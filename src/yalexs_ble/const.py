@@ -117,10 +117,35 @@ class LockState:
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
 
 
+class LockOperationSource(Enum):
+    REMOTE = 0x00
+    MANUAL = 0x01
+    AUTO_LOCK = 0x05
+    PIN = 0x0B
+    UNKNOWN = 0xFF
+
+
+VALUE_TO_LOCK_OPERATION_SOURCE = {
+    status.value: status for status in LockOperationSource
+}
+
+
+class LockOperationRemoteType(Enum):
+    UNKNOWN = 0x00
+    BLE = 0x03
+
+
+VALUE_TO_LOCK_OPERATION_REMOTE_TYPE = {
+    status.value: status for status in LockOperationRemoteType
+}
+
+
 @dataclass
 class LockActivity:
     timestamp: datetime
     status: LockStatus
+    source: LockOperationSource
+    remote_type: LockOperationRemoteType | None = None
     slot: int | None = None
 
 

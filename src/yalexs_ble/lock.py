@@ -24,6 +24,8 @@ from .const import (
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_AUTO_LOCK_MODE,
     VALUE_TO_DOOR_STATUS,
+    VALUE_TO_LOCK_OPERATION_REMOTE_TYPE,
+    VALUE_TO_LOCK_OPERATION_SOURCE,
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
     AutoLockState,
@@ -34,6 +36,8 @@ from .const import (
     LockActivity,
     LockActivityType,
     LockInfo,
+    LockOperationRemoteType,
+    LockOperationSource,
     LockStateValue,
     LockStatus,
     SettingType,
@@ -479,6 +483,38 @@ class Lock:
         _LOGGER.debug("%s: Parsed unix timestamp: %d", self.name, unix_timestamp)
         return datetime.fromtimestamp(unix_timestamp)
 
+    def _parse_operation_source(
+        self,
+        source: int,
+        remote_type: int,
+    ) -> tuple[LockOperationSource, LockOperationRemoteType | None]:
+        source_enum = VALUE_TO_LOCK_OPERATION_SOURCE.get(
+            source, LockOperationSource.UNKNOWN
+        )
+        remote_type_enum: LockOperationRemoteType | None = (
+            VALUE_TO_LOCK_OPERATION_REMOTE_TYPE.get(
+                remote_type, LockOperationRemoteType.UNKNOWN
+            )
+        )
+        if source_enum is LockOperationSource.UNKNOWN:
+            _LOGGER.info(
+                "%s: Unrecognized operation source code: %s",
+                self.name,
+                hex(source),
+            )
+
+        if source_enum is LockOperationSource.REMOTE:
+            if remote_type_enum == LockOperationRemoteType.UNKNOWN:
+                _LOGGER.info(
+                    "%s: Unrecognized operation remote type: %s",
+                    self.name,
+                    hex(remote_type),
+                )
+        else:
+            remote_type_enum = None
+
+        return source_enum, remote_type_enum
+
     def _parse_lock_activity(
         self, response: bytes
     ) -> DoorActivity | LockActivity | None:
@@ -502,10 +538,20 @@ class Lock:
         if activity_type == LockActivityType.LOCK.value:
             # Timestamp is at 0x08-0x0B
             # Lock status is at 0x06
+            # Operation source is at 0x05
+            # Remote type is at 0x07
             timestamp = self._parse_unix_timestamp(response[0x08:0x0C])
             lock_status = self._parse_lock_status(response[0x06])
+            operation_source, remote_type = self._parse_operation_source(
+                response[0x05], response[0x07]
+            )
 
-            return LockActivity(timestamp, lock_status)
+            return LockActivity(
+                timestamp,
+                lock_status,
+                source=operation_source,
+                remote_type=remote_type,
+            )
         if activity_type == LockActivityType.PIN.value:
             # Timestamp is at 0x05-0x08
             # Slot is at 0x0A
@@ -514,7 +560,12 @@ class Lock:
             pin_slot = response[0x0A]
             lock_status = self._parse_lock_status(response[0x0C] & 0x0F)
 
-            return LockActivity(timestamp, lock_status, pin_slot)
+            return LockActivity(
+                timestamp,
+                lock_status,
+                source=LockOperationSource.PIN,
+                slot=pin_slot,
+            )
         _LOGGER.warning("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
 
