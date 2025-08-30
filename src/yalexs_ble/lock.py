@@ -33,6 +33,7 @@ from .const import (
     DoorStatus,
     LockActivity,
     LockActivityType,
+    LockActivityValue,
     LockInfo,
     LockStateValue,
     LockStatus,
@@ -111,6 +112,7 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        activity_callback: Callable[[Iterable[LockActivityValue]], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -126,6 +128,7 @@ class Lock:
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
+        self._activity_callback = activity_callback
 
     def set_name(self, name: str) -> None:
         self.name = name
@@ -210,40 +213,56 @@ class Lock:
         await client.clear_cache()
         raise BleakError(f"Missing characteristic {char_uuid}")
 
-    def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
+    def _parse_state(
+        self, state: bytes
+    ) -> tuple[
+        Iterable[LockStateValue] | None,
+        Iterable[LockActivityValue] | None,
+    ]:
+        parsed_state: Iterable[LockStateValue] | None = None
+        parsed_activity: Iterable[LockActivityValue] | None = None
         if state[0] == 0xBB:
-            if state[1] == Commands.LOCK_ACTIVITY.value:
-                return None  # Ignore lock activity as these are historical events
-            if state[1] == Commands.GETSTATUS.value:
+            if state[1] == Commands.LOCK_ACTIVITY.value and (
+                parsed_activity_value := self._parse_lock_activity(state)
+            ):
+                parsed_activity = [parsed_activity_value]
+            elif state[1] == Commands.GETSTATUS.value:
                 if state[4] == StatusType.LOCK_ONLY.value:
                     lock_status = state[0x08]
-                    return [VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)]
-                if state[4] == StatusType.DOOR_ONLY.value:
+                    parsed_state = [
+                        VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)
+                    ]
+                elif state[4] == StatusType.DOOR_ONLY.value:
                     door_status = state[0x08]
-                    return [VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)]
-                if state[4] == StatusType.DOOR_AND_LOCK.value:
-                    return self._parse_lock_and_door_state(state)
-                if state[4] == StatusType.BATTERY.value:
-                    return [self._parse_battery_state(state)]
+                    parsed_state = [
+                        VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)
+                    ]
+                elif state[4] == StatusType.DOOR_AND_LOCK.value:
+                    parsed_state = self._parse_lock_and_door_state(state)
+                elif state[4] == StatusType.BATTERY.value:
+                    parsed_state = [self._parse_battery_state(state)]
             elif (
                 state[1] == Commands.WRITESETTING.value
                 or state[1] == Commands.READSETTING.value
-            ):
-                if state[4] == SettingType.AUTOLOCK.value:
-                    return [self._parse_auto_lock_state(state)]
+            ) and state[4] == SettingType.AUTOLOCK.value:
+                parsed_state = [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
             if state[1] == Commands.UNLOCK.value:
-                return [LockStatus.UNLOCKED]
-            if state[1] == Commands.LOCK.value:
-                return [LockStatus.LOCKED]
-        return None
+                parsed_state = [LockStatus.UNLOCKED]
+            elif state[1] == Commands.LOCK.value:
+                parsed_state = [LockStatus.LOCKED]
+        return (parsed_state, parsed_activity)
 
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
         _LOGGER.debug("%s: State changed: %s", self.name, state.hex())
-        if (parsed_state := self._parse_state(state)) is not None:
+        parsed_state, parsed_activity = self._parse_state(state)
+        if parsed_state is not None:
             self._state_callback(parsed_state)
-        else:
+        if parsed_activity is not None and self._activity_callback is not None:
+            self._activity_callback(parsed_activity)
+
+        if not parsed_state and not parsed_activity:
             _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
 
     async def _setup_session(self) -> None:
