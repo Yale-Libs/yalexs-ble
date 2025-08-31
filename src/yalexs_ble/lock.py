@@ -223,39 +223,78 @@ class Lock:
         Iterable[LockStateValue] | None,
         Iterable[LockActivityValue] | None,
     ]:
-        parsed_state: Iterable[LockStateValue] | None = None
-        parsed_activity: Iterable[LockActivityValue] | None = None
+        """Parse state data from lock response."""
         if state[0] == 0xBB:
-            if state[1] == Commands.LOCK_ACTIVITY.value and (
-                parsed_activity_value := self._parse_lock_activity(state)
-            ):
-                parsed_activity = [parsed_activity_value]
-            elif state[1] == Commands.GETSTATUS.value:
-                if state[4] == StatusType.LOCK_ONLY.value:
-                    lock_status = state[0x08]
-                    parsed_state = [
-                        VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)
-                    ]
-                elif state[4] == StatusType.DOOR_ONLY.value:
-                    door_status = state[0x08]
-                    parsed_state = [
-                        VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)
-                    ]
-                elif state[4] == StatusType.DOOR_AND_LOCK.value:
-                    parsed_state = self._parse_lock_and_door_state(state)
-                elif state[4] == StatusType.BATTERY.value:
-                    parsed_state = [self._parse_battery_state(state)]
-            elif (
-                state[1] == Commands.WRITESETTING.value
-                or state[1] == Commands.READSETTING.value
-            ) and state[4] == SettingType.AUTOLOCK.value:
-                parsed_state = [self._parse_auto_lock_state(state)]
-        elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                parsed_state = [LockStatus.UNLOCKED]
-            elif state[1] == Commands.LOCK.value:
-                parsed_state = [LockStatus.LOCKED]
-        return (parsed_state, parsed_activity)
+            return self._parse_bb_response(state)
+        if state[0] == 0xAA:
+            return self._parse_aa_response(state)
+        return None, None
+
+    def _parse_bb_response(
+        self, state: bytes
+    ) -> tuple[
+        Iterable[LockStateValue] | None,
+        Iterable[LockActivityValue] | None,
+    ]:
+        """Parse 0xBB prefixed responses."""
+        command = state[1]
+
+        # Handle lock activity
+        if command == Commands.LOCK_ACTIVITY.value:
+            if parsed_activity := self._parse_lock_activity(state):
+                return None, [parsed_activity]
+            return None, None
+
+        # Handle status commands
+        if command == Commands.GETSTATUS.value:
+            parsed_state = self._parse_status_response(state)
+            return parsed_state, None
+
+        # Handle settings commands
+        if (
+            command in (Commands.WRITESETTING.value, Commands.READSETTING.value)
+            and state[4] == SettingType.AUTOLOCK.value
+        ):
+            return [self._parse_auto_lock_state(state)], None
+
+        return None, None
+
+    def _parse_status_response(self, state: bytes) -> Iterable[LockStateValue] | None:
+        """Parse GETSTATUS command responses."""
+        status_type = state[4]
+
+        if status_type == StatusType.LOCK_ONLY.value:
+            lock_status = state[0x08]
+            return [VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)]
+
+        if status_type == StatusType.DOOR_ONLY.value:
+            door_status = state[0x08]
+            return [VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)]
+
+        if status_type == StatusType.DOOR_AND_LOCK.value:
+            return self._parse_lock_and_door_state(state)
+
+        if status_type == StatusType.BATTERY.value:
+            return [self._parse_battery_state(state)]
+
+        return None
+
+    def _parse_aa_response(
+        self, state: bytes
+    ) -> tuple[
+        Iterable[LockStateValue] | None,
+        Iterable[LockActivityValue] | None,
+    ]:
+        """Parse 0xAA prefixed responses (direct lock/unlock commands)."""
+        command = state[1]
+
+        if command == Commands.UNLOCK.value:
+            return [LockStatus.UNLOCKED], None
+
+        if command == Commands.LOCK.value:
+            return [LockStatus.LOCKED], None
+
+        return None, None
 
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
