@@ -5,9 +5,8 @@ import contextlib
 import logging
 import struct
 import time
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import replace
-from functools import partial
 from typing import Any, TypeVar, cast
 
 from bleak.backends.scanner import AdvertisementData
@@ -21,13 +20,12 @@ from bleak_retry_connector import (
 )
 from lru import LRU  # pylint: disable=no-name-in-module
 
+from .activity import ActivityManager
 from .const import (
     APPLE_MFR_ID,
     HAP_ENCRYPTED_FIRST_BYTE,
     HAP_FIRST_BYTE,
     LOCK_ACTIVITY_POLL_INITIAL_DELAY_DURING_UPDATE,
-    LOCK_ACTIVITY_POLL_RETRIES,
-    LOCK_ACTIVITY_POLL_RETRY_EXPONENTIAL_BACKOFF_SECONDS,
     YALE_MFR_ID,
     AuthState,
     AutoLockMode,
@@ -251,6 +249,30 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
 
+class PushLockBridge:
+    def __init__(self, lock: PushLock) -> None:
+        self._lock = lock
+
+    @property
+    def name(self) -> str:
+        return self._lock.name
+
+    @property
+    def lock_info(self) -> LockInfo | None:
+        return self._lock._lock_info
+
+    @property
+    def connection_info(self) -> ConnectionInfo | None:
+        return self._lock.connection_info
+
+    @property
+    def loop(self) -> Any:
+        return self._lock.loop
+
+    async def ensure_connected(self) -> Lock:
+        return await self._lock._ensure_connected()
+
+
 class PushLock:
     """A lock with push updates."""
 
@@ -289,14 +311,9 @@ class PushLock:
         self._callbacks: list[
             Callable[[LockState, LockInfo, ConnectionInfo], None]
         ] = []
-        self._activity_callbacks: list[
-            Callable[[DoorActivity | LockActivity, LockInfo, ConnectionInfo], None]
-        ] = []
         self._update_task: asyncio.Task[None] | None = None
-        self._activity_poll_task: asyncio.Task[None] | None = None
         self.loop = asyncio._get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
-        self._cancel_deferred_activity_poll: asyncio.TimerHandle | None = None
         self._client: Lock | None = None
         self._connect_lock = asyncio.Lock()
         self._seen_this_session: set[
@@ -314,6 +331,7 @@ class PushLock:
         self._last_lock_operation_complete_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
+        self._activity_manager = ActivityManager(PushLockBridge(self))
 
     @property
     def local_name(self) -> str | None:
@@ -423,13 +441,9 @@ class PushLock:
         request_update: bool = False,
     ) -> Callable[[], None]:
         """Register an activity callback to be called when the lock state changes."""
-
-        self._activity_callbacks.append(callback)
-
-        if request_update:
-            self._schedule_activity_poll(0, max_retries=0)
-
-        return partial(self._activity_callbacks.remove, callback)
+        return self._activity_manager.register_activity_callback(
+            callback, request_update=request_update
+        )
 
     def set_lock_key(self, key: str, slot: int) -> None:
         """Set the lock key."""
@@ -524,20 +538,15 @@ class PushLock:
         """Execute forced disconnection."""
         self._cancel_disconnect_timer()
         _LOGGER.debug("%s: Executing forced disconnect: %s", self.name, reason)
-        gather_tasks = []
+        gather_tasks: list[Awaitable[None]] = [
+            self._activity_manager.execute_forced_disconnect(),
+        ]
         if (update_task := self._update_task) and not update_task.done():
             self._update_task = None
             update_task.cancel()
             gather_tasks.append(update_task)
-        if (
-            activity_poll_task := self._activity_poll_task
-        ) and not activity_poll_task.done():
-            self._activity_poll_task = None
-            activity_poll_task.cancel()
-            gather_tasks.append(activity_poll_task)
-        if gather_tasks:
-            with contextlib.suppress(Exception, asyncio.CancelledError):
-                await asyncio.gather(*gather_tasks)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.gather(*gather_tasks)
         await self._execute_disconnect()
 
     def _disconnect_with_timer(self, timeout: float) -> None:
@@ -781,7 +790,7 @@ class PushLock:
     def _activity_callback(self, activities: Iterable[LockActivityValue]) -> None:
         """Handle activity update."""
         self._reset_disconnect_timer()
-        self._update_any_activity(activities)
+        self._activity_manager.handle_activities(activities)
 
     def _get_current_state(self) -> LockState:
         """Get the current state of the lock."""
@@ -941,7 +950,9 @@ class PushLock:
                 f"lock is in unknown state: {state.lock}"
             )
 
-        self._schedule_activity_poll(LOCK_ACTIVITY_POLL_INITIAL_DELAY_DURING_UPDATE)
+        self._activity_manager.schedule_activity_poll(
+            LOCK_ACTIVITY_POLL_INITIAL_DELAY_DURING_UPDATE
+        )
 
         if not has_lock_info:
             # On first update free up the connection
@@ -978,32 +989,6 @@ class PushLock:
                 callback(lock_state, self._lock_info, connection_info)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("%s: Error calling callback", self.name)
-
-    def _update_any_activity(self, activities: Iterable[LockActivityValue]) -> None:
-        _LOGGER.debug("%s: Activity updates: %s", self.name, activities)
-
-        for activity in activities:
-            self._callback_activity(activity)
-
-    def _callback_activity(self, activity: LockActivityValue) -> None:
-        """Call the activity callbacks."""
-        _LOGGER.debug(
-            "%s: New activity: %s %s %s",
-            self.name,
-            activity,
-            self._lock_info,
-            self.connection_info,
-        )
-        if not self._activity_callbacks:
-            return
-        assert self._lock_info is not None  # nosec
-        connection_info = self.connection_info
-        assert connection_info is not None  # nosec
-        for callback in self._activity_callbacks:
-            try:
-                callback(activity, self._lock_info, connection_info)
-            except Exception:  # pylint: disable=broad-except
-                _LOGGER.exception("%s: Error calling activity callback", self.name)
 
     def update_advertisement(
         self, ble_device: BLEDevice, ad: AdvertisementData
@@ -1265,103 +1250,6 @@ class PushLock:
             wrapped_exc.__cause__ = ex
             self._set_update_state(wrapped_exc)
             _LOGGER.exception("%s: Unknown error updating", self.name)
-
-    def _cancel_activity_poll(self) -> None:
-        """Cancel polling for activity."""
-        if self._cancel_deferred_activity_poll:
-            self._cancel_deferred_activity_poll.cancel()
-            self._cancel_deferred_activity_poll = None
-
-    def _schedule_activity_poll(
-        self,
-        seconds: float,
-        retries: int = 0,
-        max_retries: int = LOCK_ACTIVITY_POLL_RETRIES,
-        backoff: float = LOCK_ACTIVITY_POLL_RETRY_EXPONENTIAL_BACKOFF_SECONDS,
-    ) -> None:
-        """Schedule an activity poll in future seconds.
-
-        This does nothing if no activity callbacks are registered (leaving the
-        activity for the Yale/August app to consume).
-        """
-        if not self._activity_callbacks:
-            return
-
-        _LOGGER.debug(
-            "%s: Scheduling activity poll to happen in %s seconds%s",
-            self.name,
-            seconds,
-            f" (retry {retries})" if retries and max_retries else "",
-        )
-        self._cancel_activity_poll()
-        self._cancel_deferred_activity_poll = self.loop.call_later(
-            seconds,
-            partial(
-                self._deferred_activity_poll,
-                retries=retries,
-                max_retries=max_retries,
-                backoff=backoff,
-            ),
-        )
-
-    def _deferred_activity_poll(
-        self,
-        retries: int,
-        max_retries: int,
-        backoff: float,
-    ) -> None:
-        """Update the lock state."""
-        self._cancel_activity_poll()
-        if self._activity_poll_task and not self._activity_poll_task.done():
-            _LOGGER.debug(
-                "%s: Skipping activity poll since one already in progress", self.name
-            )
-            return
-        self._activity_poll_task = asyncio.create_task(
-            self._execute_activity_poll(
-                retries=retries,
-                max_retries=max_retries,
-                backoff=backoff,
-            )
-        )
-
-    async def _execute_activity_poll(
-        self, retries: int, max_retries: int, backoff: float
-    ) -> None:
-        if not self._activity_callbacks:
-            return
-
-        _LOGGER.debug("%s: Starting deferred activity update", self.name)
-
-        lock = await self._ensure_connected()
-        first_result = await lock.lock_activity()
-
-        if not first_result:
-            if retries < max_retries:
-                _LOGGER.debug(
-                    "%s: No activity found while polling on attempt %s; "
-                    "retrying up to %s more times",
-                    self.name,
-                    retries,
-                    max_retries - retries,
-                )
-                self._schedule_activity_poll(
-                    backoff * (2**retries),
-                    retries=retries + 1,
-                    max_retries=max_retries,
-                    backoff=backoff,
-                )
-            else:
-                _LOGGER.debug(
-                    "%s: No activity found while polling after maximum of %s retries",
-                    self.name,
-                    max_retries,
-                )
-            return
-
-        # continue to fetch activity while some is available
-        while (await lock.lock_activity()) is not None:
-            pass
 
 
 def get_homekit_state_num(data: bytes) -> int:
