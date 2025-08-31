@@ -34,26 +34,20 @@ def lock() -> Lock:
     )
 
 
-def test_create_lock() -> None:
-    Lock(
-        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
-        "0800200c9a66",
-        1,
-        "mylock",
-        lambda _: None,
-    )
+def test_create_lock(lock: Lock) -> None:
+    # Simply verify the lock fixture creates a valid Lock instance
+    assert lock is not None
+    assert lock.name == "mylock"
+    assert lock.key_index == 1
 
 
 @pytest.mark.asyncio
-async def test_connection_canceled_on_disconnect() -> None:
+async def test_connection_canceled_on_disconnect(lock: Lock) -> None:
     disconnect_mock = AsyncMock()
     mock_client = MagicMock(connected=True, disconnect=disconnect_mock)
-    lock = Lock(
-        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock", delegate=""),
-        "0800200c9a66",
-        1,
-        "mylock",
-        lambda _: None,
+    # Update the ble_device_callback if needed for delegate
+    lock.ble_device_callback = lambda: BLEDevice(
+        "aa:bb:cc:dd:ee:ff", "lock", delegate=""
     )
     lock.client = mock_client
 
