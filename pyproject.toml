@@ -132,6 +132,7 @@ select = [
     "I",   # isort
     "RUF", # ruff specific
     "FLY", # flynt
+    "FURB", # refurb rules
     "G", # flake8-logging-format   ,
     "PERF", # Perflint
     "PGH", # pygrep-hooks
