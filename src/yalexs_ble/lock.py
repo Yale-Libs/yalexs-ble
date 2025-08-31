@@ -491,10 +491,9 @@ class Lock:
         source_enum = VALUE_TO_LOCK_OPERATION_SOURCE.get(
             source, LockOperationSource.UNKNOWN
         )
-        remote_type_enum: LockOperationRemoteType | None = (
-            VALUE_TO_LOCK_OPERATION_REMOTE_TYPE.get(
-                remote_type, LockOperationRemoteType.UNKNOWN
-            )
+        remote_type_enum: LockOperationRemoteType | None
+        remote_type_enum = VALUE_TO_LOCK_OPERATION_REMOTE_TYPE.get(
+            remote_type, LockOperationRemoteType.UNKNOWN
         )
         if source_enum is LockOperationSource.UNKNOWN:
             _LOGGER.info(
@@ -504,7 +503,7 @@ class Lock:
             )
 
         if source_enum is LockOperationSource.REMOTE:
-            if remote_type_enum == LockOperationRemoteType.UNKNOWN:
+            if remote_type_enum is LockOperationRemoteType.UNKNOWN:
                 _LOGGER.info(
                     "%s: Unrecognized operation remote type: %s",
                     self.name,
