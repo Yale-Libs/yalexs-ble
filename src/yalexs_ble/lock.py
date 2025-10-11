@@ -194,6 +194,9 @@ class Lock:
         # Order matters here, we must start notify for the secure session before
         # the non-secure session
         await self.secure_session.start_notify()
+        # Wait for the descriptor write to complete before sending commands
+        # Some locks need time to process the CCCD write before they can respond
+        await asyncio.sleep(0.3)
         try:
             await self._setup_session()
         except BleakError as err:
