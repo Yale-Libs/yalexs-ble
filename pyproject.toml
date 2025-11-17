@@ -38,7 +38,7 @@ lru-dict = ">=1.1.4"
 async-interrupt = ">=1.1.1"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.4"
+pytest = "^9.0"
 pytest-cov = "^6.2"
 pytest-asyncio = "^1.2.0"
 
