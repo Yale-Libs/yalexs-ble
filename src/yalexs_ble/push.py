@@ -108,6 +108,7 @@ NO_BATTERY_SUPPORT_MODELS = {
     "SL-103",  # Linus L2
     "CERES",  # Smart code handle
     "Yale Linus L2",  # Linus L2 Nordic
+    "MD-04I",  # Yale Durus (EU)
 }
 
 AUTO_LOCK_DEFAULT_DURATION = 90
