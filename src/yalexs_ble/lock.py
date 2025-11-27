@@ -216,6 +216,12 @@ class Lock:
 
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
         if state[0] == 0xBB:
+            # Check for LOCK/UNLOCK command responses (0xBB + 0x0A/0x0B)
+            # These can contain actual status in byte[3] when operation fails/jams
+            if state[1] in (Commands.LOCK.value, Commands.UNLOCK.value) and len(state) > 3:
+                lock_status_byte = state[0x03]
+                if lock_status_byte in VALUE_TO_LOCK_STATUS:
+                    return [VALUE_TO_LOCK_STATUS[lock_status_byte]]
             if state[1] == Commands.LOCK_ACTIVITY.value:
                 return None  # Ignore lock activity as these are historical events
             if state[1] == Commands.GETSTATUS.value:
