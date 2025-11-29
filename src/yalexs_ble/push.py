@@ -1197,5 +1197,5 @@ class PushLock:
 
 def get_homekit_state_num(data: bytes) -> int:
     """Get the homekit state number from the manufacturer data."""
-    acid, gsn, cn, cv = struct.unpack("<HHBB", data[9:15])
+    _acid, gsn, _cn, _cv = struct.unpack("<HHBB", data[9:15])
     return gsn
