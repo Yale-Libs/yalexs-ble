@@ -109,8 +109,9 @@ def test_parse_lock_command_response_jammed():
     result = lock._parse_state(frame)
 
     assert result is not None
-    assert len(result) == 1
-    assert result[0] == LockStatus.JAMMED
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert result_list[0] == LockStatus.JAMMED
 
 
 def test_parse_lock_command_response_unlocked():
@@ -129,8 +130,9 @@ def test_parse_lock_command_response_unlocked():
     result = lock._parse_state(frame)
 
     assert result is not None
-    assert len(result) == 1
-    assert result[0] == LockStatus.UNLOCKED
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert result_list[0] == LockStatus.UNLOCKED
 
 
 def test_parse_unlock_command_response():
@@ -149,8 +151,9 @@ def test_parse_unlock_command_response():
     result = lock._parse_state(frame)
 
     assert result is not None
-    assert len(result) == 1
-    assert result[0] == LockStatus.UNLOCKED
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert result_list[0] == LockStatus.UNLOCKED
 
 
 def test_parse_lock_command_response_locked_success():
@@ -169,5 +172,6 @@ def test_parse_lock_command_response_locked_success():
     result = lock._parse_state(frame)
 
     assert result is not None
-    assert len(result) == 1
-    assert result[0] == LockStatus.LOCKED
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert result_list[0] == LockStatus.LOCKED
