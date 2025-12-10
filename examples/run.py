@@ -37,9 +37,7 @@ async def run():
         )
 
     cancel_callback = push_lock.register_callback(new_state)
-    scanner = BleakScanner(
-        detection_callback=push_lock.update_advertisement
-    )
+    scanner = BleakScanner(detection_callback=push_lock.update_advertisement)
     await scanner.start()
     cancel = await push_lock.start()
     _LOGGER.info(
