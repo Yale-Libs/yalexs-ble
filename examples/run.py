@@ -24,8 +24,6 @@ async def run():
     )
     _LOGGER.info("Expected local_name: %s", push_lock.local_name)
 
-    scanner = BleakScanner()
-
     def new_state(
         new_state: LockState, lock_info: LockInfo, connection_info: ConnectionInfo
     ) -> None:
