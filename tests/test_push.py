@@ -6,6 +6,7 @@ import pytest
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
 
+from bleak.backends.scanner import AdvertisementData
 from yalexs_ble.const import (
     AutoLockMode,
     AutoLockState,
@@ -394,3 +395,86 @@ async def test_poll_battery_bleak_dbus_error():
 
     # Cooldown should NOT be set (only TimeoutError sets cooldown)
     assert push_lock._next_battery_attempt_time == NEVER_TIME
+
+
+@pytest.mark.asyncio
+async def test_update_preserves_notify_state_from_cache() -> None:
+    """
+    Test that _update() does not overwrite lock/door state with UNKNOWN
+    when notify callbacks have updated the cached state.
+
+    Regression test for race condition where:
+    1. Update starts with UNKNOWN state
+    2. Notify callback updates cached state to LOCKED/CLOSED during update
+    3. Update skips polling lock_status (already seen this session)
+    4. Final state should preserve LOCKED/CLOSED from cache, not revert to UNKNOWN
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    # Start with UNKNOWN state; update will normally leave it UNKNOWN
+    push_lock._lock_state = LockState(
+        lock=LockStatus.UNKNOWN,
+        door=DoorStatus.UNKNOWN,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    # Mock lock that doesn't return lock/door (simulating skipped polling)
+    mock_lock = MagicMock()
+    mock_lock.lock_info = AsyncMock(return_value=MagicMock(model="ASL-03", door_sense=True))
+
+    push_lock._lock_info = MagicMock(model="ASL-03", door_sense=True)
+    push_lock._running = True
+
+    # Mark lock/door/battery as already seen to simulate skipped polling
+    push_lock._seen_this_session.add(LockStatus)
+    push_lock._seen_this_session.add(DoorStatus)
+    push_lock._seen_this_session.add(BatteryState)
+
+    # Mock advertisement_data for connection_info
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    # Gate auto_lock_status so we can inject notify updates mid-_update
+    auto_lock_in_progress = asyncio.Event()
+    allow_auto_lock_to_continue = asyncio.Event()
+
+    async def auto_lock_status():
+        auto_lock_in_progress.set()
+        await allow_auto_lock_to_continue.wait()
+        return AutoLockState(mode=AutoLockMode.OFF, duration=0)
+
+    mock_lock.auto_lock_status = AsyncMock(side_effect=auto_lock_status)
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)):
+        update_task = asyncio.create_task(push_lock._update())
+
+        # Wait until _update is awaiting auto_lock_status, then simulate notify callback
+        await auto_lock_in_progress.wait()
+        push_lock._update_any_state([LockStatus.LOCKED, DoorStatus.CLOSED])
+        allow_auto_lock_to_continue.set()
+
+        final_state = await update_task
+
+        # The critical assertion: lock/door must be preserved from cache
+        assert final_state.lock == LockStatus.LOCKED, (
+            f"Lock status should be LOCKED from cache, got {final_state.lock}"
+        )
+        assert final_state.door == DoorStatus.CLOSED, (
+            f"Door status should be CLOSED from cache, got {final_state.door}"
+        )
