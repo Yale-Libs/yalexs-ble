@@ -2,16 +2,14 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from bleak.backends.scanner import AdvertisementData
+
 from yalexs_ble.const import (
-    DoorStatus,
-    LockState,
-    LockStatus,
     AutoLockMode,
     AutoLockState,
-    BatteryState,
-    LockInfo
+    DoorStatus,
+    LockInfo,
+    LockStatus,
 )
 from yalexs_ble.push import (
     NO_BATTERY_SUPPORT_MODELS,
@@ -187,7 +185,7 @@ async def test_update_continues_after_battery_timeout():
     )
 
     # Battery times out
-    mock_lock.battery = AsyncMock(side_effect=asyncio.TimeoutError("Battery timeout"))
+    mock_lock.battery = AsyncMock(side_effect=TimeoutError("Battery timeout"))
 
     # But other calls succeed
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
@@ -233,5 +231,9 @@ async def test_update_continues_after_battery_timeout():
 
         # Battery is None or unchanged (timeout means no battery data)
         # Battery should be None since it timed out
-        assert final_state.battery is None or final_state.battery == push_lock._lock_state.battery if push_lock._lock_state else True
-
+        assert (
+            final_state.battery is None
+            or final_state.battery == push_lock._lock_state.battery
+            if push_lock._lock_state
+            else True
+        )

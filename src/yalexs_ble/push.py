@@ -846,7 +846,7 @@ class PushLock:
             )
             # Reset cooldown on success
             self._next_battery_attempt_time = NEVER_TIME
-        except (TimeoutError, asyncio.TimeoutError) as err:
+        except TimeoutError as err:
             _LOGGER.info(
                 "%s: Battery request timed out (%s), will retry in %d "
                 "seconds. Continuing with other updates.",
@@ -858,8 +858,7 @@ class PushLock:
             self._next_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
         except (BleakError, BleakDBusError) as err:
             _LOGGER.debug(
-                "%s: Battery request failed (%s), continuing with "
-                "other updates.",
+                "%s: Battery request failed (%s), continuing with other updates.",
                 self.name,
                 err,
             )
@@ -938,7 +937,11 @@ class PushLock:
 
         # Only validate voltage if it's provided (not None)
         # Voltage is None for enum-derived battery from extended status
-        if state.battery and state.battery.voltage is not None and state.battery.voltage <= 3.0:
+        if (
+            state.battery
+            and state.battery.voltage is not None
+            and state.battery.voltage <= 3.0
+        ):
             _LOGGER.debug(
                 "%s: Battery voltage is impossible: %s",
                 self.name,
