@@ -16,7 +16,6 @@ from yalexs_ble.const import (
     LockStatus,
 )
 from yalexs_ble.push import (
-    BATTERY_TIMEOUT_COOLDOWN,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
     PushLock,
@@ -376,7 +375,9 @@ async def test_poll_battery_bleak_dbus_error():
     push_lock._name = "Test Lock"
 
     mock_lock = MagicMock()
-    mock_lock.battery = AsyncMock(side_effect=BleakDBusError("DBus error", "error body"))
+    mock_lock.battery = AsyncMock(
+        side_effect=BleakDBusError("DBus error", "error body")
+    )
 
     initial_state = LockState(
         lock=LockStatus.LOCKED,
