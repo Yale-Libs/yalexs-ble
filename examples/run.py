@@ -24,8 +24,6 @@ async def run():
     )
     _LOGGER.info("Expected local_name: %s", push_lock.local_name)
 
-    scanner = BleakScanner()
-
     def new_state(
         new_state: LockState, lock_info: LockInfo, connection_info: ConnectionInfo
     ) -> None:
@@ -37,7 +35,7 @@ async def run():
         )
 
     cancel_callback = push_lock.register_callback(new_state)
-    scanner.register_detection_callback(push_lock.update_advertisement)
+    scanner = BleakScanner(detection_callback=push_lock.update_advertisement)
     await scanner.start()
     cancel = await push_lock.start()
     _LOGGER.info(
