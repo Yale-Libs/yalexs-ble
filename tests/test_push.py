@@ -234,14 +234,8 @@ async def test_update_continues_after_battery_timeout():
         assert final_state.lock == LockStatus.LOCKED
         assert final_state.door == DoorStatus.CLOSED
 
-        # Battery is None or unchanged (timeout means no battery data)
         # Battery should be None since it timed out
-        assert (
-            final_state.battery is None
-            or final_state.battery == push_lock._lock_state.battery
-            if push_lock._lock_state
-            else True
-        )
+        assert final_state.battery is None
 
 
 @pytest.mark.asyncio
