@@ -6,7 +6,6 @@ import pytest
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
 
-from bleak.backends.scanner import AdvertisementData
 from yalexs_ble.const import (
     AutoLockMode,
     AutoLockState,
@@ -429,7 +428,9 @@ async def test_update_preserves_notify_state_from_cache() -> None:
 
     # Mock lock that doesn't return lock/door (simulating skipped polling)
     mock_lock = MagicMock()
-    mock_lock.lock_info = AsyncMock(return_value=MagicMock(model="ASL-03", door_sense=True))
+    mock_lock.lock_info = AsyncMock(
+        return_value=MagicMock(model="ASL-03", door_sense=True)
+    )
 
     push_lock._lock_info = MagicMock(model="ASL-03", door_sense=True)
     push_lock._running = True
@@ -461,7 +462,9 @@ async def test_update_preserves_notify_state_from_cache() -> None:
 
     mock_lock.auto_lock_status = AsyncMock(side_effect=auto_lock_status)
 
-    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)):
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
         update_task = asyncio.create_task(push_lock._update())
 
         # Wait until _update is awaiting auto_lock_status, then simulate notify callback
