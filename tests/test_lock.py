@@ -104,6 +104,7 @@ def test_parse_operation_source(lock: Lock) -> None:
     assert source is LockOperationSource.REMOTE
     assert remote_type is LockOperationRemoteType.UNKNOWN
 
+
 def test_parse_bb_response_lock_activity(lock: Lock) -> None:
     """Test parsing 0xBB responses with lock activity."""
 
@@ -276,6 +277,7 @@ def test_parse_state(lock: Lock) -> None:
     state, activity = lock._parse_state(response)
     assert state is None
     assert activity is None
+
 
 def test_parse_lock_command_response_jammed():
     """Test parsing LOCK command response with JAMMED status."""
