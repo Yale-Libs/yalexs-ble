@@ -104,7 +104,6 @@ def test_parse_operation_source(lock: Lock) -> None:
     assert source is LockOperationSource.REMOTE
     assert remote_type is LockOperationRemoteType.UNKNOWN
 
-
 def test_parse_bb_response_lock_activity(lock: Lock) -> None:
     """Test parsing 0xBB responses with lock activity."""
 
@@ -276,4 +275,91 @@ def test_parse_state(lock: Lock) -> None:
     response[0] = 0xFF
     state, activity = lock._parse_state(response)
     assert state is None
+    assert activity is None
+
+def test_parse_lock_command_response_jammed():
+    """Test parsing LOCK command response with JAMMED status."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Frame: bb0b001b00000000000000000000001f0000
+    # 0xBB = Status response, 0x0B = LOCK command, byte[3] = 0x1B = JAMMED
+    frame = bytes.fromhex("bb0b001b00000000000000000000001f0000")
+    result, activity = lock._parse_state(frame)
+
+    assert result is not None
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert result_list[0] is LockStatus.JAMMED
+    assert activity is None
+
+
+def test_parse_lock_command_response_unlocked():
+    """Test parsing LOCK command response with UNLOCKED (jam as unlocked)."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Frame: bb0b00030000000000000000000000370000
+    # 0xBB = Status response, 0x0B = LOCK command, byte[3] = 0x03 = UNLOCKED
+    frame = bytes.fromhex("bb0b00030000000000000000000000370000")
+    result, activity = lock._parse_state(frame)
+
+    assert result, activity is not None
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert result_list[0] is LockStatus.UNLOCKED
+    assert activity is None
+
+
+def test_parse_unlock_command_response():
+    """Test parsing UNLOCK command response."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Frame: bb0a00030000000000000000000000000000
+    # 0xBB = Status response, 0x0A = UNLOCK command, byte[3] = 0x03 = UNLOCKED
+    frame = bytes.fromhex("bb0a00030000000000000000000000000000")
+    result, activity = lock._parse_state(frame)
+
+    assert result is not None
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert result_list[0] is LockStatus.UNLOCKED
+    assert activity is None
+
+
+def test_parse_lock_command_response_locked_success():
+    """Test parsing LOCK command response with successful LOCKED status."""
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+    # Frame: bb0b00050000000000000000000000000000
+    # 0xBB = Status response, 0x0B = LOCK command, byte[3] = 0x05 = LOCKED
+    frame = bytes.fromhex("bb0b00050000000000000000000000000000")
+    result, activity = lock._parse_state(frame)
+
+    assert result is not None
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert result_list[0] is LockStatus.LOCKED
     assert activity is None

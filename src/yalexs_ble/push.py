@@ -109,6 +109,11 @@ VALID_ADV_VALUES = {0, 1}
 
 AUTH_FAILURE_TO_START_REAUTH = 5
 
+# How long to wait before retrying battery after a timeout (5 minutes)
+BATTERY_TIMEOUT_COOLDOWN = 300
+
+# With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
+# exclusions
 NO_BATTERY_SUPPORT_MODELS = {
     "SL-103",  # Linus L2
     "CERES",  # Smart code handle
@@ -332,6 +337,7 @@ class PushLock:
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
         self._activity_manager = ActivityManager(PushLockBridge(self))
+        self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
 
     @property
     def local_name(self) -> str | None:
@@ -863,6 +869,53 @@ class PushLock:
         await self._update()
         _LOGGER.debug("%s: Finished validate", self.name)
 
+    async def _poll_battery(
+        self, lock: Lock, state: LockState
+    ) -> tuple[LockState, bool]:
+        """Poll battery status with timeout handling and cooldown.
+
+        Returns tuple of (updated_state, made_request).
+        """
+        # Check battery timeout cooldown
+        now = time.monotonic()
+        battery_on_cooldown = now < self._next_battery_attempt_time
+
+        if battery_on_cooldown:
+            _LOGGER.debug(
+                "%s: Skipping battery request due to recent timeout "
+                "(cooldown until %.1fs)",
+                self.name,
+                self._next_battery_attempt_time - now,
+            )
+            return state, False
+
+        try:
+            battery_state = await lock.battery()
+            _AUTH_FAILURE_HISTORY.auth_success(self.address)
+            state = replace(
+                state, battery=battery_state, auth=AuthState(successful=True)
+            )
+            # Reset cooldown on success
+            self._next_battery_attempt_time = NEVER_TIME
+        except TimeoutError as err:
+            _LOGGER.info(
+                "%s: Battery request timed out (%s), will retry in %d "
+                "seconds. Continuing with other updates.",
+                self.name,
+                err,
+                BATTERY_TIMEOUT_COOLDOWN,
+            )
+            # Set cooldown to prevent repeated timeouts
+            self._next_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+        except (BleakError, BleakDBusError) as err:
+            _LOGGER.debug(
+                "%s: Battery request failed (%s), continuing with other updates.",
+                self.name,
+                err,
+            )
+
+        return state, True
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
@@ -887,13 +940,11 @@ class PushLock:
             self._lock_info.model,
             needs_battery_workaround,
         )
+
         if not needs_battery_workaround and BatteryState not in self._seen_this_session:
-            made_request = True
-            battery_state = await lock.battery()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(
-                state, battery=battery_state, auth=AuthState(successful=True)
-            )
+            state, battery_requested = await self._poll_battery(lock, state)
+            if battery_requested:
+                made_request = True
 
         if (
             DoorStatus not in self._seen_this_session
@@ -932,6 +983,7 @@ class PushLock:
             state = replace(state, lock=lock_status, auth=AuthState(successful=True))
 
         _LOGGER.debug("%s: Finished update", self.name)
+
         self._callback_state(state)
 
         if state.battery and state.battery.voltage <= 3.0:
@@ -1254,5 +1306,5 @@ class PushLock:
 
 def get_homekit_state_num(data: bytes) -> int:
     """Get the homekit state number from the manufacturer data."""
-    acid, gsn, cn, cv = struct.unpack("<HHBB", data[9:15])
+    _acid, gsn, _cn, _cv = struct.unpack("<HHBB", data[9:15])
     return gsn

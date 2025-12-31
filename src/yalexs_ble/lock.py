@@ -239,6 +239,16 @@ class Lock:
         """Parse 0xBB prefixed responses."""
         command = state[1]
 
+        # Check for LOCK/UNLOCK command responses (0xBB + 0x0A/0x0B)
+        # These can contain actual status in byte[3] when operation fails/jams
+        if (
+            state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
+            and len(state) > 3
+        ):
+            lock_status_byte = state[0x03]
+            if lock_status_byte in VALUE_TO_LOCK_STATUS:
+                return [VALUE_TO_LOCK_STATUS[lock_status_byte]], None
+
         # Handle lock activity
         if command == Commands.LOCK_ACTIVITY.value:
             if parsed_activity := self._parse_lock_activity(state):

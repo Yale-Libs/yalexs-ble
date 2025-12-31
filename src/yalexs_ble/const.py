@@ -63,6 +63,7 @@ class LockStatus(Enum):
     # UNLATCHING = 0x09
     # UNLATCHED = 0x0A
     SECUREMODE = 0x0C
+    JAMMED = 0x1B  # Lock jammed / motor stalled
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
