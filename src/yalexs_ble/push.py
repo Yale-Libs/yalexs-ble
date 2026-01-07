@@ -931,6 +931,15 @@ class PushLock:
 
         _LOGGER.debug("%s: Finished update", self.name)
 
+        # Prevent regression to UNKNOWN when notify callbacks updated state
+        # during awaited operations in this update cycle.
+        # Only overwrite lock/door if this update actually fetched a value.
+        cached_state = self._get_current_state()
+        if state.lock == LockStatus.UNKNOWN and cached_state.lock != LockStatus.UNKNOWN:
+            state = replace(state, lock=cached_state.lock)
+        if state.door == DoorStatus.UNKNOWN and cached_state.door != DoorStatus.UNKNOWN:
+            state = replace(state, door=cached_state.door)
+
         self._callback_state(state)
 
         if state.battery and state.battery.voltage <= 3.0:
