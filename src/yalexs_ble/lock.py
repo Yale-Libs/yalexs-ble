@@ -35,6 +35,7 @@ from .const import (
     DoorStatus,
     LockActivity,
     LockActivityType,
+    LockActivityValue,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
@@ -115,6 +116,7 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        activity_callback: Callable[[Iterable[LockActivityValue]], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -130,6 +132,7 @@ class Lock:
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
+        self._activity_callback = activity_callback
 
     def set_name(self, name: str) -> None:
         self.name = name
@@ -214,49 +217,102 @@ class Lock:
         await client.clear_cache()
         raise BleakError(f"Missing characteristic {char_uuid}")
 
-    def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
+    def _parse_state(
+        self, state: bytes
+    ) -> tuple[
+        Iterable[LockStateValue] | None,
+        Iterable[LockActivityValue] | None,
+    ]:
+        """Parse state data from lock response."""
         if state[0] == 0xBB:
-            # Check for LOCK/UNLOCK command responses (0xBB + 0x0A/0x0B)
-            # These can contain actual status in byte[3] when operation fails/jams
-            if (
-                state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
-                and len(state) > 3
-            ):
-                lock_status_byte = state[0x03]
-                if lock_status_byte in VALUE_TO_LOCK_STATUS:
-                    return [VALUE_TO_LOCK_STATUS[lock_status_byte]]
-            if state[1] == Commands.LOCK_ACTIVITY.value:
-                return None  # Ignore lock activity as these are historical events
-            if state[1] == Commands.GETSTATUS.value:
-                if state[4] == StatusType.LOCK_ONLY.value:
-                    lock_status = state[0x08]
-                    return [VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)]
-                if state[4] == StatusType.DOOR_ONLY.value:
-                    door_status = state[0x08]
-                    return [VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)]
-                if state[4] == StatusType.DOOR_AND_LOCK.value:
-                    return self._parse_lock_and_door_state(state)
-                if state[4] == StatusType.BATTERY.value:
-                    return [self._parse_battery_state(state)]
-            elif (
-                state[1] == Commands.WRITESETTING.value
-                or state[1] == Commands.READSETTING.value
-            ):
-                if state[4] == SettingType.AUTOLOCK.value:
-                    return [self._parse_auto_lock_state(state)]
-        elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                return [LockStatus.UNLOCKED]
-            if state[1] == Commands.LOCK.value:
-                return [LockStatus.LOCKED]
+            return self._parse_bb_response(state)
+        if state[0] == 0xAA:
+            return self._parse_aa_response(state)
+        return None, None
+
+    def _parse_bb_response(
+        self, state: bytes
+    ) -> tuple[
+        Iterable[LockStateValue] | None,
+        Iterable[LockActivityValue] | None,
+    ]:
+        """Parse 0xBB prefixed responses."""
+        command = state[1]
+
+        # Check for LOCK/UNLOCK command responses (0xBB + 0x0A/0x0B)
+        # These can contain actual status in byte[3] when operation fails/jams
+        if state[1] in (Commands.LOCK.value, Commands.UNLOCK.value) and len(state) > 3:
+            lock_status_byte = state[0x03]
+            if lock_status_byte in VALUE_TO_LOCK_STATUS:
+                return [VALUE_TO_LOCK_STATUS[lock_status_byte]], None
+
+        # Handle lock activity
+        if command == Commands.LOCK_ACTIVITY.value:
+            if parsed_activity := self._parse_lock_activity(state):
+                return None, [parsed_activity]
+            return None, None
+
+        # Handle status commands
+        if command == Commands.GETSTATUS.value:
+            parsed_state = self._parse_status_response(state)
+            return parsed_state, None
+
+        # Handle settings commands
+        if (
+            command in (Commands.WRITESETTING.value, Commands.READSETTING.value)
+            and state[4] == SettingType.AUTOLOCK.value
+        ):
+            return [self._parse_auto_lock_state(state)], None
+
+        return None, None
+
+    def _parse_status_response(self, state: bytes) -> Iterable[LockStateValue] | None:
+        """Parse GETSTATUS command responses."""
+        status_type = state[4]
+
+        if status_type == StatusType.LOCK_ONLY.value:
+            lock_status = state[0x08]
+            return [VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)]
+
+        if status_type == StatusType.DOOR_ONLY.value:
+            door_status = state[0x08]
+            return [VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)]
+
+        if status_type == StatusType.DOOR_AND_LOCK.value:
+            return self._parse_lock_and_door_state(state)
+
+        if status_type == StatusType.BATTERY.value:
+            return [self._parse_battery_state(state)]
+
         return None
+
+    def _parse_aa_response(
+        self, state: bytes
+    ) -> tuple[
+        Iterable[LockStateValue] | None,
+        Iterable[LockActivityValue] | None,
+    ]:
+        """Parse 0xAA prefixed responses (direct lock/unlock commands)."""
+        command = state[1]
+
+        if command == Commands.UNLOCK.value:
+            return [LockStatus.UNLOCKED], None
+
+        if command == Commands.LOCK.value:
+            return [LockStatus.LOCKED], None
+
+        return None, None
 
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
         _LOGGER.debug("%s: State changed: %s", self.name, state.hex())
-        if (parsed_state := self._parse_state(state)) is not None:
+        parsed_state, parsed_activity = self._parse_state(state)
+        if parsed_state is not None:
             self._state_callback(parsed_state)
-        else:
+        if parsed_activity is not None and self._activity_callback is not None:
+            self._activity_callback(parsed_activity)
+
+        if not parsed_state and not parsed_activity:
             _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
 
     async def _setup_session(self) -> None:

@@ -5,7 +5,7 @@ import contextlib
 import logging
 import struct
 import time
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import replace
 from typing import Any, TypeVar, cast
 
@@ -20,17 +20,22 @@ from bleak_retry_connector import (
 )
 from lru import LRU  # pylint: disable=no-name-in-module
 
+from .activity import ActivityManager
 from .const import (
     APPLE_MFR_ID,
     HAP_ENCRYPTED_FIRST_BYTE,
     HAP_FIRST_BYTE,
+    LOCK_ACTIVITY_POLL_INITIAL_DELAY_DURING_UPDATE,
     YALE_MFR_ID,
     AuthState,
     AutoLockMode,
     AutoLockState,
     BatteryState,
     ConnectionInfo,
+    DoorActivity,
     DoorStatus,
+    LockActivity,
+    LockActivityValue,
     LockInfo,
     LockState,
     LockStateValue,
@@ -249,6 +254,30 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
 
+class PushLockBridge:
+    def __init__(self, lock: PushLock) -> None:
+        self._lock = lock
+
+    @property
+    def name(self) -> str:
+        return self._lock.name
+
+    @property
+    def lock_info(self) -> LockInfo | None:
+        return self._lock._lock_info
+
+    @property
+    def connection_info(self) -> ConnectionInfo | None:
+        return self._lock.connection_info
+
+    @property
+    def loop(self) -> Any:
+        return self._lock.loop
+
+    async def ensure_connected(self) -> Lock:
+        return await self._lock._ensure_connected()
+
+
 class PushLock:
     """A lock with push updates."""
 
@@ -307,6 +336,7 @@ class PushLock:
         self._last_lock_operation_complete_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
+        self._activity_manager = ActivityManager(PushLockBridge(self))
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
 
     @property
@@ -408,6 +438,19 @@ class PushLock:
         self._callbacks.append(callback)
         return unregister_callback
 
+    def register_activity_callback(
+        self,
+        callback: Callable[
+            [DoorActivity | LockActivity, LockInfo, ConnectionInfo], None
+        ],
+        *,
+        request_update: bool = False,
+    ) -> Callable[[], None]:
+        """Register an activity callback to be called when the lock state changes."""
+        return self._activity_manager.register_activity_callback(
+            callback, request_update=request_update
+        )
+
     def set_lock_key(self, key: str, slot: int) -> None:
         """Set the lock key."""
         self._lock_key = key
@@ -435,6 +478,7 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            self._activity_callback,
         )
 
     def _disconnected_callback(self) -> None:
@@ -500,11 +544,15 @@ class PushLock:
         """Execute forced disconnection."""
         self._cancel_disconnect_timer()
         _LOGGER.debug("%s: Executing forced disconnect: %s", self.name, reason)
+        gather_tasks: list[Awaitable[None]] = [
+            self._activity_manager.execute_forced_disconnect(),
+        ]
         if (update_task := self._update_task) and not update_task.done():
             self._update_task = None
             update_task.cancel()
-            with contextlib.suppress(Exception, asyncio.CancelledError):
-                await update_task
+            gather_tasks.append(update_task)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.gather(*gather_tasks)
         await self._execute_disconnect()
 
     def _disconnect_with_timer(self, timeout: float) -> None:
@@ -745,6 +793,11 @@ class PushLock:
         self._reset_disconnect_timer()
         self._update_any_state(states)
 
+    def _activity_callback(self, activities: Iterable[LockActivityValue]) -> None:
+        """Handle activity update."""
+        self._reset_disconnect_timer()
+        self._activity_manager.handle_activities(activities)
+
     def _get_current_state(self) -> LockState:
         """Get the current state of the lock."""
         return self._lock_state or LockState(
@@ -957,6 +1010,10 @@ class PushLock:
             await self._execute_forced_disconnect(
                 f"lock is in unknown state: {state.lock}"
             )
+
+        self._activity_manager.schedule_activity_poll(
+            LOCK_ACTIVITY_POLL_INITIAL_DELAY_DURING_UPDATE
+        )
 
         if not has_lock_info:
             # On first update free up the connection
