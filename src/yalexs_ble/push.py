@@ -863,6 +863,25 @@ class PushLock:
 
         return state, True
 
+    async def _probe_lock_info(self, lock: Lock) -> LockInfo:
+        """Probe the lock for info, falling back to defaults on failure."""
+        try:
+            lock_info = await lock.lock_info()
+        except (TimeoutError, BleakError) as err:
+            _LOGGER.warning(
+                "%s: Failed to probe lock info (%s), continuing with defaults",
+                self.name,
+                err,
+            )
+            lock_info = LockInfo(
+                manufacturer="Unknown",
+                model="",
+                serial=self.address,
+                firmware="Unknown",
+            )
+        _LOGGER.debug("Obtained lock info: %s", lock_info)
+        return lock_info
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
@@ -874,8 +893,7 @@ class PushLock:
         )
         lock = await self._ensure_connected()
         if not self._lock_info:
-            self._lock_info = await lock.lock_info()
-            _LOGGER.debug("Obtained lock info: %s", self._lock_info)
+            self._lock_info = await self._probe_lock_info(lock)
         # Asking for battery first seems to be reduce the chance of the lock
         # getting into a bad state.
         state = self._get_current_state()
