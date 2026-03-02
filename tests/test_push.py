@@ -481,3 +481,90 @@ async def test_update_preserves_notify_state_from_cache() -> None:
         assert final_state.door == DoorStatus.CLOSED, (
             f"Door status should be CLOSED from cache, got {final_state.door}"
         )
+
+
+@pytest.mark.asyncio
+async def test_update_continues_when_lock_info_probe_fails() -> None:
+    """Test that _update() proceeds with defaults when lock_info() raises."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    mock_lock = MagicMock()
+    mock_lock.lock_info = AsyncMock(side_effect=TimeoutError("probe timed out"))
+    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        final_state = await push_lock._update()
+
+    # lock_info was attempted
+    mock_lock.lock_info.assert_called_once()
+
+    # Update still completed with real data
+    assert final_state.lock == LockStatus.LOCKED
+    assert final_state.door == DoorStatus.CLOSED
+
+    # Defaults were used for lock_info
+    assert push_lock._lock_info is not None
+    assert push_lock._lock_info.model == "Unknown"
+
+
+@pytest.mark.asyncio
+async def test_update_continues_when_lock_info_probe_bleak_error() -> None:
+    """Test that _update() proceeds with defaults when lock_info() raises BleakError."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    mock_lock = MagicMock()
+    mock_lock.lock_info = AsyncMock(
+        side_effect=BleakError("connection dropped during probe")
+    )
+    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        final_state = await push_lock._update()
+
+    assert final_state.lock == LockStatus.LOCKED
+    assert push_lock._lock_info is not None
+    assert push_lock._lock_info.manufacturer == "Unknown"
