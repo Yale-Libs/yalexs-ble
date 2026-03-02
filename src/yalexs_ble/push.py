@@ -876,7 +876,7 @@ class PushLock:
             lock_info = LockInfo(
                 manufacturer="Unknown",
                 model="Unknown",
-                serial="Unknown",
+                serial=self.address,
                 firmware="Unknown",
             )
         _LOGGER.debug("Obtained lock info: %s", lock_info)

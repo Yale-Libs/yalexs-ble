@@ -208,7 +208,7 @@ def _make_lock_with_mock_client(
 ) -> tuple[Lock, MagicMock]:
     """Create a Lock with a mock BLE client for lock_info tests."""
     lock = Lock(
-        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock", details=None),
         "0800200c9a66",
         1,
         "mylock",
@@ -263,7 +263,7 @@ async def test_lock_info_partial_failure() -> None:
 
     assert info.manufacturer == "August"
     assert info.model == "ASL-03"
-    assert info.serial == "Unknown"
+    assert info.serial == "aa:bb:cc:dd:ee:ff"
     assert info.firmware == "2.0.0"
 
 
@@ -279,7 +279,7 @@ async def test_lock_info_all_reads_fail() -> None:
     assert info == LockInfo(
         manufacturer="Unknown",
         model="Unknown",
-        serial="Unknown",
+        serial="aa:bb:cc:dd:ee:ff",
         firmware="Unknown",
     )
 

@@ -333,10 +333,13 @@ class Lock:
                         err,
                     )
         unknown = "Unknown"
+        # Use the BLE address as fallback serial to keep devices unique
+        # in Home Assistant when the characteristic read fails.
+        serial_fallback = self.ble_device_callback().address
         self._lock_info = LockInfo(
             manufacturer=results.get(MANUFACTURER_NAME_CHARACTERISTIC, unknown),
             model=results.get(MODEL_NUMBER_CHARACTERISTIC, unknown),
-            serial=results.get(SERIAL_NUMBER_CHARACTERISTIC, unknown),
+            serial=results.get(SERIAL_NUMBER_CHARACTERISTIC, serial_fallback),
             firmware=results.get(FIRMWARE_REVISION_CHARACTERISTIC, unknown),
         )
         return self._lock_info
