@@ -48,7 +48,7 @@ from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
 
 _LOGGER = logging.getLogger(__name__)
 
-LOCK_INFO_TIMEOUT = 10
+LOCK_INFO_TIMEOUT = 5
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
