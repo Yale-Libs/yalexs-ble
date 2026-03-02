@@ -320,7 +320,10 @@ class Lock:
             for char_uuid in char_uuids:
                 char = self.client.services.get_characteristic(char_uuid)
                 if not char:
-                    await self._handle_missing_characteristic(char_uuid)
+                    _LOGGER.warning(
+                        "%s: Characteristic %s not found", self.name, char_uuid
+                    )
+                    continue
                 try:
                     results[char_uuid] = (
                         (await self.client.read_gatt_char(char)).decode().split("\0")[0]
@@ -332,15 +335,14 @@ class Lock:
                         char_uuid,
                         err,
                     )
-        unknown = "Unknown"
         # Use the BLE address as fallback serial to keep devices unique
         # in Home Assistant when the characteristic read fails.
         serial_fallback = self.ble_device_callback().address
         self._lock_info = LockInfo(
-            manufacturer=results.get(MANUFACTURER_NAME_CHARACTERISTIC, unknown),
-            model=results.get(MODEL_NUMBER_CHARACTERISTIC, unknown),
+            manufacturer=results.get(MANUFACTURER_NAME_CHARACTERISTIC, "Unknown"),
+            model=results.get(MODEL_NUMBER_CHARACTERISTIC, ""),
             serial=results.get(SERIAL_NUMBER_CHARACTERISTIC, serial_fallback),
-            firmware=results.get(FIRMWARE_REVISION_CHARACTERISTIC, unknown),
+            firmware=results.get(FIRMWARE_REVISION_CHARACTERISTIC, "Unknown"),
         )
         return self._lock_info
 

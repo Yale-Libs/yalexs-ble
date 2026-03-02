@@ -522,12 +522,16 @@ async def test_update_continues_when_lock_info_probe_fails() -> None:
 
     # Update still completed with real data
     assert final_state.lock == LockStatus.LOCKED
-    assert final_state.door == DoorStatus.CLOSED
+
+    # door_status not called because model="" makes door_sense=False
+    mock_lock.door_status.assert_not_called()
+    assert final_state.door == DoorStatus.UNKNOWN
 
     # Defaults were used for lock_info, serial falls back to MAC address
     assert push_lock._lock_info is not None
-    assert push_lock._lock_info.model == "Unknown"
+    assert push_lock._lock_info.model == ""
     assert push_lock._lock_info.serial == "aa:bb:cc:dd:ee:ff"
+    assert push_lock._lock_info.door_sense is False
 
 
 @pytest.mark.asyncio
@@ -570,3 +574,4 @@ async def test_update_continues_when_lock_info_probe_bleak_error() -> None:
     assert push_lock._lock_info is not None
     assert push_lock._lock_info.manufacturer == "Unknown"
     assert push_lock._lock_info.serial == "aa:bb:cc:dd:ee:ff"
+    assert push_lock._lock_info.door_sense is False

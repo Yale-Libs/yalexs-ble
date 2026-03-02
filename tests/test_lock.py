@@ -221,19 +221,26 @@ def _make_lock_with_mock_client(
     lock.secure_session = MagicMock()
 
     effects = side_effects or {}
-    call_count = 0
 
-    mock_client.services.get_characteristic = lambda uuid: MagicMock()
+    # Map each characteristic UUID to a unique mock object so
+    # read_gatt_char can identify which UUID is being read.
+    char_mocks: dict[str, MagicMock] = {}
+    mock_to_uuid: dict[int, str] = {}
+    for uuid in _CHAR_ORDER:
+        m = MagicMock()
+        char_mocks[uuid] = m
+        mock_to_uuid[id(m)] = uuid
+
+    mock_client.services.get_characteristic = char_mocks.get
 
     async def read_gatt_char(char: MagicMock) -> bytes:
-        nonlocal call_count
-        uuid = _CHAR_ORDER[call_count]
-        call_count += 1
+        uuid = mock_to_uuid[id(char)]
         if uuid in effects:
             raise effects[uuid]
         return _CHAR_DATA[uuid]
 
     mock_client.read_gatt_char = read_gatt_char
+    mock_client._mock_to_uuid = mock_to_uuid
     return lock, mock_client
 
 
@@ -278,7 +285,7 @@ async def test_lock_info_all_reads_fail() -> None:
 
     assert info == LockInfo(
         manufacturer="Unknown",
-        model="Unknown",
+        model="",
         serial="aa:bb:cc:dd:ee:ff",
         firmware="Unknown",
     )
@@ -300,18 +307,38 @@ async def test_lock_info_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lock_info_missing_characteristic() -> None:
+    """Test lock_info skips missing characteristics instead of aborting."""
+    lock, mock_client = _make_lock_with_mock_client()
+
+    original_get = mock_client.services.get_characteristic
+
+    def get_char_skip_serial(uuid: str) -> MagicMock | None:
+        if uuid == SERIAL_NUMBER_CHARACTERISTIC:
+            return None
+        return original_get(uuid)
+
+    mock_client.services.get_characteristic = get_char_skip_serial
+
+    info = await lock.lock_info()
+
+    assert info.manufacturer == "August"
+    assert info.model == "ASL-03"
+    assert info.serial == "aa:bb:cc:dd:ee:ff"
+    assert info.firmware == "2.0.0"
+
+
+@pytest.mark.asyncio
 async def test_lock_info_reads_model_first() -> None:
-    """Test that model is read first so it's available even on partial timeout."""
+    """Test that model is read first so it's available as early as possible."""
     lock, mock_client = _make_lock_with_mock_client()
     call_order: list[str] = []
-    call_count = 0
+    original_read = mock_client.read_gatt_char
+    mock_to_uuid = mock_client._mock_to_uuid
 
     async def tracking_read(char: MagicMock) -> bytes:
-        nonlocal call_count
-        uuid = _CHAR_ORDER[call_count]
-        call_order.append(uuid)
-        call_count += 1
-        return _CHAR_DATA[uuid]
+        call_order.append(mock_to_uuid[id(char)])
+        return await original_read(char)
 
     mock_client.read_gatt_char = tracking_read
 

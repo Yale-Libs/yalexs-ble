@@ -875,7 +875,7 @@ class PushLock:
             )
             lock_info = LockInfo(
                 manufacturer="Unknown",
-                model="Unknown",
+                model="",
                 serial=self.address,
                 firmware="Unknown",
             )
