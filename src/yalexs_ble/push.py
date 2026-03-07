@@ -1015,6 +1015,8 @@ class PushLock:
             _LOGGER.debug(
                 "%s: Failed to set connection parameters", self.name, exc_info=True
             )
+        else:
+            _LOGGER.debug("%s: Set slow connection parameters", self.name)
 
     def _callback_state(self, lock_state: LockState) -> None:
         """Call the callbacks."""
