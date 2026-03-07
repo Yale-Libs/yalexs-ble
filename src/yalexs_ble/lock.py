@@ -19,7 +19,6 @@ from bleak_retry_connector import (
 from . import util
 from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
-    MANUFACTURER_NAME_CHARACTERISTIC,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_AUTO_LOCK_MODE,
@@ -308,15 +307,13 @@ class Lock:
         _LOGGER.debug("%s: Probing the lock", self.name)
         assert self.client is not None  # nosec
         # Read model first since it drives battery and door sense behavior.
-        # Manufacturer is read last because some locks have a BLE controller
-        # bug that corrupts ACL packets on certain handle reads, and
-        # manufacturer is the least critical field.
-        # Order: model, serial, firmware, manufacturer.
+        # Manufacturer name is not read because newer locks have a BLE
+        # controller bug that corrupts ACL packets when reading that
+        # characteristic, which kills the connection.
         char_uuids = (
             MODEL_NUMBER_CHARACTERISTIC,
             SERIAL_NUMBER_CHARACTERISTIC,
             FIRMWARE_REVISION_CHARACTERISTIC,
-            MANUFACTURER_NAME_CHARACTERISTIC,
         )
         results: dict[str, str] = {}
         try:
@@ -351,7 +348,7 @@ class Lock:
         # in Home Assistant when the characteristic read fails.
         serial_fallback = self.ble_device_callback().address
         self._lock_info = LockInfo(
-            manufacturer=results.get(MANUFACTURER_NAME_CHARACTERISTIC, "Unknown"),
+            manufacturer="Yale/August",
             model=results.get(MODEL_NUMBER_CHARACTERISTIC, ""),
             serial=results.get(SERIAL_NUMBER_CHARACTERISTIC, serial_fallback),
             firmware=results.get(FIRMWARE_REVISION_CHARACTERISTIC, "Unknown"),
