@@ -1005,7 +1005,7 @@ class PushLock:
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""
         client = lock.client
-        if client is None or not hasattr(client, "set_connection_params"):
+        if client is None:
             return
         try:
             await client.set_connection_params(
