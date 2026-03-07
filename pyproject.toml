@@ -1,6 +1,6 @@
 [project]
 name = "yalexs-ble"
-version = "3.2.4"
+version = "3.3.0"
 description = "Bluetooth control of Yale and August locks"
 authors = [{ name = "J. Nick Koston", email = "nick@koston.org" }]
 license = "GPL-3.0-only"
@@ -31,7 +31,7 @@ python = ">=3.11,<3.15"
 
 # Documentation Dependencies
 bleak = ">=0.19.0"
-bleak-retry-connector = ">=3.4.0"
+bleak-retry-connector = ">=4.6.0"
 async-timeout = {version = ">=3.0.0", python = "<3.11"}
 cryptography = ">=38.0.0"
 lru-dict = ">=1.1.4"
