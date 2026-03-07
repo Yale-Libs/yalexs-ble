@@ -94,7 +94,7 @@ MANUAL_UPDATE_COALESCE_SECONDS = 0.05
 SLOW_MIN_INTERVAL = 800  # 1000ms
 SLOW_MAX_INTERVAL = 800  # 1000ms
 SLOW_LATENCY = 0
-SLOW_TIMEOUT = 300  # 3000ms
+SLOW_TIMEOUT = 600  # 6000ms
 
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
@@ -315,6 +315,7 @@ class PushLock:
         self._last_lock_operation_complete_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
+        self._slow_params_set = False
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
 
     @property
@@ -619,6 +620,7 @@ class PushLock:
             self._next_disconnect_delay = self._idle_disconnect_delay
             self._reset_disconnect_timer()
             self._seen_this_session.clear()
+            self._slow_params_set = False
             return self._client
 
     async def securemode(self) -> None:
@@ -1004,6 +1006,8 @@ class PushLock:
 
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""
+        if self._slow_params_set:
+            return
         client = lock.client
         if client is None:
             return
@@ -1016,6 +1020,7 @@ class PushLock:
                 "%s: Failed to set connection parameters", self.name, exc_info=True
             )
         else:
+            self._slow_params_set = True
             _LOGGER.debug("%s: Set slow connection parameters", self.name)
 
     def _callback_state(self, lock_state: LockState) -> None:
