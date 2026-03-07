@@ -88,6 +88,14 @@ HK_UPDATE_COALESCE_SECONDS = 0.025
 # How long to wait before processing a manual update request
 MANUAL_UPDATE_COALESCE_SECONDS = 0.05
 
+# BLE connection parameters for always-connected mode (battery saving)
+# After the initial sync, we switch to slow intervals to conserve battery.
+# Values are in BLE units: intervals in 1.25ms, timeout in 10ms.
+SLOW_MIN_INTERVAL = 800  # 1000ms
+SLOW_MAX_INTERVAL = 800  # 1000ms
+SLOW_LATENCY = 0
+SLOW_TIMEOUT = 300  # 3000ms
+
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
 
@@ -986,10 +994,27 @@ class PushLock:
             self._next_disconnect_delay = FIRST_CONNECTION_DISCONNECT_TIME
             self._reset_disconnect_timer()
 
+        if self._always_connected and made_request:
+            await self._set_slow_connection_params(lock)
+
         if made_request:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
         return state
+
+    async def _set_slow_connection_params(self, lock: Lock) -> None:
+        """Set slow BLE connection parameters to conserve battery."""
+        client = lock.client
+        if client is None or not hasattr(client, "set_connection_params"):
+            return
+        try:
+            await client.set_connection_params(
+                SLOW_MIN_INTERVAL, SLOW_MAX_INTERVAL, SLOW_LATENCY, SLOW_TIMEOUT
+            )
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "%s: Failed to set connection parameters", self.name, exc_info=True
+            )
 
     def _callback_state(self, lock_state: LockState) -> None:
         """Call the callbacks."""
