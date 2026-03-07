@@ -25,6 +25,12 @@ FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
 
 
+# delay on last attempt will be 60 sec: backoff_seconds * (retries-1)^2
+LOCK_ACTIVITY_POLL_RETRIES = 3
+LOCK_ACTIVITY_POLL_RETRY_EXPONENTIAL_BACKOFF_SECONDS = 15
+LOCK_ACTIVITY_POLL_INITIAL_DELAY_DURING_UPDATE = 30
+
+
 class Commands(IntEnum):
     GETSTATUS = 0x02
     WRITESETTING = 0x03
@@ -154,6 +160,9 @@ class LockActivity:
 class DoorActivity:
     timestamp: datetime
     status: DoorStatus
+
+
+LockActivityValue = DoorActivity | LockActivity
 
 
 @dataclass
