@@ -48,7 +48,7 @@ from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
 
 _LOGGER = logging.getLogger(__name__)
 
-LOCK_INFO_TIMEOUT = 5
+LOCK_INFO_TIMEOUT = 3
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -308,33 +308,45 @@ class Lock:
         _LOGGER.debug("%s: Probing the lock", self.name)
         assert self.client is not None  # nosec
         # Read model first since it drives battery and door sense behavior.
-        # Order: model, manufacturer, serial, firmware.
+        # Manufacturer is read last because some locks have a BLE controller
+        # bug that corrupts ACL packets on certain handle reads, and
+        # manufacturer is the least critical field.
+        # Order: model, serial, firmware, manufacturer.
         char_uuids = (
             MODEL_NUMBER_CHARACTERISTIC,
-            MANUFACTURER_NAME_CHARACTERISTIC,
             SERIAL_NUMBER_CHARACTERISTIC,
             FIRMWARE_REVISION_CHARACTERISTIC,
+            MANUFACTURER_NAME_CHARACTERISTIC,
         )
         results: dict[str, str] = {}
-        async with util.asyncio_timeout(LOCK_INFO_TIMEOUT):
-            for char_uuid in char_uuids:
-                char = self.client.services.get_characteristic(char_uuid)
-                if not char:
-                    _LOGGER.warning(
-                        "%s: Characteristic %s not found", self.name, char_uuid
-                    )
-                    continue
-                try:
-                    results[char_uuid] = (
-                        (await self.client.read_gatt_char(char)).decode().split("\0")[0]
-                    )
-                except BleakError as err:
-                    _LOGGER.warning(
-                        "%s: Failed to read characteristic %s: %s",
-                        self.name,
-                        char_uuid,
-                        err,
-                    )
+        try:
+            async with util.asyncio_timeout(LOCK_INFO_TIMEOUT):
+                for char_uuid in char_uuids:
+                    char = self.client.services.get_characteristic(char_uuid)
+                    if not char:
+                        _LOGGER.warning(
+                            "%s: Characteristic %s not found", self.name, char_uuid
+                        )
+                        continue
+                    try:
+                        results[char_uuid] = (
+                            (await self.client.read_gatt_char(char))
+                            .decode()
+                            .split("\0")[0]
+                        )
+                    except BleakError as err:
+                        _LOGGER.warning(
+                            "%s: Failed to read characteristic %s: %s",
+                            self.name,
+                            char_uuid,
+                            err,
+                        )
+        except TimeoutError:
+            _LOGGER.warning(
+                "%s: Timeout reading lock info, using %d partial results",
+                self.name,
+                len(results),
+            )
         # Use the BLE address as fallback serial to keep devices unique
         # in Home Assistant when the characteristic read fails.
         serial_fallback = self.ble_device_callback().address
