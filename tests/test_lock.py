@@ -8,7 +8,6 @@ from bleak_retry_connector import BLEDevice
 
 from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
-    MANUFACTURER_NAME_CHARACTERISTIC,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     LockInfo,
@@ -189,15 +188,13 @@ def test_parse_lock_command_response_locked_success() -> None:
 
 _CHAR_DATA: dict[str, bytes] = {
     MODEL_NUMBER_CHARACTERISTIC: b"ASL-03",
-    MANUFACTURER_NAME_CHARACTERISTIC: b"August",
     SERIAL_NUMBER_CHARACTERISTIC: b"12345",
     FIRMWARE_REVISION_CHARACTERISTIC: b"2.0.0",
 }
 
-# Model is read first, then manufacturer, serial, firmware.
+# Model is read first, then serial, firmware.
 _CHAR_ORDER: tuple[str, ...] = (
     MODEL_NUMBER_CHARACTERISTIC,
-    MANUFACTURER_NAME_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     FIRMWARE_REVISION_CHARACTERISTIC,
 )
@@ -252,7 +249,7 @@ async def test_lock_info_success() -> None:
     info = await lock.lock_info()
 
     assert info == LockInfo(
-        manufacturer="August",
+        manufacturer="Yale/August",
         model="ASL-03",
         serial="12345",
         firmware="2.0.0",
@@ -268,7 +265,7 @@ async def test_lock_info_partial_failure() -> None:
 
     info = await lock.lock_info()
 
-    assert info.manufacturer == "August"
+    assert info.manufacturer == "Yale/August"
     assert info.model == "ASL-03"
     assert info.serial == "aa:bb:cc:dd:ee:ff"
     assert info.firmware == "2.0.0"
@@ -284,7 +281,7 @@ async def test_lock_info_all_reads_fail() -> None:
     info = await lock.lock_info()
 
     assert info == LockInfo(
-        manufacturer="Unknown",
+        manufacturer="Yale/August",
         model="",
         serial="aa:bb:cc:dd:ee:ff",
         firmware="Unknown",
@@ -293,7 +290,7 @@ async def test_lock_info_all_reads_fail() -> None:
 
 @pytest.mark.asyncio
 async def test_lock_info_timeout() -> None:
-    """Test lock_info raises TimeoutError when reads hang."""
+    """Test lock_info returns partial results when reads hang."""
     lock, mock_client = _make_lock_with_mock_client()
 
     async def hang_forever(char: MagicMock) -> bytes:
@@ -302,8 +299,14 @@ async def test_lock_info_timeout() -> None:
 
     mock_client.read_gatt_char = hang_forever
 
-    with patch("yalexs_ble.lock.LOCK_INFO_TIMEOUT", 0), pytest.raises(TimeoutError):
-        await lock.lock_info()
+    with patch("yalexs_ble.lock.LOCK_INFO_TIMEOUT", 0):
+        info = await lock.lock_info()
+
+    # All reads hung so no results, but we get defaults instead of an exception
+    assert info.manufacturer == "Yale/August"
+    assert info.model == ""
+    assert info.serial == "aa:bb:cc:dd:ee:ff"
+    assert info.firmware == "Unknown"
 
 
 @pytest.mark.asyncio
@@ -322,7 +325,7 @@ async def test_lock_info_missing_characteristic() -> None:
 
     info = await lock.lock_info()
 
-    assert info.manufacturer == "August"
+    assert info.manufacturer == "Yale/August"
     assert info.model == "ASL-03"
     assert info.serial == "aa:bb:cc:dd:ee:ff"
     assert info.firmware == "2.0.0"
