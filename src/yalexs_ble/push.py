@@ -115,6 +115,9 @@ AUTH_FAILURE_TO_START_REAUTH = 5
 # How long to wait before retrying battery after a timeout (5 minutes)
 BATTERY_TIMEOUT_COOLDOWN = 300
 
+# How often to re-poll battery state in always_connected mode (10 minutes)
+BATTERY_REFRESH_INTERVAL = 600.0
+
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
 # exclusions
 NO_BATTERY_SUPPORT_MODELS = {
@@ -317,6 +320,7 @@ class PushLock:
         self._always_connected = always_connected
         self._slow_params_set = False
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
+        self._last_battery_refresh_time = NEVER_TIME
 
     @property
     def local_name(self) -> str | None:
@@ -915,6 +919,25 @@ class PushLock:
             self._lock_info.model,
             needs_battery_workaround,
         )
+
+        # In always_connected mode _seen_this_session never clears, so periodically
+        # evict BatteryState to force a re-poll at the configured interval.
+        if (
+            self._always_connected
+            and BatteryState in self._seen_this_session
+            and time.monotonic() - self._last_battery_refresh_time
+            > BATTERY_REFRESH_INTERVAL
+        ):
+            self._seen_this_session.discard(BatteryState)
+            # Stamp the time before polling so that a BleakError during
+            # _poll_battery (which leaves BatteryState out of
+            # _seen_this_session) causes immediate retry on subsequent
+            # keep-alive cycles rather than waiting another full interval.
+            self._last_battery_refresh_time = time.monotonic()
+            _LOGGER.debug(
+                "%s: Battery refresh due, will re-poll on this update",
+                self.name,
+            )
 
         if not needs_battery_workaround and BatteryState not in self._seen_this_session:
             state, battery_requested = await self._poll_battery(lock, state)
