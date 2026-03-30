@@ -115,6 +115,9 @@ AUTH_FAILURE_TO_START_REAUTH = 5
 # How long to wait before retrying battery after a timeout (5 minutes)
 BATTERY_TIMEOUT_COOLDOWN = 300
 
+# How often to re-poll battery state in always_connected mode (10 minutes)
+BATTERY_REFRESH_INTERVAL = 600.0
+
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
 # exclusions
 NO_BATTERY_SUPPORT_MODELS = {
@@ -317,6 +320,7 @@ class PushLock:
         self._always_connected = always_connected
         self._slow_params_set = False
         self._next_battery_attempt_time = NEVER_TIME  # Cooldown after battery timeout
+        self._last_battery_refresh_time = NEVER_TIME
 
     @property
     def local_name(self) -> str | None:
@@ -892,6 +896,36 @@ class PushLock:
         _LOGGER.debug("Obtained lock info: %s", lock_info)
         return lock_info
 
+    async def _maybe_poll_battery(
+        self, lock: Lock, state: LockState, made_request: bool, lock_info: LockInfo
+    ) -> tuple[LockState, bool]:
+        """Poll battery if needed, with periodic refresh in always_connected mode."""
+        needs_battery_workaround = lock_info.model in NO_BATTERY_SUPPORT_MODELS
+        _LOGGER.debug(
+            "Needs battery workaround model %s: %s",
+            lock_info.model,
+            needs_battery_workaround,
+        )
+        # In always_connected mode _seen_this_session never clears, so
+        # periodically evict BatteryState to force a re-poll.
+        if (
+            self._always_connected
+            and BatteryState in self._seen_this_session
+            and time.monotonic() - self._last_battery_refresh_time
+            > BATTERY_REFRESH_INTERVAL
+        ):
+            self._seen_this_session.discard(BatteryState)
+            self._last_battery_refresh_time = time.monotonic()
+            _LOGGER.debug(
+                "%s: Battery refresh due, will re-poll on this update",
+                self.name,
+            )
+        if not needs_battery_workaround and BatteryState not in self._seen_this_session:
+            state, battery_requested = await self._poll_battery(lock, state)
+            if battery_requested:
+                made_request = True
+        return state, made_request
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
@@ -904,22 +938,14 @@ class PushLock:
         lock = await self._ensure_connected()
         if not self._lock_info:
             self._lock_info = await self._probe_lock_info(lock)
-        # Asking for battery first seems to be reduce the chance of the lock
-        # getting into a bad state.
         state = self._get_current_state()
         made_request = False
 
-        needs_battery_workaround = self._lock_info.model in NO_BATTERY_SUPPORT_MODELS
-        _LOGGER.debug(
-            "Needs battery workaround model %s: %s",
-            self._lock_info.model,
-            needs_battery_workaround,
+        # Asking for battery first seems to reduce the chance of the lock
+        # getting into a bad state.
+        state, made_request = await self._maybe_poll_battery(
+            lock, state, made_request, self._lock_info
         )
-
-        if not needs_battery_workaround and BatteryState not in self._seen_this_session:
-            state, battery_requested = await self._poll_battery(lock, state)
-            if battery_requested:
-                made_request = True
 
         if (
             DoorStatus not in self._seen_this_session
@@ -1090,11 +1116,15 @@ class PushLock:
                 # Encrypted data, we don't know how to decrypt it
                 # but we know its a state change so we schedule an update
                 next_update = HK_UPDATE_COALESCE_SECONDS
-        # Only track the single 0/1 value from the advertisement
-        # as we can get an storm of metadata we don't know how to
-        # decode that starts with b'\x00\x00' and will cause us to
-        # connect over and over again when active scanning is enabled.
-        # b'\x00\x00\x80\x15\xd0\x11\xf7\xa5\x43\x1f\x85\xd7\xff\x23\x5f\x1e\x75\x46'
+        # Yale YALE_MFR_ID advertisements come in two formats:
+        # - 1-byte: lock state toggle (0/1), used for change detection
+        # - 18-byte: 2 header bytes + the lock's 16-byte cloud ID (the
+        #   identifier used by the Yale/ASSA ABLOY cloud API), e.g.
+        #   b'\x00\x00\x80\x15\xd0\x11\xf7\xa5\x43\x1f\x85\xd7\xff\x23\x5f\x1e\x75\x46'
+        # Only track byte[0] from the 1-byte format. The two formats
+        # alternate every few seconds; without the length check, the
+        # static 0x00 header of the 18-byte format causes repeated
+        # connections if it differs from the 1-byte value.
         is_first_advertisement = self._last_adv_value == -1
         if YALE_MFR_ID in mfr_data and (
             len(mfr_data[YALE_MFR_ID]) == 1 or is_first_advertisement

@@ -16,6 +16,7 @@ from yalexs_ble.const import (
     LockStatus,
 )
 from yalexs_ble.push import (
+    BATTERY_REFRESH_INTERVAL,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
     SLOW_LATENCY,
@@ -723,3 +724,174 @@ async def test_update_handles_connection_params_failure():
 
     assert final_state.lock == LockStatus.LOCKED
     mock_client.set_connection_params.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_battery_refresh_clears_seen_and_repoll_when_due():
+    """In always_connected mode, _update() should evict BatteryState from
+    _seen_this_session and re-poll battery once BATTERY_REFRESH_INTERVAL
+    has elapsed since the last refresh."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+
+    battery_state = BatteryState(voltage=4.0, percentage=90)
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock(return_value=battery_state)
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+    mock_lock.client = MagicMock()
+    mock_lock.client.set_connection_params = AsyncMock()
+
+    push_lock._lock_info = LockInfo(
+        manufacturer="August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+    push_lock._running = True
+
+    # Simulate battery already polled this session
+    push_lock._seen_this_session.add(BatteryState)
+
+    # Set refresh time far enough in the past to trigger
+    push_lock._last_battery_refresh_time = (
+        time.monotonic() - BATTERY_REFRESH_INTERVAL - 1.0
+    )
+    before_update = time.monotonic()
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        final_state = await push_lock._update()
+
+    # Battery should have been re-polled
+    mock_lock.battery.assert_called_once()
+    assert final_state.battery == battery_state
+    # Timestamp should have been refreshed so the next cycle waits a full interval
+    assert push_lock._last_battery_refresh_time >= before_update
+
+
+@pytest.mark.asyncio
+async def test_battery_refresh_not_due_skips_repoll():
+    """In always_connected mode, _update() should NOT re-poll battery when
+    BATTERY_REFRESH_INTERVAL has not yet elapsed."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock()
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+    mock_lock.client = MagicMock()
+    mock_lock.client.set_connection_params = AsyncMock()
+
+    push_lock._lock_info = LockInfo(
+        manufacturer="August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+    push_lock._running = True
+
+    # Simulate battery already polled this session
+    push_lock._seen_this_session.add(BatteryState)
+
+    # Set refresh time to just now — interval not elapsed
+    push_lock._last_battery_refresh_time = time.monotonic()
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        await push_lock._update()
+
+    # Battery should NOT have been re-polled
+    mock_lock.battery.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_battery_refresh_does_not_fire_when_not_always_connected():
+    """The periodic battery refresh must not affect non-always-connected locks.
+    In normal mode _seen_this_session clears on each new connection, so battery
+    is polled naturally and the interval guard must stay dormant."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock()
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.auto_lock_status = AsyncMock(
+        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
+    )
+    mock_lock.client = MagicMock()
+    mock_lock.client.set_connection_params = AsyncMock()
+
+    push_lock._lock_info = LockInfo(
+        manufacturer="August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+    push_lock._running = True
+
+    # Simulate battery already seen and interval well elapsed
+    push_lock._seen_this_session.add(BatteryState)
+    push_lock._last_battery_refresh_time = (
+        time.monotonic() - BATTERY_REFRESH_INTERVAL - 1.0
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        await push_lock._update()
+
+    # Refresh block should not have fired — battery skipped because it is
+    # in _seen_this_session and always_connected is False
+    mock_lock.battery.assert_not_called()
+    # Timestamp must not have been touched
+    assert (
+        push_lock._last_battery_refresh_time
+        < time.monotonic() - BATTERY_REFRESH_INTERVAL
+    )
