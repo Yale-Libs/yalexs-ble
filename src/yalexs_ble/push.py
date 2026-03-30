@@ -943,9 +943,7 @@ class PushLock:
 
         # Asking for battery first seems to reduce the chance of the lock
         # getting into a bad state.
-        state, made_request = await self._maybe_poll_battery(
-            lock, state, made_request
-        )
+        state, made_request = await self._maybe_poll_battery(lock, state, made_request)
 
         if (
             DoorStatus not in self._seen_this_session
