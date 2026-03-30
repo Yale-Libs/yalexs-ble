@@ -897,13 +897,13 @@ class PushLock:
         return lock_info
 
     async def _maybe_poll_battery(
-        self, lock: Lock, state: LockState, made_request: bool
+        self, lock: Lock, state: LockState, made_request: bool, lock_info: LockInfo
     ) -> tuple[LockState, bool]:
         """Poll battery if needed, with periodic refresh in always_connected mode."""
-        needs_battery_workaround = self._lock_info.model in NO_BATTERY_SUPPORT_MODELS
+        needs_battery_workaround = lock_info.model in NO_BATTERY_SUPPORT_MODELS
         _LOGGER.debug(
             "Needs battery workaround model %s: %s",
-            self._lock_info.model,
+            lock_info.model,
             needs_battery_workaround,
         )
         # In always_connected mode _seen_this_session never clears, so
@@ -943,7 +943,9 @@ class PushLock:
 
         # Asking for battery first seems to reduce the chance of the lock
         # getting into a bad state.
-        state, made_request = await self._maybe_poll_battery(lock, state, made_request)
+        state, made_request = await self._maybe_poll_battery(
+            lock, state, made_request, self._lock_info
+        )
 
         if (
             DoorStatus not in self._seen_this_session
