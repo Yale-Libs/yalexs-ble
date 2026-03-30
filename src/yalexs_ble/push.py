@@ -896,6 +896,36 @@ class PushLock:
         _LOGGER.debug("Obtained lock info: %s", lock_info)
         return lock_info
 
+    async def _maybe_poll_battery(
+        self, lock: Lock, state: LockState, made_request: bool
+    ) -> tuple[LockState, bool]:
+        """Poll battery if needed, with periodic refresh in always_connected mode."""
+        needs_battery_workaround = self._lock_info.model in NO_BATTERY_SUPPORT_MODELS
+        _LOGGER.debug(
+            "Needs battery workaround model %s: %s",
+            self._lock_info.model,
+            needs_battery_workaround,
+        )
+        # In always_connected mode _seen_this_session never clears, so
+        # periodically evict BatteryState to force a re-poll.
+        if (
+            self._always_connected
+            and BatteryState in self._seen_this_session
+            and time.monotonic() - self._last_battery_refresh_time
+            > BATTERY_REFRESH_INTERVAL
+        ):
+            self._seen_this_session.discard(BatteryState)
+            self._last_battery_refresh_time = time.monotonic()
+            _LOGGER.debug(
+                "%s: Battery refresh due, will re-poll on this update",
+                self.name,
+            )
+        if not needs_battery_workaround and BatteryState not in self._seen_this_session:
+            state, battery_requested = await self._poll_battery(lock, state)
+            if battery_requested:
+                made_request = True
+        return state, made_request
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
@@ -908,41 +938,14 @@ class PushLock:
         lock = await self._ensure_connected()
         if not self._lock_info:
             self._lock_info = await self._probe_lock_info(lock)
-        # Asking for battery first seems to be reduce the chance of the lock
-        # getting into a bad state.
         state = self._get_current_state()
         made_request = False
 
-        needs_battery_workaround = self._lock_info.model in NO_BATTERY_SUPPORT_MODELS
-        _LOGGER.debug(
-            "Needs battery workaround model %s: %s",
-            self._lock_info.model,
-            needs_battery_workaround,
+        # Asking for battery first seems to reduce the chance of the lock
+        # getting into a bad state.
+        state, made_request = await self._maybe_poll_battery(
+            lock, state, made_request
         )
-
-        # In always_connected mode _seen_this_session never clears, so periodically
-        # evict BatteryState to force a re-poll at the configured interval.
-        if (
-            self._always_connected
-            and BatteryState in self._seen_this_session
-            and time.monotonic() - self._last_battery_refresh_time
-            > BATTERY_REFRESH_INTERVAL
-        ):
-            self._seen_this_session.discard(BatteryState)
-            # Stamp the time before polling so that a BleakError during
-            # _poll_battery (which leaves BatteryState out of
-            # _seen_this_session) causes immediate retry on subsequent
-            # keep-alive cycles rather than waiting another full interval.
-            self._last_battery_refresh_time = time.monotonic()
-            _LOGGER.debug(
-                "%s: Battery refresh due, will re-poll on this update",
-                self.name,
-            )
-
-        if not needs_battery_workaround and BatteryState not in self._seen_this_session:
-            state, battery_requested = await self._poll_battery(lock, state)
-            if battery_requested:
-                made_request = True
 
         if (
             DoorStatus not in self._seen_this_session
