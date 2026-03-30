@@ -891,4 +891,7 @@ async def test_battery_refresh_does_not_fire_when_not_always_connected():
     # in _seen_this_session and always_connected is False
     mock_lock.battery.assert_not_called()
     # Timestamp must not have been touched
-    assert push_lock._last_battery_refresh_time < time.monotonic() - BATTERY_REFRESH_INTERVAL
+    assert (
+        push_lock._last_battery_refresh_time
+        < time.monotonic() - BATTERY_REFRESH_INTERVAL
+    )
