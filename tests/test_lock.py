@@ -10,6 +10,8 @@ from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
+    AutoLockMode,
+    AutoLockState,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
@@ -184,6 +186,48 @@ def test_parse_lock_command_response_locked_success() -> None:
     result_list = list(result)
     assert len(result_list) == 1
     assert result_list[0] is LockStatus.LOCKED
+
+
+def _make_auto_lock_response(mode_byte: int, duration: int) -> bytes:
+    """Build a minimal _parse_auto_lock_state response buffer."""
+    return bytes(8) + duration.to_bytes(2, "little") + bytes([mode_byte])
+
+
+def _make_lock() -> Lock:
+    return Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+
+def test_parse_auto_lock_state_known_mode() -> None:
+    """Known mode byte returns the matching AutoLockMode with its duration."""
+    lock = _make_lock()
+    response = _make_auto_lock_response(AutoLockMode.TIMER, 30)
+    result = lock._parse_auto_lock_state(response)
+    assert result == AutoLockState(AutoLockMode.TIMER, 30)
+
+
+def test_parse_auto_lock_state_unknown_mode_logs_and_returns_off(caplog: pytest.LogCaptureFixture) -> None:
+    """Unrecognized mode byte falls back to OFF and logs a warning."""
+    lock = _make_lock()
+    response = _make_auto_lock_response(0xAB, 15)
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        result = lock._parse_auto_lock_state(response)
+    assert result.mode is AutoLockMode.OFF
+    assert "0xab" in caplog.text.lower()
+
+
+def test_parse_auto_lock_state_both_zero_means_disabled() -> None:
+    """When mode byte maps to 0 (INSTANT) and duration is 0, state is OFF."""
+    lock = _make_lock()
+    response = _make_auto_lock_response(AutoLockMode.INSTANT, 0)
+    result = lock._parse_auto_lock_state(response)
+    assert result.mode is AutoLockMode.OFF
+    assert result.duration == 0
 
 
 _CHAR_DATA: dict[str, bytes] = {
