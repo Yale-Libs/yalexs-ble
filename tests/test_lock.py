@@ -211,7 +211,9 @@ def test_parse_auto_lock_state_known_mode() -> None:
     assert result == AutoLockState(AutoLockMode.TIMER, 30)
 
 
-def test_parse_auto_lock_state_unknown_mode_logs_and_returns_off(caplog: pytest.LogCaptureFixture) -> None:
+def test_parse_auto_lock_state_unknown_mode_logs_and_returns_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Unrecognized mode byte falls back to OFF and logs a warning."""
     lock = _make_lock()
     response = _make_auto_lock_response(0xAB, 15)
