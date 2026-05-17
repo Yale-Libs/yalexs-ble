@@ -231,6 +231,105 @@ def _make_lock() -> Lock:
     )
 
 
+def test_parse_unlock_response_unknown_status_byte_is_recognized() -> None:
+    """Issue #317: bb0a + non-status byte[3] is recognized, not flagged unknown.
+
+    The Yale/August locks were observed emitting `bb0a00390000...0200` right
+    after a successful unlock. byte[3]=0x39 is not a LockStatus. The packet
+    should be recognized as a LOCK/UNLOCK ack and produce no state update,
+    rather than triggering the noisy "Unknown state" log.
+    """
+    lock = _make_lock()
+
+    frame = bytes.fromhex("bb0a00390000000000000000000000000200")
+    result = lock._parse_state(frame)
+
+    assert result is not None
+    assert list(result) == []
+
+
+def test_parse_lock_response_unknown_status_byte_is_recognized() -> None:
+    """Same as #317 but for the LOCK command (0x0B)."""
+    lock = _make_lock()
+
+    frame = bytes.fromhex("bb0b00390000000000000000000000000200")
+    result = lock._parse_state(frame)
+
+    assert result is not None
+    assert list(result) == []
+
+
+def test_parse_lock_activity_response_is_recognized() -> None:
+    """LOCK_ACTIVITY (0xBB + 0x2D) is historical, not an unknown packet."""
+    lock = _make_lock()
+
+    frame = bytes.fromhex("bb2d00000000000000000000000000000000")
+    result = lock._parse_state(frame)
+
+    assert result is not None
+    assert list(result) == []
+
+
+def test_parse_truly_unknown_packet_returns_none() -> None:
+    """A packet that doesn't match any recognized prefix returns None."""
+    lock = _make_lock()
+
+    frame = bytes.fromhex("cc00000000000000000000000000000000")
+    result = lock._parse_state(frame)
+
+    assert result is None
+
+
+def test_internal_state_callback_skips_log_for_recognized_no_update(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Recognized-but-no-update packets must not log 'Unknown state'."""
+    received: list[list[LockStatus]] = []
+
+    def collect(states: object) -> None:
+        received.append(list(states))  # type: ignore[arg-type]
+
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        collect,
+    )
+
+    frame = bytes.fromhex("bb0a00390000000000000000000000000200")
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        lock._internal_state_callback(frame)
+
+    assert "Unknown state" not in caplog.text
+    assert received == [[]]
+
+
+def test_internal_state_callback_logs_unknown_for_unrecognized_packet(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Truly unrecognized packets still emit the 'Unknown state' INFO log."""
+    received: list[list[LockStatus]] = []
+
+    def collect(states: object) -> None:
+        received.append(list(states))  # type: ignore[arg-type]
+
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        collect,
+    )
+
+    frame = bytes.fromhex("cc00000000000000000000000000000000")
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        lock._internal_state_callback(frame)
+
+    assert "Unknown state" in caplog.text
+    assert received == []
+
+
 def test_parse_auto_lock_state_known_mode() -> None:
     """Known mode byte returns the matching AutoLockMode with its duration."""
     lock = _make_lock()
