@@ -16,6 +16,8 @@ from yalexs_ble.const import (
     LockStatus,
 )
 from yalexs_ble.push import (
+    _AUTH_FAILURE_HISTORY,
+    AUTH_FAILURE_TO_START_REAUTH,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
     SLOW_LATENCY,
@@ -723,3 +725,222 @@ async def test_update_handles_connection_params_failure():
 
     assert final_state.lock == LockStatus.LOCKED
     mock_client.set_connection_params.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_disconnected_callback_schedules_reconnect_when_always_connected():
+    """Disconnect callback schedules keep-alive when always_connected and auth ok."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:01",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+    _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+
+    with patch.object(push_lock, "_keep_alive") as mock_keep_alive:
+        push_lock._disconnected_callback()
+
+    mock_keep_alive.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_disconnected_callback_skips_reconnect_after_auth_failures():
+    """Disconnect callback skips keep-alive when auth has failed enough times."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:02",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+    for _ in range(AUTH_FAILURE_TO_START_REAUTH):
+        _AUTH_FAILURE_HISTORY.auth_failed(push_lock.address)
+
+    try:
+        with patch.object(push_lock, "_keep_alive") as mock_keep_alive:
+            push_lock._disconnected_callback()
+        mock_keep_alive.assert_not_called()
+    finally:
+        _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+
+
+@pytest.mark.asyncio
+async def test_disconnected_callback_noop_when_not_always_connected():
+    """Disconnect callback does nothing in non-always-connected mode."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:03",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    with patch.object(push_lock, "_keep_alive") as mock_keep_alive:
+        push_lock._disconnected_callback()
+
+    mock_keep_alive.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_noop_when_not_always_connected():
+    """Keep-alive returns immediately when not always_connected."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:04",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    with (
+        patch.object(push_lock, "_schedule_future_update") as mock_schedule_update,
+        patch.object(push_lock, "_schedule_next_keep_alive") as mock_next_keep_alive,
+    ):
+        push_lock._keep_alive()
+
+    mock_schedule_update.assert_not_called()
+    mock_next_keep_alive.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_schedules_update_and_next_when_always_connected():
+    """Keep-alive schedules an immediate update and next keep-alive when always_connected."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:05",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+
+    with (
+        patch.object(push_lock, "_schedule_future_update") as mock_schedule_update,
+        patch.object(push_lock, "_schedule_next_keep_alive") as mock_next_keep_alive,
+    ):
+        push_lock._keep_alive()
+
+    mock_schedule_update.assert_called_once_with(0)
+    mock_next_keep_alive.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_with_timer_skips_when_operation_lock_held():
+    """Disconnect timer reschedules itself when an operation is in progress."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:06",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    async with push_lock._operation_lock:
+        with (
+            patch.object(push_lock, "_reset_disconnect_timer") as mock_reset,
+            patch.object(push_lock, "background_task") as mock_bg,
+        ):
+            push_lock._disconnect_with_timer(5.0)
+
+    mock_reset.assert_called_once()
+    mock_bg.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_with_timer_runs_deferred_update_when_pending():
+    """Disconnect timer cancels future update and runs it when one is pending."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:07",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    # Simulate a pending deferred update without actually scheduling on the loop
+    push_lock._cancel_deferred_update = MagicMock()
+
+    with (
+        patch.object(push_lock, "_reset_disconnect_timer") as mock_reset,
+        patch.object(push_lock, "_cancel_future_update") as mock_cancel_future,
+        patch.object(push_lock, "_deferred_update") as mock_deferred,
+        patch.object(push_lock, "background_task") as mock_bg,
+    ):
+        push_lock._disconnect_with_timer(5.0)
+
+    mock_reset.assert_called_once()
+    mock_cancel_future.assert_called_once()
+    mock_deferred.assert_called_once()
+    mock_bg.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_with_timer_triggers_disconnect_when_idle():
+    """Disconnect timer schedules a forced disconnect when idle."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:08",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    with (
+        patch.object(push_lock, "_cancel_disconnect_timer") as mock_cancel,
+        patch.object(push_lock, "background_task") as mock_bg,
+    ):
+        push_lock._disconnect_with_timer(5.0)
+        # Close the coroutine that would have been scheduled, to avoid
+        # an unawaited-coroutine warning at GC time.
+        (coro,), _ = mock_bg.call_args
+        coro.close()
+
+    mock_cancel.assert_called_once()
+    mock_bg.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_async_handle_disconnected_skips_when_connect_in_progress():
+    """Handle-disconnected returns early when a connect is in progress."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:09",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    async with push_lock._connect_lock:
+        with (
+            patch.object(push_lock, "_cancel_disconnect_timer") as mock_cancel,
+            patch.object(
+                push_lock, "_execute_disconnect", new_callable=AsyncMock
+            ) as mock_disconnect,
+        ):
+            await push_lock._async_handle_disconnected(RuntimeError("boom"))
+
+    mock_cancel.assert_not_called()
+    mock_disconnect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_async_handle_disconnected_executes_disconnect_when_idle():
+    """Handle-disconnected runs full cleanup when no connect is in progress."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:0a",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    with (
+        patch.object(push_lock, "_cancel_disconnect_timer") as mock_cancel,
+        patch.object(
+            push_lock, "_execute_disconnect", new_callable=AsyncMock
+        ) as mock_disconnect,
+    ):
+        await push_lock._async_handle_disconnected(RuntimeError("boom"))
+
+    mock_cancel.assert_called_once()
+    mock_disconnect.assert_called_once()
