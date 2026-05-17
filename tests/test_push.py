@@ -1265,3 +1265,125 @@ async def test_retry_backoff_exceptions_sleep_between_attempts() -> None:
         with pytest.raises(TimeoutError):
             await op_nobackoff(lock2)
         assert sleep_mock.await_args_list == []
+
+
+@pytest.mark.asyncio
+async def test_lock_operation_preserves_prior_state_on_connect_failure() -> None:
+    """
+    Test that a failed lock operation restores the prior lock status instead of
+    regressing the entity to UNKNOWN.
+
+    Regression test for #299: Yale Durus locks (and any model) should not flip
+    to UNKNOWN in Home Assistant when a transient BLE connect failure prevents
+    the operation from being delivered. The physical lock did not change, so
+    the last known state is the most accurate report we can make until the
+    next poll or push notification arrives.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    # Seed a known-good prior state (LOCKED).
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    with patch.object(
+        push_lock,
+        "_ensure_connected",
+        AsyncMock(side_effect=TimeoutError("connect timed out")),
+    ):
+        with pytest.raises(TimeoutError):
+            await push_lock.unlock()
+
+    # The lock must not have regressed to UNKNOWN — it should be back to
+    # its prior LOCKED state since the operation never reached the device.
+    assert push_lock._lock_state is not None
+    assert push_lock._lock_state.lock == LockStatus.LOCKED, (
+        f"Expected lock to stay LOCKED on connect failure, got "
+        f"{push_lock._lock_state.lock}"
+    )
+    assert push_lock._lock_state.door == DoorStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_lock_operation_preserves_unknown_when_prior_was_unknown() -> None:
+    """
+    Test that when the prior state was UNKNOWN (e.g., we've never observed the
+    lock yet), a failed operation keeps it UNKNOWN — i.e., the fix does not
+    invent a fake "good" state when we genuinely don't know.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    push_lock._lock_state = LockState(
+        lock=LockStatus.UNKNOWN,
+        door=DoorStatus.UNKNOWN,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    with patch.object(
+        push_lock,
+        "_ensure_connected",
+        AsyncMock(side_effect=TimeoutError("connect timed out")),
+    ):
+        with pytest.raises(TimeoutError):
+            await push_lock.lock()
+
+    assert push_lock._lock_state is not None
+    assert push_lock._lock_state.lock == LockStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_lock_operation_sets_complete_state_on_success() -> None:
+    """Sanity check: successful operation still drives the lock to the
+    complete_state. The prior-state fix must not interfere with the happy path.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    mock_lock = MagicMock()
+    mock_lock.force_unlock = AsyncMock(return_value=None)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.unlock()
+
+    mock_lock.force_unlock.assert_called_once()
+    assert push_lock._lock_state is not None
+    assert push_lock._lock_state.lock == LockStatus.UNLOCKED

@@ -615,32 +615,45 @@ class PushLock:
 
     async def securemode(self) -> None:
         """Set the lock into securemode."""
+        prior_lock_status = self._get_current_state().lock
         self._update_any_state([LockStatus.LOCKING])
         self._cancel_future_update()
         await self._execute_lock_operation(
-            "force_securemode", LockStatus.LOCKING, LockStatus.SECUREMODE
+            "force_securemode",
+            LockStatus.LOCKING,
+            LockStatus.SECUREMODE,
+            prior_lock_status,
         )
 
     async def lock(self) -> None:
         """Lock the lock."""
+        prior_lock_status = self._get_current_state().lock
         self._update_any_state([LockStatus.LOCKING])
         self._cancel_future_update()
         await self._execute_lock_operation(
-            "force_lock", LockStatus.LOCKING, LockStatus.LOCKED
+            "force_lock", LockStatus.LOCKING, LockStatus.LOCKED, prior_lock_status
         )
 
     async def unlock(self) -> None:
         """Unlock the lock."""
+        prior_lock_status = self._get_current_state().lock
         self._update_any_state([LockStatus.UNLOCKING])
         self._cancel_future_update()
         await self._execute_lock_operation(
-            "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
+            "force_unlock",
+            LockStatus.UNLOCKING,
+            LockStatus.UNLOCKED,
+            prior_lock_status,
         )
 
     @operation_lock
     @retry_bluetooth_connection_error
     async def _execute_lock_operation(
-        self, op_attr: str, pending_state: LockStatus, complete_state: LockStatus
+        self,
+        op_attr: str,
+        pending_state: LockStatus,
+        complete_state: LockStatus,
+        prior_lock_status: LockStatus,
     ) -> None:
         """Execute a lock operation."""
         if not self._running:
@@ -655,7 +668,10 @@ class PushLock:
             self._cancel_future_update()
             await getattr(lock, op_attr)()
         except Exception as ex:
-            self._update_any_state([LockStatus.UNKNOWN])
+            # Restore the prior lock status rather than regressing to UNKNOWN.
+            # A transient BLE connect failure doesn't change the physical lock —
+            # push notify / the next poll will surface the authoritative state.
+            self._update_any_state([prior_lock_status])
             # The retry_bluetooth_connection_error wrapper calls
             # _async_handle_disconnected for RETRY_EXCEPTIONS /
             # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
