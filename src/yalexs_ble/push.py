@@ -922,6 +922,38 @@ class PushLock:
         _LOGGER.debug("Obtained lock info: %s", lock_info)
         return lock_info
 
+    def _reconcile_with_notify_updates(
+        self, state: LockState, fetched: set[str]
+    ) -> LockState:
+        """Reconcile an in-flight _update snapshot with concurrent notify writes.
+
+        Notify callbacks may have mutated ``_lock_state`` during awaits in
+        ``_update``. ``state`` is a snapshot from before those awaits, so:
+
+        - Fields the update did NOT re-fetch must yield to the live cache
+          (otherwise the writeback would clobber the notify update).
+        - Fields the update DID re-fetch that returned UNKNOWN are treated as
+          stale and fall back to the cache if it has a real value.
+        """
+        cached_state = self._get_current_state()
+        for field in (
+            "lock",
+            "door",
+            "battery",
+            "auth",
+            "auto_lock",
+            "auto_lock_prev",
+        ):
+            if field not in fetched and getattr(state, field) != getattr(
+                cached_state, field
+            ):
+                state = replace(state, **{field: getattr(cached_state, field)})
+        if state.lock == LockStatus.UNKNOWN and cached_state.lock != LockStatus.UNKNOWN:
+            state = replace(state, lock=cached_state.lock)
+        if state.door == DoorStatus.UNKNOWN and cached_state.door != DoorStatus.UNKNOWN:
+            state = replace(state, door=cached_state.door)
+        return state
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
@@ -935,26 +967,28 @@ class PushLock:
         if not self._lock_info:
             self._lock_info = await self._probe_lock_info(lock)
         state = self._get_current_state()
-        made_request = False
+        # Track which fields this update actually re-fetched. Fields not fetched
+        # must yield to any concurrent notify callback updates at writeback time.
+        # made_request is equivalent to bool(fetched).
+        fetched: set[str] = set()
 
         # Asking for battery first seems to reduce the chance of the lock
         # getting into a bad state.
         state, battery_requested = await self._poll_battery(lock, state)
         if battery_requested:
-            made_request = True
+            fetched.add("battery")
 
         if (
             DoorStatus not in self._seen_this_session
             and self._lock_info
             and self._lock_info.door_sense
         ):
-            made_request = True
             door_status = await lock.door_status()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
             state = replace(state, door=door_status, auth=AuthState(successful=True))
+            fetched.add("door")
 
         if AutoLockState not in self._seen_this_session:
-            made_request = True
             auto_lock_state = await lock.auto_lock_status()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
             state = replace(
@@ -963,6 +997,7 @@ class PushLock:
                 auto_lock_prev=state.auto_lock,
                 auth=AuthState(successful=True),
             )
+            fetched.update(("auto_lock", "auto_lock_prev"))
 
         # Only ask for the lock status if we haven't seen
         # it this session since notify callbacks will happen
@@ -972,23 +1007,17 @@ class PushLock:
         # However, we always want to poll lock
         # state to keep the connection alive if we are always connected.
         if LockStatus not in self._seen_this_session or (
-            not made_request and self._always_connected
+            not fetched and self._always_connected
         ):
-            made_request = True
             lock_status = await lock.lock_status()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
             state = replace(state, lock=lock_status, auth=AuthState(successful=True))
+            fetched.add("lock")
 
         _LOGGER.debug("%s: Finished update", self.name)
 
-        # Prevent regression to UNKNOWN when notify callbacks updated state
-        # during awaited operations in this update cycle.
-        # Only overwrite lock/door if this update actually fetched a value.
-        cached_state = self._get_current_state()
-        if state.lock == LockStatus.UNKNOWN and cached_state.lock != LockStatus.UNKNOWN:
-            state = replace(state, lock=cached_state.lock)
-        if state.door == DoorStatus.UNKNOWN and cached_state.door != DoorStatus.UNKNOWN:
-            state = replace(state, door=cached_state.door)
+        made_request = bool(fetched)
+        state = self._reconcile_with_notify_updates(state, fetched)
 
         self._callback_state(state)
 
