@@ -656,8 +656,11 @@ class PushLock:
             await getattr(lock, op_attr)()
         except Exception as ex:
             self._update_any_state([LockStatus.UNKNOWN])
+            # The retry_bluetooth_connection_error wrapper invokes
+            # _async_handle_disconnected for known transient errors; other
+            # exceptions propagate without disconnecting.
             _LOGGER.debug(
-                "%s: Failed to execute lock operation due to %s, forcing disconnect",
+                "%s: Failed to execute lock operation due to %s",
                 self.name,
                 ex,
             )
@@ -720,14 +723,19 @@ class PushLock:
         # Duration validation
         if duration not in self.auto_lock_durations:
             raise ValueError(f"Invalid auto lock duration: {duration}")
+        # Unlike lock/unlock/securemode, this path does not optimistically mutate
+        # _lock_state.auto_lock, so there is no prior value to restore on failure.
+        # Notify callbacks or the next poll surface the authoritative state.
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
             await lock.set_auto_lock(mode, duration)
         except Exception as ex:
+            # The retry_bluetooth_connection_error wrapper invokes
+            # _async_handle_disconnected for known transient errors; other
+            # exceptions propagate without disconnecting.
             _LOGGER.debug(
-                "%s: Failed to execute set auto lock operation due to %s, "
-                "forcing disconnect",
+                "%s: Failed to execute set auto lock operation due to %s",
                 self.name,
                 ex,
             )
