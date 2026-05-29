@@ -296,7 +296,7 @@ class PushLock:
             Callable[[LockState, LockInfo, ConnectionInfo], None]
         ] = []
         self._update_task: asyncio.Task[None] | None = None
-        self.loop = asyncio._get_running_loop()
+        self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
         self._client: Lock | None = None
         self._connect_lock = asyncio.Lock()

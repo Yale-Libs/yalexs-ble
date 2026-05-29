@@ -163,6 +163,19 @@ def test_needs_battery_workaround():
     assert "MD-04I" not in NO_BATTERY_SUPPORT_MODELS
 
 
+def test_push_lock_init_outside_running_loop_raises():
+    """PushLock construction outside a running loop must fail fast."""
+    with pytest.raises(RuntimeError):
+        PushLock(local_name="unique_name", address="AA:BB:CC:DD:EE:FF")
+
+
+@pytest.mark.asyncio
+async def test_push_lock_init_captures_running_loop():
+    """PushLock stores the running loop when constructed inside one."""
+    lock = PushLock(local_name="unique_name", address="AA:BB:CC:DD:EE:FF")
+    assert lock.loop is asyncio.get_running_loop()
+
+
 @pytest.mark.asyncio
 async def test_update_continues_after_battery_timeout():
     """
