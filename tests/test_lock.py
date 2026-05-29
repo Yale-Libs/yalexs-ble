@@ -10,6 +10,7 @@ from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
+    AutoLockMode,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
@@ -348,3 +349,74 @@ async def test_lock_info_reads_model_first() -> None:
     await lock.lock_info()
 
     assert call_order[0] == MODEL_NUMBER_CHARACTERISTIC
+
+
+def _make_bare_lock() -> Lock:
+    return Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock", delegate=""),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+
+def test_parse_auto_lock_state_unknown_byte_logs_raw_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unknown mode byte must be logged verbatim, not the OFF fallback."""
+    lock = _make_bare_lock()
+    # response layout: bytes 0x08..0x09 = duration, byte 0x0A = mode
+    response = bytearray(16)
+    response[0x08] = 0x1E  # duration = 30 (little-endian)
+    response[0x09] = 0x00
+    response[0x0A] = 0x42  # unknown mode byte
+
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        state = lock._parse_auto_lock_state(bytes(response))
+
+    assert state.mode == AutoLockMode.OFF
+    assert state.duration == 30
+    assert any(
+        "0x42" in record.message and "Unrecognized auto lock mode" in record.message
+        for record in caplog.records
+    ), caplog.records
+
+
+def test_parse_auto_lock_state_known_mode_does_not_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Recognized mode bytes must not emit the unrecognized-mode warning."""
+    lock = _make_bare_lock()
+    response = bytearray(16)
+    response[0x08] = 0x3C  # duration = 60 (little-endian)
+    response[0x09] = 0x00
+    response[0x0A] = AutoLockMode.TIMER.value
+
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        state = lock._parse_auto_lock_state(bytes(response))
+
+    assert state.mode == AutoLockMode.TIMER
+    assert state.duration == 60
+    assert not any(
+        "Unrecognized auto lock mode" in record.message for record in caplog.records
+    )
+
+
+def test_parse_auto_lock_state_off_byte_does_not_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """OFF byte (0xFF) is not sent by the lock, but treat it as recognized, no log."""
+    lock = _make_bare_lock()
+    response = bytearray(16)
+    response[0x08] = 0x00
+    response[0x09] = 0x00
+    response[0x0A] = AutoLockMode.OFF.value
+
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        state = lock._parse_auto_lock_state(bytes(response))
+
+    assert state.mode == AutoLockMode.OFF
+    assert not any(
+        "Unrecognized auto lock mode" in record.message for record in caplog.records
+    )

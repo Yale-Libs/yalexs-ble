@@ -458,11 +458,12 @@ class Lock:
     def _parse_auto_lock_state(self, response: bytes) -> AutoLockState:
         """Parse the auto lock state from the response."""
         duration = util._bytes_to_int(response[0x08:0x0A])
-        mode = VALUE_TO_AUTO_LOCK_MODE.get(response[0x0A], AutoLockMode.OFF)
-        if mode == AutoLockMode.OFF:
+        raw_mode = response[0x0A]
+        if raw_mode not in VALUE_TO_AUTO_LOCK_MODE:
             _LOGGER.info(
-                "%s: Unrecognized auto lock mode code: %s", self.name, hex(mode)
+                "%s: Unrecognized auto lock mode code: %s", self.name, hex(raw_mode)
             )
+        mode = VALUE_TO_AUTO_LOCK_MODE.get(raw_mode, AutoLockMode.OFF)
         if mode == 0 and duration == 0:
             # If both values are 0, auto lock is disabled
             mode = AutoLockMode.OFF
