@@ -17,7 +17,35 @@ from yalexs_ble.const import (
     LockOperationSource,
     LockStatus,
 )
-from yalexs_ble.lock import Lock
+from yalexs_ble.lock import (
+    AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
+    Lock,
+    convert_voltage_to_percentage,
+)
+
+
+def test_aa_battery_voltage_to_percentage_is_monotonic() -> None:
+    """Percentage must be non-increasing as voltage decreases.
+
+    Guards against copy/paste regressions in the lookup table — a non-monotonic
+    table makes ``convert_voltage_to_percentage`` return higher percentages for
+    lower voltages, which erodes user trust in the battery indicator.
+    """
+    sorted_pairs = sorted(AA_BATTERY_VOLTAGE_TO_PERCENTAGE)
+    percents = [pct for _, pct in sorted_pairs]
+    assert percents == sorted(percents), (
+        f"voltage→pct table is non-monotonic: {sorted_pairs}"
+    )
+
+
+def test_convert_voltage_to_percentage_is_monotonic_across_table() -> None:
+    """``convert_voltage_to_percentage`` must be non-decreasing in voltage."""
+    voltages = sorted(v for v, _ in AA_BATTERY_VOLTAGE_TO_PERCENTAGE)
+    results = [convert_voltage_to_percentage(v) for v in voltages]
+    assert results == sorted(results), (
+        f"convert_voltage_to_percentage is non-monotonic across table voltages: "
+        f"{list(zip(voltages, results, strict=True))}"
+    )
 
 
 def test_create_lock() -> None:
