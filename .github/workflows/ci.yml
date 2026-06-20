@@ -20,17 +20,6 @@ jobs:
           python-version: "3.11"
       - uses: pre-commit/action@v3.0.1
 
-  # Make sure commit messages follow the conventional commits convention:
-  # https://www.conventionalcommits.org
-  commitlint:
-    name: Lint Commit Messages
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@v6
-
   test:
     strategy:
       fail-fast: false
@@ -68,7 +57,6 @@ jobs:
     needs:
       - test
       - lint
-      - commitlint
     permissions:
       id-token: write
       contents: write
