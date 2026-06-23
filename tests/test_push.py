@@ -728,7 +728,7 @@ async def test_update_handles_connection_params_failure():
 
 
 @pytest.mark.asyncio
-async def test_disconnected_callback_schedules_reconnect_when_always_connected():
+async def test_disconnected_callback_schedules_reconnect_when_always_connected() -> None:
     """Disconnect callback schedules keep-alive when always_connected and auth ok."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:01",
@@ -746,7 +746,7 @@ async def test_disconnected_callback_schedules_reconnect_when_always_connected()
 
 
 @pytest.mark.asyncio
-async def test_disconnected_callback_skips_reconnect_after_auth_failures():
+async def test_disconnected_callback_skips_reconnect_after_auth_failures() -> None:
     """Disconnect callback skips keep-alive when auth has failed enough times."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:02",
@@ -767,7 +767,7 @@ async def test_disconnected_callback_skips_reconnect_after_auth_failures():
 
 
 @pytest.mark.asyncio
-async def test_disconnected_callback_noop_when_not_always_connected():
+async def test_disconnected_callback_noop_when_not_always_connected() -> None:
     """Disconnect callback does nothing in non-always-connected mode."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:03",
@@ -784,7 +784,7 @@ async def test_disconnected_callback_noop_when_not_always_connected():
 
 
 @pytest.mark.asyncio
-async def test_keep_alive_noop_when_not_always_connected():
+async def test_keep_alive_noop_when_not_always_connected() -> None:
     """Keep-alive returns immediately when not always_connected."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:04",
@@ -805,7 +805,7 @@ async def test_keep_alive_noop_when_not_always_connected():
 
 
 @pytest.mark.asyncio
-async def test_keep_alive_schedules_update_and_next_when_always_connected():
+async def test_keep_alive_schedules_update_and_next_when_always_connected() -> None:
     """Keep-alive schedules update and next keep-alive when always_connected."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:05",
@@ -826,7 +826,7 @@ async def test_keep_alive_schedules_update_and_next_when_always_connected():
 
 
 @pytest.mark.asyncio
-async def test_disconnect_with_timer_skips_when_operation_lock_held():
+async def test_disconnect_with_timer_skips_when_operation_lock_held() -> None:
     """Disconnect timer reschedules itself when an operation is in progress."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:06",
@@ -848,7 +848,7 @@ async def test_disconnect_with_timer_skips_when_operation_lock_held():
 
 
 @pytest.mark.asyncio
-async def test_disconnect_with_timer_runs_deferred_update_when_pending():
+async def test_disconnect_with_timer_runs_deferred_update_when_pending() -> None:
     """Disconnect timer cancels future update and runs it when one is pending."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:07",
@@ -875,7 +875,7 @@ async def test_disconnect_with_timer_runs_deferred_update_when_pending():
 
 
 @pytest.mark.asyncio
-async def test_disconnect_with_timer_triggers_disconnect_when_idle():
+async def test_disconnect_with_timer_triggers_disconnect_when_idle() -> None:
     """Disconnect timer schedules a forced disconnect when idle."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:08",
@@ -900,7 +900,7 @@ async def test_disconnect_with_timer_triggers_disconnect_when_idle():
 
 
 @pytest.mark.asyncio
-async def test_async_handle_disconnected_skips_when_connect_in_progress():
+async def test_async_handle_disconnected_skips_when_connect_in_progress() -> None:
     """Handle-disconnected returns early when a connect is in progress."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:09",
@@ -924,7 +924,7 @@ async def test_async_handle_disconnected_skips_when_connect_in_progress():
 
 
 @pytest.mark.asyncio
-async def test_async_handle_disconnected_executes_disconnect_when_idle():
+async def test_async_handle_disconnected_executes_disconnect_when_idle() -> None:
     """Handle-disconnected runs full cleanup when no connect is in progress."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:0a",
