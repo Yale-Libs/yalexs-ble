@@ -34,7 +34,7 @@ class SecureSession(Session):
             self._read_characteristic
         )
 
-    def set_key(self, key: bytes) -> None:
+    def set_key(self, key: bytes | bytearray) -> None:
         self.cipher_encrypt = Cipher(  # nosec
             algorithms.AES(key), modes.ECB()
         ).encryptor()
@@ -54,7 +54,7 @@ class SecureSession(Session):
         checksum_bytes = checksum.to_bytes(4, byteorder="little", signed=False)
         util._copy(command, checksum_bytes, destLocation=0x0C)
 
-    def _validate_response(self, data: bytes) -> None:
+    def _validate_response(self, data: bytes | bytearray) -> None:
         response_checksum = int.from_bytes(
             data[0x0C:0x10], byteorder="little", signed=False
         )

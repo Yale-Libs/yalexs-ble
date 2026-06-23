@@ -10,7 +10,7 @@ from bleak.backends.scanner import AdvertisementData
 UNIQUE_LOCAL_NAME_LEN = 7
 
 
-def _simple_checksum(buf: bytes) -> int:
+def _simple_checksum(buf: bytes | bytearray) -> int:
     cs = 0
     for i in range(0x12):
         cs = (cs + buf[i]) & 0xFF
@@ -18,7 +18,7 @@ def _simple_checksum(buf: bytes) -> int:
     return (-cs) & 0xFF
 
 
-def _bytes_to_int(buffer: bytes) -> int:
+def _bytes_to_int(buffer: bytes | bytearray) -> int:
     """Convert a byte buffer to an integer."""
     return int.from_bytes(buffer, byteorder="little", signed=False)
 
@@ -30,7 +30,7 @@ def _int_to_bytes(value: int, length: int) -> bytes:
     return value.to_bytes(length, byteorder="little", signed=False)
 
 
-def _security_checksum(buffer: bytes) -> int:
+def _security_checksum(buffer: bytes | bytearray) -> int:
     val1 = _bytes_to_int(buffer[0x00:0x04])
     val2 = _bytes_to_int(buffer[0x04:0x08])
     val3 = _bytes_to_int(buffer[0x08:0x12])
