@@ -728,7 +728,9 @@ async def test_update_handles_connection_params_failure():
 
 
 @pytest.mark.asyncio
-async def test_disconnected_callback_schedules_reconnect_when_always_connected() -> None:
+async def test_disconnected_callback_schedules_reconnect_when_always_connected() -> (
+    None
+):
     """Disconnect callback schedules keep-alive when always_connected and auth ok."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:01",
