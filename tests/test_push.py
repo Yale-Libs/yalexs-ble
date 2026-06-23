@@ -806,7 +806,7 @@ async def test_keep_alive_noop_when_not_always_connected():
 
 @pytest.mark.asyncio
 async def test_keep_alive_schedules_update_and_next_when_always_connected():
-    """Keep-alive schedules an immediate update and next keep-alive when always_connected."""
+    """Keep-alive schedules update and next keep-alive when always_connected."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:05",
         key="0800200c9a66",
