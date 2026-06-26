@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+from collections.abc import Iterable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -15,6 +16,7 @@ from yalexs_ble.const import (
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
+    LockStateValue,
     LockStatus,
 )
 from yalexs_ble.lock import (
@@ -284,10 +286,10 @@ def test_internal_state_callback_skips_log_for_recognized_no_update(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Recognized-but-no-update packets must not log 'Unknown state'."""
-    received: list[list[LockStatus]] = []
+    received: list[list[LockStateValue]] = []
 
-    def collect(states: object) -> None:
-        received.append(list(states))  # type: ignore[arg-type]
+    def collect(states: Iterable[LockStateValue]) -> None:
+        received.append(list(states))
 
     lock = Lock(
         lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
@@ -309,10 +311,10 @@ def test_internal_state_callback_logs_unknown_for_unrecognized_packet(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Truly unrecognized packets still emit the 'Unknown state' INFO log."""
-    received: list[list[LockStatus]] = []
+    received: list[list[LockStateValue]] = []
 
-    def collect(states: object) -> None:
-        received.append(list(states))  # type: ignore[arg-type]
+    def collect(states: Iterable[LockStateValue]) -> None:
+        received.append(list(states))
 
     lock = Lock(
         lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
