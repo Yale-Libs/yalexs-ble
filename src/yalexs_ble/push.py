@@ -1195,7 +1195,15 @@ class PushLock:
         """Execute a background task."""
         task: asyncio.Task[Any] = asyncio.create_task(fut)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.remove)
+        task.add_done_callback(self._on_background_task_done)
+
+    def _on_background_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Remove finished task and log unexpected exceptions."""
+        self._background_tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            _LOGGER.error(
+                "%s: Background task failed: %s", self.name, exc, exc_info=exc
+            )
 
     async def wait_for_first_update(self, timeout: float) -> None:
         """Wait for the first update."""
