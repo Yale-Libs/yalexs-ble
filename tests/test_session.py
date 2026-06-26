@@ -44,7 +44,7 @@ async def test_notify_future_cleared_after_successful_write() -> None:
         response = bytearray(0x12)
         response[0x00] = 0xBB
         response[0x03] = (-sum(response[:0x12])) & 0xFF
-        session._notify(0, bytes(response))
+        session._notify(0, response)
 
     session.client.write_gatt_char.side_effect = fake_write
 
@@ -104,7 +104,7 @@ async def test_late_notify_after_timeout_is_ignored() -> None:
     response[0x03] = (-sum(response[:0x12])) & 0xFF
 
     # Should be a no-op — no exception propagates from the notify callback.
-    session._notify(0, bytes(response))
+    session._notify(0, response)
 
     # And the stale reference is cleared so future calls start fresh.
     assert session._notify_future is None
