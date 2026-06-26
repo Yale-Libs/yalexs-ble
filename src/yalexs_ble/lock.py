@@ -216,9 +216,16 @@ class Lock:
         raise BleakError(f"Missing characteristic {char_uuid}")
 
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
+        # Returns:
+        #   - non-empty iterable: state updates to emit
+        #   - empty tuple (): packet is recognized but carries no state update
+        #   - None: packet is not recognized (caller logs as unknown)
         if state[0] == 0xBB:
             # Check for LOCK/UNLOCK command responses (0xBB + 0x0A/0x0B)
-            # These can contain actual status in byte[3] when operation fails/jams
+            # byte[3] holds a LockStatus on jam/fail and on some success acks.
+            # Other values (e.g. 0x39 seen on Yale/August locks after a normal
+            # unlock — see #317) are not status codes; treat the packet as
+            # recognized-no-update instead of logging it as unknown.
             if (
                 state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
                 and len(state) > 3
@@ -226,8 +233,16 @@ class Lock:
                 lock_status_byte = state[0x03]
                 if lock_status_byte in VALUE_TO_LOCK_STATUS:
                     return [VALUE_TO_LOCK_STATUS[lock_status_byte]]
+                _LOGGER.debug(
+                    "%s: Lock/unlock command response with non-status byte[3]=%s: %s",
+                    self.name,
+                    hex(lock_status_byte),
+                    state.hex(),
+                )
+                return ()
             if state[1] == Commands.LOCK_ACTIVITY.value:
-                return None  # Ignore lock activity as these are historical events
+                # Historical events — recognized but not emitted as state.
+                return ()
             if state[1] == Commands.GETSTATUS.value:
                 if state[4] == StatusType.LOCK_ONLY.value:
                     lock_status = state[0x08]
@@ -255,10 +270,11 @@ class Lock:
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
         _LOGGER.debug("%s: State changed: %s", self.name, state.hex())
-        if (parsed_state := self._parse_state(state)) is not None:
-            self._state_callback(parsed_state)
-        else:
+        parsed_state = self._parse_state(state)
+        if parsed_state is None:
             _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
+            return
+        self._state_callback(parsed_state)
 
     async def _setup_session(self) -> None:
         """Setup the session."""
