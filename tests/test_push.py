@@ -1298,13 +1298,15 @@ async def test_lock_operation_preserves_prior_state_on_connect_failure() -> None
         auto_lock_prev=None,
     )
 
-    with patch.object(
-        push_lock,
-        "_ensure_connected",
-        AsyncMock(side_effect=TimeoutError("connect timed out")),
+    with (
+        patch.object(
+            push_lock,
+            "_ensure_connected",
+            AsyncMock(side_effect=TimeoutError("connect timed out")),
+        ),
+        pytest.raises(TimeoutError),
     ):
-        with pytest.raises(TimeoutError):
-            await push_lock.unlock()
+        await push_lock.unlock()
 
     # The lock must not have regressed to UNKNOWN — it should be back to
     # its prior LOCKED state since the operation never reached the device.
@@ -1341,13 +1343,15 @@ async def test_lock_operation_preserves_unknown_when_prior_was_unknown() -> None
         auto_lock_prev=None,
     )
 
-    with patch.object(
-        push_lock,
-        "_ensure_connected",
-        AsyncMock(side_effect=TimeoutError("connect timed out")),
+    with (
+        patch.object(
+            push_lock,
+            "_ensure_connected",
+            AsyncMock(side_effect=TimeoutError("connect timed out")),
+        ),
+        pytest.raises(TimeoutError),
     ):
-        with pytest.raises(TimeoutError):
-            await push_lock.lock()
+        await push_lock.lock()
 
     assert push_lock._lock_state is not None
     assert push_lock._lock_state.lock == LockStatus.UNKNOWN
