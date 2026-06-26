@@ -1060,4 +1060,3 @@ async def test_retry_backoff_exceptions_sleep_between_attempts():
         with pytest.raises(TimeoutError):
             await op_nobackoff(lock2)
         assert sleep_mock.await_args_list == []
-
