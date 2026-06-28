@@ -655,6 +655,18 @@ class PushLock:
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
 
+    async def unlatch(self) -> None:
+        """Unlatch the lock ("open door" / pull spring).
+
+        Only supported on Linus L2 family locks; check
+        ``lock_info.can_open`` before exposing this operation. See issue #350.
+        """
+        self._update_any_state([LockStatus.UNLATCHING])
+        self._cancel_future_update()
+        await self._execute_lock_operation(
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLATCHED
+        )
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _execute_lock_operation(
