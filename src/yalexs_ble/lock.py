@@ -408,6 +408,22 @@ class Lock:
         _LOGGER.debug("%s: Finished unlocking", self.name)
 
     @raise_if_not_connected
+    async def force_unlatch(self) -> None:
+        """Force the lock to unlatch ("open door" / pull spring).
+
+        Uses the UNLOCK opcode with operation byte 0x01, which signals the lock
+        to retract the latch in addition to unlocking. Only Linus L2 family
+        locks support this (see LockInfo.can_open). See issue #350.
+        """
+        _LOGGER.debug("%s: Unlatching", self.name)
+        assert self.session is not None  # nosec
+        await self.session.execute(
+            self.session.build_operation_command(Commands.UNLOCK, 0x01),
+            "force_unlatch",
+        )
+        _LOGGER.debug("%s: Finished unlatching", self.name)
+
+    @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
         """Change the auto lock setting."""
         _LOGGER.debug(
@@ -437,6 +453,12 @@ class Lock:
     async def unlock(self) -> None:
         if (await self.lock_status()) != LockStatus.UNLOCKED:
             await self.force_unlock()
+
+    async def unlatch(self) -> None:
+        # Unlatch is a momentary "open door" action, not a steady state, so it
+        # always fires (unlike lock/unlock which short-circuit when already in
+        # the target state).
+        await self.force_unlatch()
 
     async def _execute_command(
         self, opcode: int, cmd_byte: int, command_name: str

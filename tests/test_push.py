@@ -1265,3 +1265,25 @@ async def test_retry_backoff_exceptions_sleep_between_attempts() -> None:
         with pytest.raises(TimeoutError):
             await op_nobackoff(lock2)
         assert sleep_mock.await_args_list == []
+
+
+@pytest.mark.asyncio
+async def test_unlatch_executes_open_operation():
+    """unlatch() drives the UNLATCHING->UNLATCHED open-door operation."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._execute_lock_operation = AsyncMock()
+
+    await push_lock.unlatch()
+
+    # Optimistically flips to UNLATCHING before the BLE round-trip.
+    assert push_lock.lock_status is LockStatus.UNLATCHING
+    push_lock._execute_lock_operation.assert_awaited_once_with(
+        "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLATCHED
+    )
