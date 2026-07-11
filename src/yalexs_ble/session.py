@@ -80,7 +80,7 @@ class Session:
         self._enable_cooldown = False
         self.loop = asyncio.get_running_loop()
 
-    def set_key(self, key: bytes) -> None:
+    def set_key(self, key: bytes | bytearray) -> None:
         self.cipher_encrypt = Cipher(
             algorithms.AES(key),
             modes.CBC(bytes(0x10)),  # nosec
@@ -102,7 +102,7 @@ class Session:
                 data = bytearray(data)
             util._copy(data, plainText)
 
-        return data
+        return bytes(data)
 
     def build_operation_command(self, opcode: int, cmd_byte: int) -> bytearray:
         """Build a command to send to the lock."""
@@ -138,7 +138,7 @@ class Session:
         async with self._lock:
             return await self._locked_write(command, command_name)
 
-    def _notify(self, char: int, data: bytes) -> None:
+    def _notify(self, char: int, data: bytearray) -> None:
         self._last_callback_time = time.monotonic()
         _LOGGER.debug(
             "%s: Receiving response via notify: %s (waiting=%s)",

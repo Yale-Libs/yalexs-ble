@@ -24,7 +24,35 @@ from yalexs_ble.const import (
     SettingType,
     StatusType,
 )
-from yalexs_ble.lock import Lock
+from yalexs_ble.lock import (
+    AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
+    Lock,
+    convert_voltage_to_percentage,
+)
+
+
+def test_aa_battery_voltage_to_percentage_is_monotonic() -> None:
+    """Percentage must be non-increasing as voltage decreases.
+
+    Guards against copy/paste regressions in the lookup table — a non-monotonic
+    table makes ``convert_voltage_to_percentage`` return higher percentages for
+    lower voltages, which erodes user trust in the battery indicator.
+    """
+    sorted_pairs = sorted(AA_BATTERY_VOLTAGE_TO_PERCENTAGE)
+    percents = [pct for _, pct in sorted_pairs]
+    assert percents == sorted(percents), (
+        f"voltage→pct table is non-monotonic: {sorted_pairs}"
+    )
+
+
+def test_convert_voltage_to_percentage_is_monotonic_across_table() -> None:
+    """``convert_voltage_to_percentage`` must be non-decreasing in voltage."""
+    voltages = sorted(v for v, _ in AA_BATTERY_VOLTAGE_TO_PERCENTAGE)
+    results = [convert_voltage_to_percentage(v) for v in voltages]
+    assert results == sorted(results), (
+        f"convert_voltage_to_percentage is non-monotonic across table voltages: "
+        f"{list(zip(voltages, results, strict=True))}"
+    )
 
 
 @pytest.fixture
@@ -196,6 +224,50 @@ def test_parse_lock_command_response_locked_success() -> None:
     assert len(result_list) == 1
     assert result_list[0] is LockStatus.LOCKED
     assert activity is None
+
+
+def _make_auto_lock_response(mode_byte: int, duration: int) -> bytes:
+    """Build a minimal _parse_auto_lock_state response buffer."""
+    return bytes(8) + duration.to_bytes(2, "little") + bytes([mode_byte])
+
+
+def _make_lock() -> Lock:
+    return Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
+        "0800200c9a66",
+        1,
+        "mylock",
+        lambda _: None,
+    )
+
+
+def test_parse_auto_lock_state_known_mode() -> None:
+    """Known mode byte returns the matching AutoLockMode with its duration."""
+    lock = _make_lock()
+    response = _make_auto_lock_response(AutoLockMode.TIMER, 30)
+    result = lock._parse_auto_lock_state(response)
+    assert result == AutoLockState(AutoLockMode.TIMER, 30)
+
+
+def test_parse_auto_lock_state_unknown_mode_logs_and_returns_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unrecognized mode byte falls back to OFF and logs a warning."""
+    lock = _make_lock()
+    response = _make_auto_lock_response(0xAB, 15)
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        result = lock._parse_auto_lock_state(response)
+    assert result.mode is AutoLockMode.OFF
+    assert "0xab" in caplog.text.lower()
+
+
+def test_parse_auto_lock_state_both_zero_means_disabled() -> None:
+    """When mode byte maps to 0 (INSTANT) and duration is 0, state is OFF."""
+    lock = _make_lock()
+    response = _make_auto_lock_response(AutoLockMode.INSTANT, 0)
+    result = lock._parse_auto_lock_state(response)
+    assert result.mode is AutoLockMode.OFF
+    assert result.duration == 0
 
 
 _CHAR_DATA: dict[str, bytes] = {
@@ -375,9 +447,10 @@ def test_parse_bb_response_lock_activity(lock: Lock) -> None:
         mock_parse.return_value = mock_activity
 
         # Create a response with lock activity command
-        response = bytearray(20)
-        response[0] = 0xBB
-        response[1] = Commands.LOCK_ACTIVITY.value
+        response_arr = bytearray(20)
+        response_arr[0] = 0xBB
+        response_arr[1] = Commands.LOCK_ACTIVITY.value
+        response = bytes(response_arr)
 
         state, activity = lock._parse_bb_response(response)
         assert state is None
@@ -395,9 +468,10 @@ def test_parse_bb_response_status_commands(lock: Lock) -> None:
     """Test parsing 0xBB responses with GETSTATUS command."""
 
     # Test GETSTATUS command
-    response = bytearray(20)
-    response[0] = 0xBB
-    response[1] = Commands.GETSTATUS.value
+    response_arr = bytearray(20)
+    response_arr[0] = 0xBB
+    response_arr[1] = Commands.GETSTATUS.value
+    response = bytes(response_arr)
 
     with patch.object(lock, "_parse_status_response") as mock_parse_status:
         mock_parse_status.return_value = [LockStatus.LOCKED]
@@ -412,10 +486,11 @@ def test_parse_bb_response_settings_commands(lock: Lock) -> None:
     """Test parsing 0xBB responses with settings commands."""
 
     # Test WRITESETTING command with autolock
-    response = bytearray(20)
-    response[0] = 0xBB
-    response[1] = Commands.WRITESETTING.value
-    response[4] = SettingType.AUTOLOCK.value
+    response_arr = bytearray(20)
+    response_arr[0] = 0xBB
+    response_arr[1] = Commands.WRITESETTING.value
+    response_arr[4] = SettingType.AUTOLOCK.value
+    response = bytes(response_arr)
 
     with patch.object(lock, "_parse_auto_lock_state") as mock_parse_auto:
         mock_auto_state = AutoLockState(mode=AutoLockMode.TIMER, duration=30)
@@ -427,7 +502,8 @@ def test_parse_bb_response_settings_commands(lock: Lock) -> None:
         mock_parse_auto.assert_called_once_with(response)
 
     # Test READSETTING command with autolock
-    response[1] = Commands.READSETTING.value
+    response_arr[1] = Commands.READSETTING.value
+    response = bytes(response_arr)
     with patch.object(lock, "_parse_auto_lock_state") as mock_parse_auto:
         mock_auto_state = AutoLockState(mode=AutoLockMode.OFF, duration=0)
         mock_parse_auto.return_value = mock_auto_state
@@ -441,22 +517,25 @@ def test_parse_aa_response(lock: Lock) -> None:
     """Test parsing 0xAA responses (direct lock/unlock commands)."""
 
     # Test UNLOCK command
-    response = bytearray(20)
-    response[0] = 0xAA
-    response[1] = Commands.UNLOCK.value
+    response_arr = bytearray(20)
+    response_arr[0] = 0xAA
+    response_arr[1] = Commands.UNLOCK.value
+    response = bytes(response_arr)
 
     state, activity = lock._parse_aa_response(response)
     assert state == [LockStatus.UNLOCKED]
     assert activity is None
 
     # Test LOCK command
-    response[1] = Commands.LOCK.value
+    response_arr[1] = Commands.LOCK.value
+    response = bytes(response_arr)
     state, activity = lock._parse_aa_response(response)
     assert state == [LockStatus.LOCKED]
     assert activity is None
 
     # Test unknown command
-    response[1] = 0xFF
+    response_arr[1] = 0xFF
+    response = bytes(response_arr)
     state, activity = lock._parse_aa_response(response)
     assert state is None
     assert activity is None
@@ -466,22 +545,25 @@ def test_parse_status_response(lock: Lock) -> None:
     """Test parsing different status types from GETSTATUS responses."""
 
     # Test LOCK_ONLY status
-    response = bytearray(20)
-    response[4] = StatusType.LOCK_ONLY.value
-    response[0x08] = LockStatus.LOCKED.value
+    response_arr = bytearray(20)
+    response_arr[4] = StatusType.LOCK_ONLY.value
+    response_arr[0x08] = LockStatus.LOCKED.value
+    response = bytes(response_arr)
 
     state = lock._parse_status_response(response)
     assert state == [LockStatus.LOCKED]
 
     # Test DOOR_ONLY status
-    response[4] = StatusType.DOOR_ONLY.value
-    response[0x08] = DoorStatus.CLOSED.value
+    response_arr[4] = StatusType.DOOR_ONLY.value
+    response_arr[0x08] = DoorStatus.CLOSED.value
+    response = bytes(response_arr)
 
     state = lock._parse_status_response(response)
     assert state == [DoorStatus.CLOSED]
 
     # Test DOOR_AND_LOCK status
-    response[4] = StatusType.DOOR_AND_LOCK.value
+    response_arr[4] = StatusType.DOOR_AND_LOCK.value
+    response = bytes(response_arr)
     with patch.object(lock, "_parse_lock_and_door_state") as mock_parse:
         mock_parse.return_value = [LockStatus.LOCKED, DoorStatus.CLOSED]
 
@@ -490,7 +572,8 @@ def test_parse_status_response(lock: Lock) -> None:
         mock_parse.assert_called_once_with(response)
 
     # Test BATTERY status
-    response[4] = StatusType.BATTERY.value
+    response_arr[4] = StatusType.BATTERY.value
+    response = bytes(response_arr)
     with patch.object(lock, "_parse_battery_state") as mock_parse:
         mock_battery = BatteryState(voltage=6.0, percentage=85)
         mock_parse.return_value = mock_battery
@@ -500,7 +583,8 @@ def test_parse_status_response(lock: Lock) -> None:
         mock_parse.assert_called_once_with(response)
 
     # Test unknown status type
-    response[4] = 0xFF
+    response_arr[4] = 0xFF
+    response = bytes(response_arr)
     state = lock._parse_status_response(response)
     assert state is None
 
@@ -509,8 +593,9 @@ def test_parse_state(lock: Lock) -> None:
     """Test the main _parse_state method."""
 
     # Test 0xBB response
-    response = bytearray(20)
-    response[0] = 0xBB
+    response_arr = bytearray(20)
+    response_arr[0] = 0xBB
+    response = bytes(response_arr)
     with patch.object(lock, "_parse_bb_response") as mock_parse:
         mock_parse.return_value = ([LockStatus.LOCKED], None)
 
@@ -520,7 +605,8 @@ def test_parse_state(lock: Lock) -> None:
         mock_parse.assert_called_once_with(response)
 
     # Test 0xAA response
-    response[0] = 0xAA
+    response_arr[0] = 0xAA
+    response = bytes(response_arr)
     with patch.object(lock, "_parse_aa_response") as mock_parse:
         mock_parse.return_value = ([LockStatus.UNLOCKED], None)
 
@@ -530,7 +616,8 @@ def test_parse_state(lock: Lock) -> None:
         mock_parse.assert_called_once_with(response)
 
     # Test unknown response prefix
-    response[0] = 0xFF
+    response_arr[0] = 0xFF
+    response = bytes(response_arr)
     state, activity = lock._parse_state(response)
     assert state is None
     assert activity is None

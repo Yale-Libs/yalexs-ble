@@ -69,8 +69,8 @@ AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.34, 40),
     (1.33, 35),
     (1.32, 30),
-    (1.31, 35),
-    (1.30, 30),
+    (1.31, 28),
+    (1.30, 27),
     (1.29, 25),
     (1.28, 20),
     (1.27, 15),
@@ -514,10 +514,11 @@ class Lock:
     def _parse_auto_lock_state(self, response: bytes) -> AutoLockState:
         """Parse the auto lock state from the response."""
         duration = util._bytes_to_int(response[0x08:0x0A])
-        mode = VALUE_TO_AUTO_LOCK_MODE.get(response[0x0A], AutoLockMode.OFF)
-        if mode == AutoLockMode.OFF:
+        raw_mode = response[0x0A]
+        mode = VALUE_TO_AUTO_LOCK_MODE.get(raw_mode, AutoLockMode.OFF)
+        if raw_mode not in VALUE_TO_AUTO_LOCK_MODE:
             _LOGGER.info(
-                "%s: Unrecognized auto lock mode code: %s", self.name, hex(mode)
+                "%s: Unrecognized auto lock mode code: %s", self.name, hex(raw_mode)
             )
         if mode == 0 and duration == 0:
             # If both values are 0, auto lock is disabled

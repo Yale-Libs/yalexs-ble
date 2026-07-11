@@ -1,6 +1,6 @@
 [project]
 name = "yalexs-ble"
-version = "3.3.0"
+version = "3.4.0"
 description = "Bluetooth control of Yale and August locks"
 authors = [{ name = "J. Nick Koston", email = "nick@koston.org" }]
 license = "GPL-3.0-only"
@@ -30,17 +30,17 @@ packages = [
 python = ">=3.11,<3.15"
 
 # Documentation Dependencies
-bleak = ">=0.19.0"
-bleak-retry-connector = ">=4.6.0"
+bleak = ">=3.0.2"
+bleak-retry-connector = ">=4.6.1"
 async-timeout = {version = ">=3.0.0", python = "<3.11"}
-cryptography = ">=38.0.0"
+cryptography = ">=48.0.1"
 lru-dict = ">=1.1.4"
 async-interrupt = ">=1.1.1"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^9.0"
-pytest-cov = "^7.0"
-pytest-asyncio = "^1.2.0"
+pytest = "^9.1"
+pytest-cov = "^7.1"
+pytest-asyncio = "^1.4.0"
 
 [tool.semantic_release]
 branch = "main"
