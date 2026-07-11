@@ -1044,15 +1044,7 @@ class PushLock:
             reschedule=False,
         )
 
-        if not has_lock_info:
-            # On first update free up the connection
-            # so we can bring other locks online if
-            # the bluetooth adapter is out of connections
-            # slots. We reset the timer to a low number
-            # so that if another update request is pending
-            # we do not disconnect until it completes.
-            self._next_disconnect_delay = FIRST_CONNECTION_DISCONNECT_TIME
-            self._reset_disconnect_timer()
+        self._conditionally_reset_disconnect(has_lock_info)
 
         if self._always_connected and made_request:
             await self._set_slow_connection_params(lock)
@@ -1061,6 +1053,17 @@ class PushLock:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
         return state
+
+    def _conditionally_reset_disconnect(self, initially_had_lock_info: bool) -> None:
+        if not initially_had_lock_info:
+            # On first update free up the connection
+            # so we can bring other locks online if
+            # the bluetooth adapter is out of connections
+            # slots. We reset the timer to a low number
+            # so that if another update request is pending
+            # we do not disconnect until it completes.
+            self._next_disconnect_delay = FIRST_CONNECTION_DISCONNECT_TIME
+            self._reset_disconnect_timer()
 
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""
