@@ -116,6 +116,7 @@ class ActivityManager:
         retries: int = 0,
         max_retries: int = LOCK_ACTIVITY_POLL_RETRIES,
         backoff: float = LOCK_ACTIVITY_POLL_RETRY_EXPONENTIAL_BACKOFF_SECONDS,
+        reschedule: bool = True,
     ) -> None:
         """Schedule an activity poll in future seconds.
 
@@ -123,6 +124,9 @@ class ActivityManager:
         activity for the Yale/August app to consume).
         """
         if not self._activity_callbacks:
+            return
+
+        if reschedule is False and self._cancel_deferred_activity_poll:
             return
 
         _LOGGER.debug(
@@ -172,32 +176,38 @@ class ActivityManager:
 
         _LOGGER.debug("%s: Starting deferred activity update", self._lock.name)
 
-        lock = await self._lock.ensure_connected()
-        first_result = await lock.lock_activity()
+        try:
+            lock = await self._lock.ensure_connected()
+            first_result = await lock.lock_activity()
 
-        if not first_result:
-            if retries < max_retries:
-                _LOGGER.debug(
-                    "%s: No activity found while polling on attempt %s; "
-                    "retrying up to %s more times",
-                    self._lock.name,
-                    retries,
-                    max_retries - retries,
-                )
-                self.schedule_activity_poll(
-                    backoff * (2**retries),
-                    retries=retries + 1,
-                    max_retries=max_retries,
-                    backoff=backoff,
-                )
-            else:
-                _LOGGER.debug(
-                    "%s: No activity found while polling after maximum of %s retries",
-                    self._lock.name,
-                    max_retries,
-                )
-            return
+            if first_result is None:
+                if retries < max_retries:
+                    _LOGGER.debug(
+                        "%s: No activity found while polling on attempt %s; "
+                        "retrying up to %s more times",
+                        self._lock.name,
+                        retries,
+                        max_retries - retries,
+                    )
+                    self.schedule_activity_poll(
+                        backoff * (2**retries),
+                        retries=retries + 1,
+                        max_retries=max_retries,
+                        backoff=backoff,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "%s: No activity found while polling after maximum of "
+                        "%s retries",
+                        self._lock.name,
+                        max_retries,
+                    )
+                return
 
-        # continue to fetch activity while some is available
-        while (await lock.lock_activity()) is not None:
-            pass
+            # continue to fetch activity while some is available
+            while (await lock.lock_activity()) is not None:
+                pass
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception(
+                "%s: Unknown error performing deferred activity update", self._lock.name
+            )

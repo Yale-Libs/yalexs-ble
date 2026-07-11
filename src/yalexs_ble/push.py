@@ -1040,7 +1040,8 @@ class PushLock:
             )
 
         self._activity_manager.schedule_activity_poll(
-            LOCK_ACTIVITY_POLL_INITIAL_DELAY_DURING_UPDATE
+            LOCK_ACTIVITY_POLL_INITIAL_DELAY_DURING_UPDATE,
+            reschedule=False,
         )
 
         if not has_lock_info:
