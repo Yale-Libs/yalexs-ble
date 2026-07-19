@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,10 +13,16 @@ from yalexs_ble.const import (
     SERIAL_NUMBER_CHARACTERISTIC,
     AutoLockMode,
     AutoLockState,
+    BatteryState,
+    Commands,
+    DoorStatus,
+    LockActivity,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
     LockStatus,
+    SettingType,
+    StatusType,
 )
 from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
@@ -48,8 +55,10 @@ def test_convert_voltage_to_percentage_is_monotonic_across_table() -> None:
     )
 
 
-def test_create_lock() -> None:
-    Lock(
+@pytest.fixture
+def lock() -> Lock:
+    """Create a Lock instance for testing."""
+    return Lock(
         lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
         "0800200c9a66",
         1,
@@ -58,16 +67,20 @@ def test_create_lock() -> None:
     )
 
 
+def test_create_lock(lock: Lock) -> None:
+    # Simply verify the lock fixture creates a valid Lock instance
+    assert lock is not None
+    assert lock.name == "mylock"
+    assert lock.key_index == 1
+
+
 @pytest.mark.asyncio
-async def test_connection_canceled_on_disconnect() -> None:
+async def test_connection_canceled_on_disconnect(lock: Lock) -> None:
     disconnect_mock = AsyncMock()
     mock_client = MagicMock(connected=True, disconnect=disconnect_mock)
-    lock = Lock(
-        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock", delegate=""),
-        "0800200c9a66",
-        1,
-        "mylock",
-        lambda _: None,
+    # Update the ble_device_callback if needed for delegate
+    lock.ble_device_callback = lambda: BLEDevice(
+        "aa:bb:cc:dd:ee:ff", "lock", delegate=""
     )
     lock.client = mock_client
 
@@ -86,15 +99,8 @@ async def test_connection_canceled_on_disconnect() -> None:
     assert task.cancelled() is True
 
 
-def test_parse_operation_source() -> None:
+def test_parse_operation_source(lock: Lock) -> None:
     """Test parsing operation source and remote type."""
-    lock = Lock(
-        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
-        "0800200c9a66",
-        1,
-        "mylock",
-        lambda _: None,
-    )
 
     # Test remote source with BLE type
     source, remote_type = lock._parse_operation_source(0x00, 0x03)
@@ -145,12 +151,13 @@ def test_parse_lock_command_response_jammed() -> None:
     # Frame: bb0b001b00000000000000000000001f0000
     # 0xBB = Status response, 0x0B = LOCK command, byte[3] = 0x1B = JAMMED
     frame = bytes.fromhex("bb0b001b00000000000000000000001f0000")
-    result = lock._parse_state(frame)
+    result, activity = lock._parse_state(frame)
 
     assert result is not None
     result_list = list(result)
     assert len(result_list) == 1
     assert result_list[0] is LockStatus.JAMMED
+    assert activity is None
 
 
 def test_parse_lock_command_response_unlocked() -> None:
@@ -166,12 +173,13 @@ def test_parse_lock_command_response_unlocked() -> None:
     # Frame: bb0b00030000000000000000000000370000
     # 0xBB = Status response, 0x0B = LOCK command, byte[3] = 0x03 = UNLOCKED
     frame = bytes.fromhex("bb0b00030000000000000000000000370000")
-    result = lock._parse_state(frame)
+    result, activity = lock._parse_state(frame)
 
     assert result is not None
     result_list = list(result)
     assert len(result_list) == 1
     assert result_list[0] is LockStatus.UNLOCKED
+    assert activity is None
 
 
 def test_parse_unlock_command_response() -> None:
@@ -187,12 +195,13 @@ def test_parse_unlock_command_response() -> None:
     # Frame: bb0a00030000000000000000000000000000
     # 0xBB = Status response, 0x0A = UNLOCK command, byte[3] = 0x03 = UNLOCKED
     frame = bytes.fromhex("bb0a00030000000000000000000000000000")
-    result = lock._parse_state(frame)
+    result, activity = lock._parse_state(frame)
 
     assert result is not None
     result_list = list(result)
     assert len(result_list) == 1
     assert result_list[0] is LockStatus.UNLOCKED
+    assert activity is None
 
 
 def test_parse_lock_command_response_locked_success() -> None:
@@ -208,12 +217,13 @@ def test_parse_lock_command_response_locked_success() -> None:
     # Frame: bb0b00050000000000000000000000000000
     # 0xBB = Status response, 0x0B = LOCK command, byte[3] = 0x05 = LOCKED
     frame = bytes.fromhex("bb0b00050000000000000000000000000000")
-    result = lock._parse_state(frame)
+    result, activity = lock._parse_state(frame)
 
     assert result is not None
     result_list = list(result)
     assert len(result_list) == 1
     assert result_list[0] is LockStatus.LOCKED
+    assert activity is None
 
 
 def _make_auto_lock_response(mode_byte: int, duration: int) -> bytes:
@@ -422,3 +432,192 @@ async def test_lock_info_reads_model_first() -> None:
     await lock.lock_info()
 
     assert call_order[0] == MODEL_NUMBER_CHARACTERISTIC
+
+
+def test_parse_bb_response_lock_activity(lock: Lock) -> None:
+    """Test parsing 0xBB responses with lock activity."""
+
+    # Mock _parse_lock_activity to return a mock activity
+    with patch.object(lock, "_parse_lock_activity") as mock_parse:
+        mock_activity = LockActivity(
+            timestamp=datetime(2024, 1, 1, 12, 0),
+            status=LockStatus.LOCKED,
+            source=LockOperationSource.MANUAL,
+        )
+        mock_parse.return_value = mock_activity
+
+        # Create a response with lock activity command
+        response_arr = bytearray(20)
+        response_arr[0] = 0xBB
+        response_arr[1] = Commands.LOCK_ACTIVITY.value
+        response = bytes(response_arr)
+
+        state, activity = lock._parse_bb_response(response)
+        assert state is None
+        assert activity == [mock_activity]
+        mock_parse.assert_called_once_with(response)
+
+    # Test when _parse_lock_activity returns None
+    with patch.object(lock, "_parse_lock_activity", return_value=None):
+        state, activity = lock._parse_bb_response(response)
+        assert state is None
+        assert activity is None
+
+
+def test_parse_bb_response_status_commands(lock: Lock) -> None:
+    """Test parsing 0xBB responses with GETSTATUS command."""
+
+    # Test GETSTATUS command
+    response_arr = bytearray(20)
+    response_arr[0] = 0xBB
+    response_arr[1] = Commands.GETSTATUS.value
+    response = bytes(response_arr)
+
+    with patch.object(lock, "_parse_status_response") as mock_parse_status:
+        mock_parse_status.return_value = [LockStatus.LOCKED]
+
+        state, activity = lock._parse_bb_response(response)
+        assert state == [LockStatus.LOCKED]
+        assert activity is None
+        mock_parse_status.assert_called_once_with(response)
+
+
+def test_parse_bb_response_settings_commands(lock: Lock) -> None:
+    """Test parsing 0xBB responses with settings commands."""
+
+    # Test WRITESETTING command with autolock
+    response_arr = bytearray(20)
+    response_arr[0] = 0xBB
+    response_arr[1] = Commands.WRITESETTING.value
+    response_arr[4] = SettingType.AUTOLOCK.value
+    response = bytes(response_arr)
+
+    with patch.object(lock, "_parse_auto_lock_state") as mock_parse_auto:
+        mock_auto_state = AutoLockState(mode=AutoLockMode.TIMER, duration=30)
+        mock_parse_auto.return_value = mock_auto_state
+
+        state, activity = lock._parse_bb_response(response)
+        assert state == [mock_auto_state]
+        assert activity is None
+        mock_parse_auto.assert_called_once_with(response)
+
+    # Test READSETTING command with autolock
+    response_arr[1] = Commands.READSETTING.value
+    response = bytes(response_arr)
+    with patch.object(lock, "_parse_auto_lock_state") as mock_parse_auto:
+        mock_auto_state = AutoLockState(mode=AutoLockMode.OFF, duration=0)
+        mock_parse_auto.return_value = mock_auto_state
+
+        state, activity = lock._parse_bb_response(response)
+        assert state == [mock_auto_state]
+        assert activity is None
+
+
+def test_parse_aa_response(lock: Lock) -> None:
+    """Test parsing 0xAA responses (direct lock/unlock commands)."""
+
+    # Test UNLOCK command
+    response_arr = bytearray(20)
+    response_arr[0] = 0xAA
+    response_arr[1] = Commands.UNLOCK.value
+    response = bytes(response_arr)
+
+    state, activity = lock._parse_aa_response(response)
+    assert state == [LockStatus.UNLOCKED]
+    assert activity is None
+
+    # Test LOCK command
+    response_arr[1] = Commands.LOCK.value
+    response = bytes(response_arr)
+    state, activity = lock._parse_aa_response(response)
+    assert state == [LockStatus.LOCKED]
+    assert activity is None
+
+    # Test unknown command
+    response_arr[1] = 0xFF
+    response = bytes(response_arr)
+    state, activity = lock._parse_aa_response(response)
+    assert state is None
+    assert activity is None
+
+
+def test_parse_status_response(lock: Lock) -> None:
+    """Test parsing different status types from GETSTATUS responses."""
+
+    # Test LOCK_ONLY status
+    response_arr = bytearray(20)
+    response_arr[4] = StatusType.LOCK_ONLY.value
+    response_arr[0x08] = LockStatus.LOCKED.value
+    response = bytes(response_arr)
+
+    state = lock._parse_status_response(response)
+    assert state == [LockStatus.LOCKED]
+
+    # Test DOOR_ONLY status
+    response_arr[4] = StatusType.DOOR_ONLY.value
+    response_arr[0x08] = DoorStatus.CLOSED.value
+    response = bytes(response_arr)
+
+    state = lock._parse_status_response(response)
+    assert state == [DoorStatus.CLOSED]
+
+    # Test DOOR_AND_LOCK status
+    response_arr[4] = StatusType.DOOR_AND_LOCK.value
+    response = bytes(response_arr)
+    with patch.object(lock, "_parse_lock_and_door_state") as mock_parse:
+        mock_parse.return_value = [LockStatus.LOCKED, DoorStatus.CLOSED]
+
+        state = lock._parse_status_response(response)
+        assert state == [LockStatus.LOCKED, DoorStatus.CLOSED]
+        mock_parse.assert_called_once_with(response)
+
+    # Test BATTERY status
+    response_arr[4] = StatusType.BATTERY.value
+    response = bytes(response_arr)
+    with patch.object(lock, "_parse_battery_state") as mock_parse:
+        mock_battery = BatteryState(voltage=6.0, percentage=85)
+        mock_parse.return_value = mock_battery
+
+        state = lock._parse_status_response(response)
+        assert state == [mock_battery]
+        mock_parse.assert_called_once_with(response)
+
+    # Test unknown status type
+    response_arr[4] = 0xFF
+    response = bytes(response_arr)
+    state = lock._parse_status_response(response)
+    assert state is None
+
+
+def test_parse_state(lock: Lock) -> None:
+    """Test the main _parse_state method."""
+
+    # Test 0xBB response
+    response_arr = bytearray(20)
+    response_arr[0] = 0xBB
+    response = bytes(response_arr)
+    with patch.object(lock, "_parse_bb_response") as mock_parse:
+        mock_parse.return_value = ([LockStatus.LOCKED], None)
+
+        state, activity = lock._parse_state(response)
+        assert state == [LockStatus.LOCKED]
+        assert activity is None
+        mock_parse.assert_called_once_with(response)
+
+    # Test 0xAA response
+    response_arr[0] = 0xAA
+    response = bytes(response_arr)
+    with patch.object(lock, "_parse_aa_response") as mock_parse:
+        mock_parse.return_value = ([LockStatus.UNLOCKED], None)
+
+        state, activity = lock._parse_state(response)
+        assert state == [LockStatus.UNLOCKED]
+        assert activity is None
+        mock_parse.assert_called_once_with(response)
+
+    # Test unknown response prefix
+    response_arr[0] = 0xFF
+    response = bytes(response_arr)
+    state, activity = lock._parse_state(response)
+    assert state is None
+    assert activity is None
