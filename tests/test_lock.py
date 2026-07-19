@@ -316,25 +316,6 @@ def test_parse_ack_still_reports_state() -> None:
     assert list(result) == [LockStatus.LOCKED]
 
 
-def test_parse_settings_read_ack_is_none_and_logs_unknown(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """An AA ack echoing a non-operation command is not recognized as state.
-
-    Production capture: the ack to the startup auto-lock READSETTING (command
-    0x04 echoed in byte[1], setting 0x28 in byte[4]). Only the Lock/Unlock
-    acks carry a state meaning; other acks surface via the unknown-state log.
-    """
-    lock = _make_lock()
-
-    frame = bytes.fromhex("aa0400282800000000000000000000000200")
-    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
-        assert lock._parse_state(frame) is None
-        lock._internal_state_callback(frame)
-
-    assert "Unknown state" in caplog.text
-
-
 def test_internal_state_callback_emits_recognized_state() -> None:
     """A recognized frame with state content reaches the state callback."""
     received: list[list[LockStateValue]] = []
@@ -353,11 +334,6 @@ def test_jammed_maps_to_the_settled_static_position_value() -> None:
     assert VALUE_TO_LOCK_STATUS[0x07] is LockStatus.JAMMED
 
 
-def _make_auto_lock_response(mode_byte: int, duration: int) -> bytes:
-    """Build a minimal _parse_auto_lock_state response buffer."""
-    return bytes(8) + duration.to_bytes(2, "little") + bytes([mode_byte])
-
-
 def _make_lock(
     state_callback: Callable[[Iterable[LockStateValue]], None] = lambda _: None,
 ) -> Lock:
@@ -370,33 +346,48 @@ def _make_lock(
     )
 
 
-def test_parse_auto_lock_state_known_mode() -> None:
-    """Known mode byte returns the matching AutoLockMode with its duration."""
+def test_parse_auto_lock_state_timed_from_wire() -> None:
+    """Real capture: value 1800 stored as seconds|(seconds<<16) -> Timed 30 min.
+
+    Front Door READSETTING response, YUR/DEL fw 2.1.0 (2026-07-05 capture).
+    """
     lock = _make_lock()
-    response = _make_auto_lock_response(AutoLockMode.TIMER, 30)
+    response = bytes.fromhex("bb0400fb2800000008070807000000000000")
     result = lock._parse_auto_lock_state(response)
-    assert result == AutoLockState(AutoLockMode.TIMER, 30)
+    assert result == AutoLockState(AutoLockMode.TIMER, 1800)
 
 
-def test_parse_auto_lock_state_unknown_mode_logs_and_returns_off(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Unrecognized mode byte falls back to OFF and logs a warning."""
+def test_parse_auto_lock_state_off_from_wire() -> None:
+    """Real capture: all-zero setting value -> auto-lock off.
+
+    Back Door READSETTING response (2026-07-05 capture).
+    """
     lock = _make_lock()
-    response = _make_auto_lock_response(0xAB, 15)
-    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
-        result = lock._parse_auto_lock_state(response)
-    assert result.mode is AutoLockMode.OFF
-    assert "0xab" in caplog.text.lower()
-
-
-def test_parse_auto_lock_state_both_zero_means_disabled() -> None:
-    """When mode byte maps to 0 (INSTANT) and duration is 0, state is OFF."""
-    lock = _make_lock()
-    response = _make_auto_lock_response(AutoLockMode.INSTANT, 0)
+    response = bytes.fromhex("bb0400192800000000000000000000000000")
     result = lock._parse_auto_lock_state(response)
-    assert result.mode is AutoLockMode.OFF
-    assert result.duration == 0
+    assert result == AutoLockState(AutoLockMode.OFF, 0)
+
+
+def test_parse_auto_lock_state_instant_low_half_only() -> None:
+    """Derivation branch: low 16 bits set, high half zero -> Instant.
+
+    Synthetic value exercising the branch; not a captured device value.
+    """
+    lock = _make_lock()
+    response = bytes(8) + (0x0005).to_bytes(4, "little")
+    result = lock._parse_auto_lock_state(response)
+    assert result == AutoLockState(AutoLockMode.INSTANT, 5)
+
+
+def test_parse_state_readsetting_ack_ignored() -> None:
+    """The READSETTING (0x04) transport ACK carries no state -> recognized, ignored.
+
+    Real ACK frame for an auto-lock READSETTING (2026-07-05 capture); must return
+    an empty iterable (not None), so it is never logged as an unknown frame.
+    """
+    lock = _make_lock()
+    ack = bytes.fromhex("aa0400282800000000000000000000000200")
+    assert lock._parse_state(ack) == ()
 
 
 _CHAR_DATA: dict[str, bytes] = {

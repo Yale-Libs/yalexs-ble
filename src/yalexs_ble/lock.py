@@ -21,7 +21,6 @@ from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
-    VALUE_TO_AUTO_LOCK_MODE,
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_OPERATION_REMOTE_TYPE,
     VALUE_TO_LOCK_OPERATION_SOURCE,
@@ -267,6 +266,14 @@ class Lock:
                 return [LockStatus.UNLOCKED]
             if state[1] == Commands.LOCK.value:
                 return [LockStatus.LOCKED]
+            if state[1] == Commands.READSETTING.value:
+                # ACK for a settings read (for example auto-lock, setting 0x28). It
+                # carries no state -- the value arrives in the BB 04 settings
+                # response -- so
+                # recognize and ignore it rather than logging "Unknown state".
+                # Kept specific to READSETTING so a new ACK type on another
+                # model still surfaces as an unknown frame.
+                return ()
         return None
 
     def _internal_state_callback(self, state: bytes) -> None:
@@ -477,18 +484,21 @@ class Lock:
         return door_status_enum
 
     def _parse_auto_lock_state(self, response: bytes) -> AutoLockState:
-        """Parse the auto lock state from the response."""
-        duration = util._bytes_to_int(response[0x08:0x0A])
-        raw_mode = response[0x0A]
-        mode = VALUE_TO_AUTO_LOCK_MODE.get(raw_mode, AutoLockMode.OFF)
-        if raw_mode not in VALUE_TO_AUTO_LOCK_MODE:
-            _LOGGER.info(
-                "%s: Unrecognized auto lock mode code: %s", self.name, hex(raw_mode)
-            )
-        if mode == 0 and duration == 0:
-            # If both values are 0, auto lock is disabled
-            mode = AutoLockMode.OFF
-        return AutoLockState(mode, duration)
+        """Parse the auto lock state from a READSETTING (setting 0x28) response.
+
+        The auto-lock time is a single little-endian uint32 at
+        ``response[8:12]``; there is no mode byte. A Timed relock is
+        encoded by the lock as ``seconds | (seconds << 16)`` -- the same seconds
+        in both 16-bit halves -- so a non-zero high half signals Timed and
+        carries the seconds. A value with only the low half set is Instant; zero
+        is off. The mode is derived from the value, never read from a wire byte.
+        """
+        value = util._bytes_to_int(response[0x08:0x0C])
+        if value == 0:
+            return AutoLockState(AutoLockMode.OFF, 0)
+        if seconds := (value >> 16) & 0xFFFF:
+            return AutoLockState(AutoLockMode.TIMER, seconds)
+        return AutoLockState(AutoLockMode.INSTANT, value & 0xFFFF)
 
     @raise_if_not_connected
     async def lock_status(self) -> LockStatus:
