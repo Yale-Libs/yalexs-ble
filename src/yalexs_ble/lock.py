@@ -107,6 +107,29 @@ def convert_voltage_to_percentage(voltage: float) -> int:
     return AA_BATTERY_VOLTAGE_MAP[AA_BATTERY_VOLTAGE_LIST[pos]]
 
 
+def _settings_response_matcher(
+    command_value: int, setting_value: int
+) -> Callable[[bytes], bool]:
+    """Match the 0xBB settings frame answering one command/setting pair.
+
+    A settings command (READSETTING/WRITESETTING) is answered by two frames:
+    an 0xAA acknowledgment echoing the request, then the 0xBB frame carrying
+    the stored value. The acknowledgment's value field is zero, so completing
+    the solicited wait on it misreads every setting; the wait must hold out
+    for the 0xBB frame that echoes the command opcode and the setting id.
+    """
+
+    def matches(data: bytes) -> bool:
+        return (
+            len(data) >= 0x0C
+            and data[0x00] == 0xBB
+            and data[0x01] == command_value
+            and data[0x04] == setting_value
+        )
+
+    return matches
+
+
 class Lock:
     def __init__(
         self,
@@ -266,13 +289,16 @@ class Lock:
                 return [LockStatus.UNLOCKED]
             if state[1] == Commands.LOCK.value:
                 return [LockStatus.LOCKED]
-            if state[1] == Commands.READSETTING.value:
-                # ACK for a settings read (for example auto-lock, setting 0x28). It
-                # carries no state -- the value arrives in the BB 04 settings
-                # response -- so
+            if state[1] in (
+                Commands.READSETTING.value,
+                Commands.WRITESETTING.value,
+            ):
+                # ACK for a settings command (for example auto-lock, setting
+                # 0x28). It carries no state -- the value arrives in the 0xBB
+                # settings response -- so
                 # recognize and ignore it rather than logging "Unknown state".
-                # Kept specific to READSETTING so a new ACK type on another
-                # model still surfaces as an unknown frame.
+                # Kept specific to the settings opcodes so a new ACK type on
+                # another model still surfaces as an unknown frame.
                 return ()
         return None
 
@@ -443,7 +469,13 @@ class Lock:
             Commands.WRITESETTING, SettingType.AUTOLOCK
         )
         util._copy(cmd, util._int_to_bytes(value, 4), destLocation=0x08)
-        await self.session.execute(cmd, "set_auto_lock")
+        await self.session.execute(
+            cmd,
+            "set_auto_lock",
+            _settings_response_matcher(
+                Commands.WRITESETTING.value, SettingType.AUTOLOCK.value
+            ),
+        )
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
 
     async def securemode(self) -> None:
@@ -556,8 +588,16 @@ class Lock:
     @raise_if_not_connected
     async def auto_lock_status(self) -> AutoLockState:
         _LOGGER.debug("%s: Executing auto_lock_status", self.name)
+        # Deliberately untyped wait: it completes on the READSETTING
+        # acknowledgment, whose value field is zero, so the return value is
+        # not the stored setting. The 0xBB settings response arrives moments
+        # later on the notify path and the push layer applies it from there.
+        # A typed wait would stall the poll for the full write timeout on a
+        # lock that never answers READSETTING (no auto-lock support).
         response = await self._execute_command(
-            Commands.READSETTING, SettingType.AUTOLOCK, "auto_lock_status"
+            Commands.READSETTING,
+            SettingType.AUTOLOCK,
+            "auto_lock_status",
         )
         _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
         return self._parse_auto_lock_state(response)

@@ -20,10 +20,12 @@ from yalexs_ble.const import (
     LockOperationSource,
     LockStateValue,
     LockStatus,
+    SettingType,
 )
 from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
     Lock,
+    _settings_response_matcher,
     convert_voltage_to_percentage,
 )
 
@@ -398,7 +400,12 @@ class _CommandCaptureSession:
         cmd[0x10] = 0x02
         return cmd
 
-    async def execute(self, command: bytearray, command_name: str) -> bytes:
+    async def execute(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
         self.sent.append(command)
         return b""
 
@@ -465,6 +472,41 @@ def test_parse_state_readsetting_ack_ignored() -> None:
     lock = _make_lock()
     ack = bytes.fromhex("aa0400282800000000000000000000000200")
     assert lock._parse_state(ack) == ()
+
+
+def test_parse_state_writesetting_ack_ignored() -> None:
+    """The WRITESETTING (0x03) transport ACK carries no state -> recognized, ignored.
+
+    Real ACK frame for an auto-lock write of Timed(90) (2026-07-16 capture); the
+    stored value is echoed at [8:12] but the frame is only the acknowledgment --
+    the authoritative echo is the 0xBB frame that follows.
+    """
+    lock = _make_lock()
+    ack = bytes.fromhex("aa030075280000005a005a00000000000200")
+    assert lock._parse_state(ack) == ()
+
+
+def test_settings_response_matcher_takes_value_frame_not_ack() -> None:
+    """The matcher keys on 0xBB + the settings opcode + the setting id.
+
+    All frames verbatim from the 2026-07-16 field capture: a settings command
+    is answered by an 0xAA acknowledgment ~40 ms before the 0xBB value frame,
+    and the acknowledgment's zero value field decodes as auto-lock off.
+    """
+    write_matcher = _settings_response_matcher(
+        Commands.WRITESETTING.value, SettingType.AUTOLOCK.value
+    )
+
+    read_response = bytes.fromhex("bb0400fb2800000008070807000000000000")
+    write_ack = bytes.fromhex("aa030075280000005a005a00000000000200")
+    write_response = bytes.fromhex("bb030066280000005a005a00000000000000")
+    battery_answer = bytes.fromhex("bb0200a50f00000079140000000000000200")
+
+    assert write_matcher(write_response)
+    assert not write_matcher(write_ack)
+    assert not write_matcher(read_response)  # wrong opcode for the write
+    assert not write_matcher(battery_answer)
+    assert not write_matcher(write_response[:4])  # truncated below the setting id
 
 
 _CHAR_DATA: dict[str, bytes] = {
