@@ -14,6 +14,7 @@ from yalexs_ble.const import (
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
     AutoLockState,
+    Commands,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
@@ -377,6 +378,82 @@ def test_parse_auto_lock_state_instant_low_half_only() -> None:
     response = bytes(8) + (0x0005).to_bytes(4, "little")
     result = lock._parse_auto_lock_state(response)
     assert result == AutoLockState(AutoLockMode.INSTANT, 5)
+
+
+class _CommandCaptureSession:
+    """Minimal Session stand-in that captures executed commands.
+
+    build_operation_command mirrors Session's 18-byte frame layout
+    (EE, opcode, cmd byte at [4], ClearText trailer marker at [16]).
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[bytearray] = []
+
+    def build_operation_command(self, opcode: int, cmd_byte: int) -> bytearray:
+        cmd = bytearray(0x12)
+        cmd[0x00] = 0xEE
+        cmd[0x01] = opcode
+        cmd[0x04] = cmd_byte
+        cmd[0x10] = 0x02
+        return cmd
+
+    async def execute(self, command: bytearray, command_name: str) -> bytes:
+        self.sent.append(command)
+        return b""
+
+
+async def _set_auto_lock_payload(mode: AutoLockMode, duration: int) -> bytearray:
+    """Run set_auto_lock against a capture session; return the sent command."""
+    lock = _make_lock()
+    session = _CommandCaptureSession()
+    lock.session = session  # type: ignore[assignment]
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+    await lock.set_auto_lock(mode, duration)
+    assert len(session.sent) == 1
+    return session.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_timed_encodes_seconds_in_both_halves() -> None:
+    """Timed(1800) -> value = 1800|(1800<<16) -> [8:12] = 08 07 08 07."""
+    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 1800)
+    assert cmd[0x01] == Commands.WRITESETTING.value
+    assert cmd[0x04] == 0x28  # auto-lock setting id
+    assert cmd[0x08:0x0C] == bytes.fromhex("08070807")
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_instant_encodes_low_half_only() -> None:
+    """Instant(5) -> value = 5 -> [8:12] = 05 00 00 00."""
+    cmd = await _set_auto_lock_payload(AutoLockMode.INSTANT, 5)
+    assert cmd[0x08:0x0C] == bytes.fromhex("05000000")
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_off_encodes_zero() -> None:
+    """Off -> value = 0 regardless of the duration argument."""
+    cmd = await _set_auto_lock_payload(AutoLockMode.OFF, 1800)
+    assert cmd[0x08:0x0C] == bytes(4)
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_duration_out_of_range_raises() -> None:
+    """Durations must fit a 16-bit half; 0xFFFF+ is rejected (app rule 1-65534)."""
+    with pytest.raises(ValueError, match="out of range"):
+        await _set_auto_lock_payload(AutoLockMode.TIMER, 0xFFFF)
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_round_trips_through_decode() -> None:
+    """A value we write, echoed back by the lock, decodes to what we set."""
+    lock = _make_lock()
+    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 1800)
+    echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
+    assert lock._parse_auto_lock_state(echoed) == AutoLockState(
+        AutoLockMode.TIMER, 1800
+    )
 
 
 def test_parse_state_readsetting_ack_ignored() -> None:

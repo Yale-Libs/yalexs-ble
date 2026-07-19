@@ -416,20 +416,33 @@ class Lock:
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
-        """Change the auto lock setting."""
+        """Change the auto lock setting (0x28).
+
+        The value is a single little-endian uint32 at [8:12], mirroring the
+        read side: 0 = off, ``n`` (low half only) = instant with an ``n``
+        second delay, ``N | (N << 16)`` = timed relock after ``N`` seconds
+        (the decoder reads the high half; the low copy is a write convention).
+        There is no mode byte -- the mode is implied by the value shape.
+        """
         _LOGGER.debug(
             "%s: Setting auto lock to mode=%d, dur=%d", self.name, mode, duration
         )
         assert self.session is not None  # nosec
-        if mode == AutoLockMode.OFF:
-            mode = AutoLockMode.INSTANT
-            duration = 0
+        if mode == AutoLockMode.OFF or duration == 0:
+            value = 0
+        elif not 1 <= duration <= 0xFFFE:
+            # The seconds live in a 16-bit half; cap conservatively below
+            # the field maximum.
+            raise ValueError(f"Auto lock duration out of range (1-65534): {duration}")
+        elif mode == AutoLockMode.TIMER:
+            value = duration | (duration << 16)
+        else:  # INSTANT
+            value = duration
 
         cmd = self.session.build_operation_command(
             Commands.WRITESETTING, SettingType.AUTOLOCK
         )
-        util._copy(cmd, util._int_to_bytes(duration, 2), destLocation=0x08)
-        cmd[0x0A] = mode
+        util._copy(cmd, util._int_to_bytes(value, 4), destLocation=0x08)
         await self.session.execute(cmd, "set_auto_lock")
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
 
