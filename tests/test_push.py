@@ -494,6 +494,82 @@ async def test_update_preserves_notify_state_from_cache() -> None:
 
 
 @pytest.mark.asyncio
+async def test_update_auto_lock_from_notify_path_survives_poll_result() -> None:
+    """_update() carries the notify-published auto-lock into its final state.
+
+    The auto-lock read's return value is the READSETTING acknowledgment
+    constant (OFF) and is discarded; the stored setting arrives as the 0xBB
+    settings response on the notify path during the cycle. The end-of-update
+    restore must apply the notify-published value, not revert to the cycle's
+    starting snapshot or the poll constant.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    mock_lock = MagicMock()
+    push_lock._lock_info = MagicMock(model="ASL-03", door_sense=True)
+    push_lock._running = True
+
+    # Mark everything but AutoLockState seen so only the auto-lock read runs.
+    push_lock._seen_this_session.add(LockStatus)
+    push_lock._seen_this_session.add(DoorStatus)
+    push_lock._seen_this_session.add(BatteryState)
+
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    # Gate the read so the settings-response notify publish lands mid-cycle.
+    auto_lock_in_progress = asyncio.Event()
+    allow_auto_lock_to_continue = asyncio.Event()
+
+    async def auto_lock_status():
+        auto_lock_in_progress.set()
+        await allow_auto_lock_to_continue.wait()
+        # The acknowledgment constant -- must not reach the final state.
+        return AutoLockState(mode=AutoLockMode.OFF, duration=0)
+
+    mock_lock.auto_lock_status = AsyncMock(side_effect=auto_lock_status)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        update_task = asyncio.create_task(push_lock._update())
+
+        await auto_lock_in_progress.wait()
+        # The 0xBB settings response publishing through the notify path.
+        push_lock._update_any_state([AutoLockState(AutoLockMode.TIMER, 1800)])
+        allow_auto_lock_to_continue.set()
+
+        final_state = await update_task
+
+        assert final_state.auto_lock == AutoLockState(AutoLockMode.TIMER, 1800), (
+            f"Auto-lock should be the notify-published value, "
+            f"got {final_state.auto_lock}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_update_continues_when_lock_info_probe_fails() -> None:
     """Test that _update() proceeds with defaults when lock_info() raises."""
     push_lock = PushLock(

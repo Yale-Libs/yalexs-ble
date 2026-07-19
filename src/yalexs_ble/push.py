@@ -947,14 +947,14 @@ class PushLock:
 
         if AutoLockState not in self._seen_this_session:
             made_request = True
-            auto_lock_state = await lock.auto_lock_status()
+            # The solicited wait returns the READSETTING acknowledgment,
+            # whose value field is zero -- never the stored setting. Issue
+            # the read only to trigger the 0xBB settings response, which
+            # the notify path decodes and applies; the end-of-update
+            # restore below carries that value into this cycle's result.
+            await lock.auto_lock_status()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(
-                state,
-                auto_lock=auto_lock_state,
-                auto_lock_prev=state.auto_lock,
-                auth=AuthState(successful=True),
-            )
+            state = replace(state, auth=AuthState(successful=True))
 
         # Only ask for the lock status if we haven't seen
         # it this session since notify callbacks will happen
@@ -981,6 +981,17 @@ class PushLock:
             state = replace(state, lock=cached_state.lock)
         if state.door == DoorStatus.UNKNOWN and cached_state.door != DoorStatus.UNKNOWN:
             state = replace(state, door=cached_state.door)
+
+        # Auto-lock is owned by the notify path: the 0xBB settings responses
+        # (read and write) publish it mid-update, while the poll's own return
+        # value is the acknowledgment constant and is discarded above. Always
+        # carry the cached value forward so this wholesale application cannot
+        # clobber a value published during the cycle.
+        state = replace(
+            state,
+            auto_lock=cached_state.auto_lock,
+            auto_lock_prev=cached_state.auto_lock_prev,
+        )
 
         self._callback_state(state)
 
