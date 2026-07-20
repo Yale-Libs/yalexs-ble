@@ -229,7 +229,7 @@ def _lock_info(model: str) -> LockInfo:
         ("", True),
     ],
 )
-def test_battery_reporting(model: str, reporting: bool):
+def test_battery_reporting(model: str, reporting: bool) -> None:
     assert _lock_info(model).battery_reporting is reporting
 
 
@@ -244,7 +244,7 @@ def test_battery_reporting(model: str, reporting: bool):
         ("", False),
     ],
 )
-def test_door_sense(model: str, door_sense: bool):
+def test_door_sense(model: str, door_sense: bool) -> None:
     assert _lock_info(model).door_sense is door_sense
 
 
@@ -419,6 +419,25 @@ async def test_update_continues_after_battery_timeout():
 
         # Battery should be None since it timed out
         assert push_lock.battery is None
+
+
+@pytest.mark.asyncio
+async def test_poll_battery_skipped_on_non_reporting_model() -> None:
+    """A model that never answers battery requests is not polled at all."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    # Suffixed variant: prefix matching must still recognise it.
+    push_lock._lock_info = _lock_info("SL-103-EU")
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock()
+
+    assert await push_lock._poll_battery(mock_lock) is False
+    mock_lock.battery.assert_not_called()
 
 
 @pytest.mark.asyncio
