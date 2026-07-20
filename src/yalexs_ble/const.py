@@ -22,7 +22,17 @@ MODEL_NUMBER_CHARACTERISTIC = "00002a24-0000-1000-8000-00805f9b34fb"
 SERIAL_NUMBER_CHARACTERISTIC = "00002a25-0000-1000-8000-00805f9b34fb"
 FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 
+# Model tables are matched by prefix against the Model Number characteristic,
+# which varies by region and firmware (e.g. "SL-103" and "Yale Linus L2" are
+# both the Linus L2).
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
+
+# With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these exclusions
+NO_BATTERY_SUPPORT_MODELS = {
+    "SL-103",  # Linus L2
+    "CERES",  # Smart code handle
+    "Yale Linus L2",  # Linus L2 Nordic
+}
 
 
 class Commands(IntEnum):
@@ -228,12 +238,15 @@ class LockInfo:
     @property
     def door_sense(self) -> bool:
         """Check if the lock has door sense support."""
-        return bool(
-            self.model
-            and not any(
-                self.model.startswith(old_model) for old_model in NO_DOOR_SENSE_MODELS
-            )
-        )
+        return bool(self.model) and not self._model_in(NO_DOOR_SENSE_MODELS)
+
+    @property
+    def battery_reporting(self) -> bool:
+        """Check if the lock answers battery status requests."""
+        return not self._model_in(NO_BATTERY_SUPPORT_MODELS)
+
+    def _model_in(self, models: set[str]) -> bool:
+        return any(self.model.startswith(model) for model in models)
 
 
 @dataclass

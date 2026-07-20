@@ -21,7 +21,6 @@ from yalexs_ble.push import (
     BATTERY_REFRESH_INTERVAL,
     DEFAULT_ATTEMPTS,
     NEVER_TIME,
-    NO_BATTERY_SUPPORT_MODELS,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
     SLOW_MIN_INTERVAL,
@@ -32,7 +31,7 @@ from yalexs_ble.push import (
 )
 from yalexs_ble.session import DisconnectedError, ResponseError
 
-# Shared battery-supporting lock used across tests. model is NOT in
+# Shared battery-supporting lock used across tests. model is not in
 # NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
 TEST_LOCK_INFO = LockInfo(
     manufacturer="August",
@@ -167,12 +166,40 @@ async def test_retry_bluetooth_connection_error_with_operation_lock():
     await asyncio.sleep(0)
 
 
-def test_needs_battery_workaround():
-    assert "SL-103" in NO_BATTERY_SUPPORT_MODELS
-    assert "CERES" in NO_BATTERY_SUPPORT_MODELS
-    assert "Yale Linus L2" in NO_BATTERY_SUPPORT_MODELS
-    assert "ASL-03" not in NO_BATTERY_SUPPORT_MODELS
-    assert "MD-04I" not in NO_BATTERY_SUPPORT_MODELS
+def _lock_info(model: str) -> LockInfo:
+    return LockInfo(manufacturer="yale", model=model, serial="x", firmware="1.0")
+
+
+@pytest.mark.parametrize(
+    ("model", "reporting"),
+    [
+        ("SL-103", False),
+        ("CERES", False),
+        ("Yale Linus L2", False),
+        # Regional/firmware suffixes must still match the family.
+        ("SL-103-EU", False),
+        ("ASL-03", True),
+        ("MD-04I", True),
+        ("", True),
+    ],
+)
+def test_battery_reporting(model: str, reporting: bool) -> None:
+    assert _lock_info(model).battery_reporting is reporting
+
+
+@pytest.mark.parametrize(
+    ("model", "door_sense"),
+    [
+        ("ASL-02", False),
+        ("ASL-01", False),
+        ("ASL-01-XX", False),
+        ("ASL-03", True),
+        # An unknown model is assumed to have no door sense.
+        ("", False),
+    ],
+)
+def test_door_sense(model: str, door_sense: bool) -> None:
+    assert _lock_info(model).door_sense is door_sense
 
 
 @pytest.mark.asyncio
@@ -242,6 +269,38 @@ async def test_update_continues_after_battery_timeout():
 
         # Battery should be None since it timed out
         assert final_state.battery is None
+
+
+@pytest.mark.asyncio
+async def test_poll_battery_skipped_on_non_reporting_model():
+    """A model that never answers battery requests is not polled at all."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    # Suffixed variant: prefix matching must still recognise it.
+    push_lock._lock_info = _lock_info("SL-103-EU")
+
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock()
+
+    initial_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    result_state, made_request = await push_lock._poll_battery(mock_lock, initial_state)
+
+    assert made_request is False
+    assert result_state == initial_state
+    mock_lock.battery.assert_not_called()
 
 
 @pytest.mark.asyncio
