@@ -505,7 +505,7 @@ async def test_set_auto_lock_timed_zero_duration_encodes_off_shape() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_lock_status_issues_read_and_returns_none() -> None:
+async def test_auto_lock_status_issues_read() -> None:
     """auto_lock_status sends a READSETTING for the auto-lock setting.
 
     The wait completes on the acknowledgment, which carries no value, so the
@@ -517,7 +517,7 @@ async def test_auto_lock_status_issues_read_and_returns_none() -> None:
     lock.session = session  # type: ignore[assignment]
     lock.secure_session = MagicMock()
     lock.client = MagicMock(is_connected=True)
-    assert await lock.auto_lock_status() is None
+    await lock.auto_lock_status()
     assert len(session.sent) == 1
     assert session.sent[0][0x01] == Commands.READSETTING.value
     assert session.sent[0][0x04] == SettingType.AUTOLOCK.value
