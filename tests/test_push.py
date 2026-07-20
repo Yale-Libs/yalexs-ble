@@ -630,6 +630,23 @@ async def test_update_sets_slow_connection_params_when_always_connected():
     )
 
 
+def test_slow_connection_params_are_latency_based():
+    """Slow mode must idle via peripheral latency, not a long interval.
+
+    A long min == max interval throttles notification delivery (one frame per
+    two connection events), so an operation's reply cannot drain before the
+    next command is written. The idle duty cycle has to come from latency
+    while the base interval stays short.
+    """
+    # Short base interval so notifications drain quickly once latency drops.
+    assert SLOW_MAX_INTERVAL * 1.25 <= 50  # ms
+    assert SLOW_MIN_INTERVAL == SLOW_MAX_INTERVAL
+    # Idle wake-up is ~500ms, which is where the battery saving comes from.
+    assert 400 <= (1 + SLOW_LATENCY) * SLOW_MAX_INTERVAL * 1.25 <= 600  # ms
+    # Core spec: supervision timeout > (1 + latency) * max_interval * 2.
+    assert SLOW_TIMEOUT * 10 > (1 + SLOW_LATENCY) * SLOW_MAX_INTERVAL * 1.25 * 2
+
+
 @pytest.mark.asyncio
 async def test_update_does_not_set_connection_params_when_not_always_connected():
     """Test _update() skips connection params when not always connected."""

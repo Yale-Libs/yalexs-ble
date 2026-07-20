@@ -91,12 +91,22 @@ HK_UPDATE_COALESCE_SECONDS = 0.025
 MANUAL_UPDATE_COALESCE_SECONDS = 0.05
 
 # BLE connection parameters for always-connected mode (battery saving)
-# After the initial sync, we switch to slow intervals to conserve battery.
+# After the initial sync, we switch to a low duty cycle to conserve battery.
 # Values are in BLE units: intervals in 1.25ms, timeout in 10ms.
-SLOW_MIN_INTERVAL = 800  # 1000ms
-SLOW_MAX_INTERVAL = 800  # 1000ms
-SLOW_LATENCY = 0
-SLOW_TIMEOUT = 600  # 6000ms
+#
+# The idle duty cycle is set by peripheral latency, not by the interval: the
+# lock may skip up to SLOW_LATENCY connection events, so it wakes about every
+# (1 + SLOW_LATENCY) * interval = 510ms. Keeping the interval short means the
+# lock drops latency and drains its notifications at the base interval as soon
+# as it has something to send. Pinning min == max at a long interval instead
+# (1000ms) makes notification delivery, which is acknowledgement gated at one
+# frame per two connection events, take ~2s per frame; a lock operation's
+# three-frame reply then needs >6s to drain and the next command is issued
+# while the previous operation's frames are still arriving.
+SLOW_MIN_INTERVAL = 24  # 30ms
+SLOW_MAX_INTERVAL = 24  # 30ms
+SLOW_LATENCY = 16  # up to 16 skipped connection events (510ms)
+SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
