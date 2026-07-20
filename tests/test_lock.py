@@ -14,6 +14,7 @@ from yalexs_ble.const import (
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
     AutoLockState,
+    Commands,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
@@ -561,3 +562,49 @@ async def test_lock_info_reads_model_first() -> None:
     await lock.lock_info()
 
     assert call_order[0] == MODEL_NUMBER_CHARACTERISTIC
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("SL-103", True),  # Linus L2
+        ("Yale Linus L2", True),  # Linus L2 Nordic
+        ("Yale Linus L2 Lite", True),  # Linus L2 Lite (issue #350)
+        ("ASL-03", False),
+        ("ASL-02", False),
+        ("", False),
+    ],
+)
+def test_lock_info_can_open(model: str, expected: bool) -> None:
+    """can_open is True only for Linus L2 family models (issue #350)."""
+    info = LockInfo(
+        manufacturer="Yale/August",
+        model=model,
+        serial="12345",
+        firmware="2.0.0",
+    )
+    assert info.can_open is expected
+
+
+@pytest.mark.asyncio
+async def test_force_unlatch_issues_unlock_with_operation_byte() -> None:
+    """force_unlatch sends the UNLOCK opcode with operation byte 0x01."""
+    lock, _ = _make_lock_with_mock_client()
+    lock.session = MagicMock()
+    lock.session.execute = AsyncMock(return_value=b"")
+
+    await lock.force_unlatch()
+
+    lock.session.build_operation_command.assert_called_once_with(Commands.UNLOCK, 0x01)
+    lock.session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unlatch_delegates_to_force_unlatch() -> None:
+    """unlatch() always fires force_unlatch(), with no status short-circuit."""
+    lock, _ = _make_lock_with_mock_client()
+
+    with patch.object(lock, "force_unlatch", AsyncMock()) as mock_force_unlatch:
+        await lock.unlatch()
+
+    mock_force_unlatch.assert_awaited_once()

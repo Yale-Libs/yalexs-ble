@@ -24,6 +24,14 @@ FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
 
+# Models that support the "open door" / unlatch (pull spring) operation in
+# addition to lock/unlock. The Yale Linus L2 family (including the L2 Lite)
+# can retract the latch so the door can be pushed open. Matched by prefix so
+# variant suffixes (e.g. "Yale Linus L2 Lite") are covered. See issue #350.
+# See also NO_BATTERY_SUPPORT_MODELS in push.py -- the same L2 family model
+# strings appear in both sets; a new L2 variant likely belongs in both.
+OPEN_SUPPORT_MODELS = {"SL-103", "Yale Linus L2"}
+
 
 class Commands(IntEnum):
     GETSTATUS = 0x02
@@ -112,8 +120,8 @@ class LockStatus(Enum):
     LOCKED = 0x05
     UNKNOWN_06 = 0x06  # PolDiscovery
     JAMMED = 0x07  # STATICPOSITION
-    # UNLATCHING = 0x09
-    # UNLATCHED = 0x0A
+    UNLATCHING = 0x09
+    UNLATCHED = 0x0A
     SECUREMODE = 0x0C
 
 
@@ -232,6 +240,16 @@ class LockInfo:
             self.model
             and not any(
                 self.model.startswith(old_model) for old_model in NO_DOOR_SENSE_MODELS
+            )
+        )
+
+    @property
+    def can_open(self) -> bool:
+        """Check if the lock supports the "open door" (unlatch) operation."""
+        return bool(
+            self.model
+            and any(
+                self.model.startswith(open_model) for open_model in OPEN_SUPPORT_MODELS
             )
         )
 

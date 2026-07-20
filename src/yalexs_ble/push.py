@@ -123,7 +123,10 @@ BATTERY_TIMEOUT_COOLDOWN = 300
 BATTERY_REFRESH_INTERVAL = 600
 
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
-# exclusions
+# exclusions.
+# See also OPEN_SUPPORT_MODELS in const.py -- the same L2 family model strings
+# appear in both sets; a new L2 variant likely belongs in both. CERES is a
+# smart-code handle, not an L2, so it is intentionally only here.
 NO_BATTERY_SUPPORT_MODELS = {
     "SL-103",  # Linus L2
     "CERES",  # Smart code handle
@@ -635,6 +638,24 @@ class PushLock:
         self._cancel_future_update()
         await self._execute_lock_operation(
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
+        )
+
+    async def unlatch(self) -> None:
+        """Unlatch the lock ("open door" / pull spring).
+
+        Only supported on Linus L2 family locks; check
+        ``lock_info.can_open`` before exposing this operation. See issue #350.
+
+        Unlatching is momentary: the latch retracts so the door can be pushed
+        open and the lock settles back to UNLOCKED. UNLATCHED (0x0A) is only
+        ever observed transiently in a notification, so it is not a valid
+        terminal state to write -- doing so would leave the lock reported as
+        UNLATCHED until the next advertisement-triggered poll.
+        """
+        self._update_any_state([LockStatus.UNLATCHING])
+        self._cancel_future_update()
+        await self._execute_lock_operation(
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
         )
 
     @operation_lock
