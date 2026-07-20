@@ -645,11 +645,17 @@ class PushLock:
 
         Only supported on Linus L2 family locks; check
         ``lock_info.can_open`` before exposing this operation. See issue #350.
+
+        Unlatching is momentary: the latch retracts so the door can be pushed
+        open and the lock settles back to UNLOCKED. UNLATCHED (0x0A) is only
+        ever observed transiently in a notification, so it is not a valid
+        terminal state to write -- doing so would leave the lock reported as
+        UNLATCHED until the next advertisement-triggered poll.
         """
         self._update_any_state([LockStatus.UNLATCHING])
         self._cancel_future_update()
         await self._execute_lock_operation(
-            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLATCHED
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
         )
 
     @operation_lock

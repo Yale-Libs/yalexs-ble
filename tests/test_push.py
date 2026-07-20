@@ -1269,7 +1269,7 @@ async def test_retry_backoff_exceptions_sleep_between_attempts() -> None:
 
 @pytest.mark.asyncio
 async def test_unlatch_executes_open_operation() -> None:
-    """unlatch() drives the UNLATCHING->UNLATCHED open-door operation."""
+    """unlatch() drives the UNLATCHING->UNLOCKED open-door operation."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
         key="0800200c9a66",
@@ -1286,5 +1286,5 @@ async def test_unlatch_executes_open_operation() -> None:
         # Optimistically flips to UNLATCHING before the BLE round-trip.
         assert push_lock.lock_status is LockStatus.UNLATCHING
         mock_execute.assert_awaited_once_with(
-            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLATCHED
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
         )
