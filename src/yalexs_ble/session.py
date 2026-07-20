@@ -152,16 +152,27 @@ class Session:
         _LOGGER.debug(
             "%s: Decrypted response via notify: %s", self.name, decrypted_data.hex()
         )
-        if self._notify_future is None:
+        notify_future = self._notify_future
+        if notify_future is None:
+            return
+        if notify_future.done():
+            # The awaiter was already cancelled by a timeout or disconnect;
+            # clear the slot and ignore the notify. Logged above debug because
+            # a lock that chronically answers late is a real fault that would
+            # otherwise be invisible in installs without debug logging.
+            _LOGGER.warning(
+                "%s: Ignoring notify; the waiting request already gave up", self.name
+            )
+            self._notify_future = None
             return
         try:
             self._validate_response(data)
         except ResponseError as ex:
             _LOGGER.debug("%s: Invalid response, waiting for next one", self.name)
-            self._notify_future.set_exception(ex)
+            notify_future.set_exception(ex)
             self._notify_future = None
             return
-        self._notify_future.set_result(decrypted_data)
+        notify_future.set_result(decrypted_data)
         self._notify_future = None
 
     async def _locked_write(self, command: bytearray, command_name: str) -> bytes:
@@ -179,29 +190,36 @@ class Session:
             "%s: Encrypted command %s: %s", self.name, command_name, command.hex()
         )
 
-        for attempt in range(3):
-            future: asyncio.Future[bytes] = self.loop.create_future()
-            self._notify_future = future
-            _LOGGER.debug(
-                "%s: Writing command to %s: %s",
-                self.name,
-                self.write_characteristic,
-                command.hex(),
-            )
-            _LOGGER.debug("%s: Waiting for response", self.name)
-            async with util.asyncio_timeout(10):
-                try:
-                    await self.client.write_gatt_char(
-                        self.write_characteristic, command, True
-                    )
-                    result = await future
-                except ResponseError:
-                    if attempt == 2:
-                        raise
-                    _LOGGER.debug("%s: Invalid response, retrying", self.name)
-                    continue
-                else:
-                    break
+        try:
+            for _ in range(3):
+                future: asyncio.Future[bytes] = self.loop.create_future()
+                self._notify_future = future
+                _LOGGER.debug(
+                    "%s: Writing command to %s: %s",
+                    self.name,
+                    self.write_characteristic,
+                    command.hex(),
+                )
+                _LOGGER.debug("%s: Waiting for response", self.name)
+                async with util.asyncio_timeout(10):
+                    try:
+                        await self.client.write_gatt_char(
+                            self.write_characteristic, command, True
+                        )
+                        result = await future
+                    except ResponseError as ex:
+                        _LOGGER.debug("%s: Invalid response, retrying", self.name)
+                        last_error = ex
+                    else:
+                        break
+            else:
+                raise last_error
+        finally:
+            # Drop the reference even on success — _notify already cleared it,
+            # but on timeout / BleakError / cancellation it would point at a
+            # cancelled or unresolved future, and a late notify would hit
+            # set_result() on a done future (InvalidStateError).
+            self._notify_future = None
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
         return result
 
