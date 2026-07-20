@@ -122,14 +122,6 @@ BATTERY_TIMEOUT_COOLDOWN = 300
 # How often to re-poll battery state in always_connected mode (10 minutes)
 BATTERY_REFRESH_INTERVAL = 600
 
-# With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
-# exclusions
-NO_BATTERY_SUPPORT_MODELS = {
-    "SL-103",  # Linus L2
-    "CERES",  # Smart code handle
-    "Yale Linus L2",  # Linus L2 Nordic
-}
-
 AUTO_LOCK_DEFAULT_DURATION = 90
 
 
@@ -838,7 +830,7 @@ class PushLock:
         Returns tuple of (updated_state, made_request).
         """
         assert self._lock_info is not None  # nosec
-        if self._lock_info.model in NO_BATTERY_SUPPORT_MODELS:
+        if not self._lock_info.battery_reporting:
             _LOGGER.debug(
                 "%s: Needs battery workaround model %s",
                 self.name,

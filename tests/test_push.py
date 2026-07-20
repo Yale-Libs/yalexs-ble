@@ -21,7 +21,6 @@ from yalexs_ble.push import (
     BATTERY_REFRESH_INTERVAL,
     DEFAULT_ATTEMPTS,
     NEVER_TIME,
-    NO_BATTERY_SUPPORT_MODELS,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
     SLOW_MIN_INTERVAL,
@@ -32,7 +31,7 @@ from yalexs_ble.push import (
 )
 from yalexs_ble.session import DisconnectedError, ResponseError
 
-# Shared battery-supporting lock used across tests. model is NOT in
+# Shared battery-supporting lock used across tests. model is not in
 # NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
 TEST_LOCK_INFO = LockInfo(
     manufacturer="August",
@@ -167,12 +166,40 @@ async def test_retry_bluetooth_connection_error_with_operation_lock():
     await asyncio.sleep(0)
 
 
-def test_needs_battery_workaround():
-    assert "SL-103" in NO_BATTERY_SUPPORT_MODELS
-    assert "CERES" in NO_BATTERY_SUPPORT_MODELS
-    assert "Yale Linus L2" in NO_BATTERY_SUPPORT_MODELS
-    assert "ASL-03" not in NO_BATTERY_SUPPORT_MODELS
-    assert "MD-04I" not in NO_BATTERY_SUPPORT_MODELS
+def _lock_info(model: str) -> LockInfo:
+    return LockInfo(manufacturer="yale", model=model, serial="x", firmware="1.0")
+
+
+@pytest.mark.parametrize(
+    ("model", "reporting"),
+    [
+        ("SL-103", False),
+        ("CERES", False),
+        ("Yale Linus L2", False),
+        # Regional/firmware suffixes must still match the family.
+        ("SL-103-EU", False),
+        ("ASL-03", True),
+        ("MD-04I", True),
+        ("", True),
+    ],
+)
+def test_battery_reporting(model: str, reporting: bool):
+    assert _lock_info(model).battery_reporting is reporting
+
+
+@pytest.mark.parametrize(
+    ("model", "door_sense"),
+    [
+        ("ASL-02", False),
+        ("ASL-01", False),
+        ("ASL-01-XX", False),
+        ("ASL-03", True),
+        # An unknown model is assumed to have no door sense.
+        ("", False),
+    ],
+)
+def test_door_sense(model: str, door_sense: bool):
+    assert _lock_info(model).door_sense is door_sense
 
 
 @pytest.mark.asyncio
