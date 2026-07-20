@@ -1370,3 +1370,92 @@ async def test_set_auto_lock_timeout_warns_and_names_the_failure(
     warnings = [record for record in caplog.records if record.levelname == "WARNING"]
     assert len(warnings) == 1
     assert "the lock may not support auto lock" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setter", "arg", "auto_lock", "auto_lock_prev", "expected"),
+    [
+        # Turning auto lock off writes OFF with a zero duration.
+        ("set_auto_lock_mode", AutoLockMode.OFF, None, None, (AutoLockMode.OFF, 0)),
+        ("set_auto_lock_duration", 0, None, None, (AutoLockMode.OFF, 0)),
+        # Already off returns without writing.
+        (
+            "set_auto_lock_mode",
+            AutoLockMode.OFF,
+            AutoLockState(mode=AutoLockMode.OFF, duration=0),
+            None,
+            None,
+        ),
+        (
+            "set_auto_lock_duration",
+            0,
+            AutoLockState(mode=AutoLockMode.OFF, duration=0),
+            None,
+            None,
+        ),
+        # A mode change keeps the current duration; a duration change keeps
+        # the current mode.
+        (
+            "set_auto_lock_mode",
+            AutoLockMode.INSTANT,
+            AutoLockState(mode=AutoLockMode.TIMER, duration=120),
+            None,
+            (AutoLockMode.INSTANT, 120),
+        ),
+        (
+            "set_auto_lock_duration",
+            60,
+            AutoLockState(mode=AutoLockMode.INSTANT, duration=5),
+            None,
+            (AutoLockMode.INSTANT, 60),
+        ),
+        # When auto lock is currently off, fall back to the previous state.
+        (
+            "set_auto_lock_mode",
+            AutoLockMode.TIMER,
+            AutoLockState(mode=AutoLockMode.OFF, duration=0),
+            AutoLockState(mode=AutoLockMode.TIMER, duration=300),
+            (AutoLockMode.TIMER, 300),
+        ),
+        (
+            "set_auto_lock_duration",
+            60,
+            AutoLockState(mode=AutoLockMode.OFF, duration=0),
+            AutoLockState(mode=AutoLockMode.INSTANT, duration=10),
+            (AutoLockMode.INSTANT, 60),
+        ),
+    ],
+)
+async def test_set_auto_lock_wrappers_choose_the_written_pair(
+    setter: str,
+    arg: AutoLockMode | int,
+    auto_lock: AutoLockState | None,
+    auto_lock_prev: AutoLockState | None,
+    expected: tuple[AutoLockMode, int] | None,
+) -> None:
+    """The public setters pick mode and duration from current, then previous state."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:0c",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    if auto_lock or auto_lock_prev:
+        push_lock._lock_state = LockState(
+            lock=LockStatus.LOCKED,
+            door=DoorStatus.CLOSED,
+            battery=None,
+            auth=None,
+            auto_lock=auto_lock,
+            auto_lock_prev=auto_lock_prev,
+        )
+
+    with patch.object(push_lock, "_set_auto_lock", new_callable=AsyncMock) as mock_set:
+        await getattr(push_lock, setter)(arg)
+
+    if expected is None:
+        mock_set.assert_not_awaited()
+    else:
+        mock_set.assert_awaited_once_with(*expected)
