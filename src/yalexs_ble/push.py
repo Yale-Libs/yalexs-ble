@@ -934,13 +934,17 @@ class PushLock:
           (otherwise the writeback would clobber the notify update).
         - Fields the update DID re-fetch that returned UNKNOWN are treated as
           stale and fall back to the cache if it has a real value.
+
+        ``auth`` is deliberately excluded: ``LockStateValue`` has no
+        ``AuthState`` member, so notify callbacks cannot mutate it mid-update.
+        The only other writer is the retry decorator's auth-failure latch, which
+        a successful update must be able to clear.
         """
         cached_state = self._get_current_state()
         for field in (
             "lock",
             "door",
             "battery",
-            "auth",
             "auto_lock",
             "auto_lock_prev",
         ):
