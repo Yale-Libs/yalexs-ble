@@ -371,6 +371,30 @@ def test_parse_auto_lock_state_off_from_wire() -> None:
     assert result == AutoLockState(AutoLockMode.OFF, 0)
 
 
+def test_parse_auto_lock_state_old_encoding_reads_user_value() -> None:
+    """A value written by a release before the two-timer encoding -> Timed 30.
+
+    Earlier releases stored the user's seconds in the never-opened half and a
+    fixed 90 in the door-close half, so Timed(30) was written as 1e 00 5a 00.
+    The decode reports the never-opened half, so the value reads back as set.
+    """
+    lock = _make_lock()
+    response = bytes(8) + bytes.fromhex("1e005a00")
+    result = lock._parse_auto_lock_state(response)
+    assert result == AutoLockState(AutoLockMode.TIMER, 30)
+
+
+def test_parse_auto_lock_state_zero_never_opened_falls_back() -> None:
+    """A zero never-opened half falls back to the door-close half.
+
+    Synthetic value exercising the branch; not a captured device value.
+    """
+    lock = _make_lock()
+    response = bytes(8) + bytes.fromhex("00005a00")
+    result = lock._parse_auto_lock_state(response)
+    assert result == AutoLockState(AutoLockMode.TIMER, 90)
+
+
 def test_parse_auto_lock_state_instant_low_half_only() -> None:
     """Derivation branch: low 16 bits set, high half zero -> Instant.
 
@@ -505,9 +529,7 @@ async def test_set_auto_lock_instant_round_trips_through_decode() -> None:
     lock = _make_lock()
     cmd = await _set_auto_lock_payload(AutoLockMode.INSTANT, 5)
     echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
-    assert lock._parse_auto_lock_state(echoed) == AutoLockState(
-        AutoLockMode.INSTANT, 5
-    )
+    assert lock._parse_auto_lock_state(echoed) == AutoLockState(AutoLockMode.INSTANT, 5)
 
 
 @pytest.mark.asyncio

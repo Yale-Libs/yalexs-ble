@@ -151,9 +151,11 @@ async def test_locked_write_clears_slot_on_timeout() -> None:
     # The write succeeds but no notify is ever delivered.
     session.client.write_gatt_char = AsyncMock()
 
-    with patch.object(util, "asyncio_timeout", _short_timeout):
-        with pytest.raises(TimeoutError):
-            await session._locked_write(bytearray(18), "auto_lock_status")
+    with (
+        patch.object(util, "asyncio_timeout", _short_timeout),
+        pytest.raises(TimeoutError),
+    ):
+        await session._locked_write(bytearray(18), "auto_lock_status")
 
     assert session._notify_future is None
     assert session._notify_matcher is None
@@ -170,9 +172,11 @@ async def test_late_notify_after_timeout_is_ignored() -> None:
     session = _make_session(received)
     session.client.write_gatt_char = AsyncMock()
 
-    with patch.object(util, "asyncio_timeout", _short_timeout):
-        with pytest.raises(TimeoutError):
-            await session._locked_write(bytearray(18), "auto_lock_status")
+    with (
+        patch.object(util, "asyncio_timeout", _short_timeout),
+        pytest.raises(TimeoutError),
+    ):
+        await session._locked_write(bytearray(18), "auto_lock_status")
 
     assert session._notify_future is None
     session._notify(0, bytearray(READ_ANSWER))
@@ -188,9 +192,11 @@ async def test_fresh_command_rearms_slot_after_timeout() -> None:
     session = _make_session(received)
     session.client.write_gatt_char = AsyncMock()
 
-    with patch.object(util, "asyncio_timeout", _short_timeout):
-        with pytest.raises(TimeoutError):
-            await session._locked_write(bytearray(18), "auto_lock_status")
+    with (
+        patch.object(util, "asyncio_timeout", _short_timeout),
+        pytest.raises(TimeoutError),
+    ):
+        await session._locked_write(bytearray(18), "auto_lock_status")
     assert session._notify_future is None
 
     async def deliver(*_args: object, **_kwargs: object) -> None:

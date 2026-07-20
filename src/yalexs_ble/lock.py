@@ -444,11 +444,13 @@ class Lock:
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
         """Change the auto lock setting (0x28).
 
-        The value is a single little-endian uint32 at [8:12], mirroring the
-        read side: 0 = off, ``n`` (low half only) = instant with an ``n``
-        second delay, ``N | (N << 16)`` = timed relock after ``N`` seconds
-        (the decoder reads the high half; the low copy is a write convention).
-        There is no mode byte -- the mode is implied by the value shape.
+        The value is a little-endian uint32 at [8:12] holding two 16-bit
+        timers: the never-opened timer at [8:10] and the door-close timer at
+        [10:12]. 0 = off; ``n`` in the never-opened half alone = instant with
+        an ``n`` second delay; ``N | (N << 16)`` = timed relock after ``N``
+        seconds, with both timers set to the same value. There is no mode
+        byte -- the mode is implied by the value shape, and the read side
+        reports the never-opened half (see ``_parse_auto_lock_state``).
         """
         _LOGGER.debug(
             "%s: Setting auto lock to mode=%d, dur=%d", self.name, mode, duration
@@ -536,20 +538,24 @@ class Lock:
         the low half (bytes [8:10]) is the never-opened timer and the high half
         (bytes [10:12]) is the door-close timer. A Timed relock is encoded by
         the lock as ``seconds | (seconds << 16)`` -- the same seconds in both
-        halves -- so a non-zero high half signals Timed and carries the seconds.
-        A value with only the low half set is Instant; zero is off. The mode is
-        derived from the value, never read from a wire byte.
+        halves -- so a non-zero high half signals Timed. A value with only the
+        low half set is Instant; zero is off. The mode is derived from the
+        value, never read from a wire byte.
 
-        The Timed decode keeps the door-close half and drops the never-opened
-        half, so a write derived from this state sets both timers to the same
-        value.
+        The Timed decode reports the never-opened half: it is the field the
+        app displays, and releases before the two-timer encoding stored the
+        user's seconds there, so those values read back as set. A zero
+        never-opened half falls back to the door-close half. A write derived
+        from this state sets both timers to the same value.
         """
         value = util._bytes_to_int(response[0x08:0x0C])
         if value == 0:
             return AutoLockState(AutoLockMode.OFF, 0)
-        if seconds := (value >> 16) & 0xFFFF:
-            return AutoLockState(AutoLockMode.TIMER, seconds)
-        return AutoLockState(AutoLockMode.INSTANT, value & 0xFFFF)
+        never_opened = value & 0xFFFF
+        door_close = (value >> 16) & 0xFFFF
+        if door_close:
+            return AutoLockState(AutoLockMode.TIMER, never_opened or door_close)
+        return AutoLockState(AutoLockMode.INSTANT, never_opened)
 
     @raise_if_not_connected
     async def lock_status(self) -> LockStatus:
