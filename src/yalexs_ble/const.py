@@ -92,6 +92,18 @@ class OperationError(IntEnum):
 VALUE_TO_OPERATION_ERROR = {err.value: err for err in OperationError}
 
 
+class LockCommandType(IntEnum):
+    """Byte[4] qualifier on a LOCK command, echoed back in the 0xAA ack.
+
+    A plain lock leaves byte[4] at 0x00; securemode (deadlock) sets 0x04.
+    Both share the LOCK opcode, so byte[4] is the only thing that tells the
+    resulting state apart.
+    """
+
+    LOCK = 0x00
+    SECUREMODE = 0x04
+
+
 class StatusType(IntEnum):
     LOCK_ONLY = 0x02
     DOOR_ONLY = 0x2E
