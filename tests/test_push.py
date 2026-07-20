@@ -1391,3 +1391,85 @@ async def test_lock_operation_sets_complete_state_on_success() -> None:
     mock_lock.force_unlock.assert_called_once()
     assert push_lock._lock_state is not None
     assert push_lock._lock_state.lock == LockStatus.UNLOCKED
+
+
+@pytest.mark.asyncio
+async def test_securemode_preserves_prior_state_on_connect_failure() -> None:
+    """
+    Test that a failed securemode() restores the prior lock status.
+
+    Covers the third entry point that captures prior_lock_status, alongside
+    lock() and unlock().
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    push_lock._lock_state = LockState(
+        lock=LockStatus.UNLOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    with (
+        patch.object(
+            push_lock,
+            "_ensure_connected",
+            AsyncMock(side_effect=TimeoutError("connect timed out")),
+        ),
+        pytest.raises(TimeoutError),
+    ):
+        await push_lock.securemode()
+
+    assert push_lock._lock_state is not None
+    assert push_lock._lock_state.lock == LockStatus.UNLOCKED
+
+
+@pytest.mark.asyncio
+async def test_lock_operation_sets_unknown_when_command_already_dispatched() -> None:
+    """
+    Test that a failure *after* the command was sent to the lock reports UNKNOWN.
+
+    Once the write has been dispatched we cannot know whether the lock acted on
+    it, so asserting the prior state would be a false negative for a security
+    device. Only pre-dispatch failures preserve the prior state.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=None,
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+
+    mock_lock = MagicMock()
+    mock_lock.force_unlock = AsyncMock(side_effect=TimeoutError("write timed out"))
+
+    with (
+        patch.object(
+            push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+        ),
+        pytest.raises(TimeoutError),
+    ):
+        await push_lock.unlock()
+
+    assert push_lock._lock_state is not None
+    assert push_lock._lock_state.lock == LockStatus.UNKNOWN

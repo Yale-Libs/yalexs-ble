@@ -663,15 +663,20 @@ class PushLock:
         _LOGGER.debug("%s: Starting %s", self.name, pending_state)
         self._update_any_state([pending_state])
         self._cancel_future_update()
+        dispatched = False
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
+            dispatched = True
             await getattr(lock, op_attr)()
         except Exception as ex:
-            # Restore the prior lock status rather than regressing to UNKNOWN.
-            # A transient BLE connect failure doesn't change the physical lock —
-            # push notify / the next poll will surface the authoritative state.
-            self._update_any_state([prior_lock_status])
+            # Pre-dispatch failures (e.g. a BLE connect timeout) mean the command
+            # never left the host, so the physical lock cannot have changed —
+            # keep the last known state instead of regressing to UNKNOWN.
+            # Once dispatched we genuinely don't know the outcome.
+            self._update_any_state(
+                [LockStatus.UNKNOWN if dispatched else prior_lock_status]
+            )
             # The retry_bluetooth_connection_error wrapper calls
             # _async_handle_disconnected for RETRY_EXCEPTIONS /
             # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
