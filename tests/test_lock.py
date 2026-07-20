@@ -597,3 +597,14 @@ async def test_force_unlatch_issues_unlock_with_operation_byte() -> None:
 
     lock.session.build_operation_command.assert_called_once_with(Commands.UNLOCK, 0x01)
     lock.session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unlatch_delegates_to_force_unlatch() -> None:
+    """unlatch() always fires force_unlatch(), with no status short-circuit."""
+    lock, _ = _make_lock_with_mock_client()
+    lock.force_unlatch = AsyncMock()
+
+    await lock.unlatch()
+
+    lock.force_unlatch.assert_awaited_once()

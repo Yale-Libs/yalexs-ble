@@ -1268,7 +1268,7 @@ async def test_retry_backoff_exceptions_sleep_between_attempts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unlatch_executes_open_operation():
+async def test_unlatch_executes_open_operation() -> None:
     """unlatch() drives the UNLATCHING->UNLATCHED open-door operation."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",

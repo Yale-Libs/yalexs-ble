@@ -123,7 +123,10 @@ BATTERY_TIMEOUT_COOLDOWN = 300
 BATTERY_REFRESH_INTERVAL = 600
 
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
-# exclusions
+# exclusions.
+# See also OPEN_SUPPORT_MODELS in const.py -- the same L2 family model strings
+# appear in both sets; a new L2 variant likely belongs in both. CERES is a
+# smart-code handle, not an L2, so it is intentionally only here.
 NO_BATTERY_SUPPORT_MODELS = {
     "SL-103",  # Linus L2
     "CERES",  # Smart code handle

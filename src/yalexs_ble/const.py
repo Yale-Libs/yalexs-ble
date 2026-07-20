@@ -28,6 +28,8 @@ NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
 # addition to lock/unlock. The Yale Linus L2 family (including the L2 Lite)
 # can retract the latch so the door can be pushed open. Matched by prefix so
 # variant suffixes (e.g. "Yale Linus L2 Lite") are covered. See issue #350.
+# See also NO_BATTERY_SUPPORT_MODELS in push.py -- the same L2 family model
+# strings appear in both sets; a new L2 variant likely belongs in both.
 OPEN_SUPPORT_MODELS = {"SL-103", "Yale Linus L2"}
 
 
