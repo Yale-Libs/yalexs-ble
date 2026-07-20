@@ -26,6 +26,7 @@ from .const import (
     VALUE_TO_LOCK_OPERATION_REMOTE_TYPE,
     VALUE_TO_LOCK_OPERATION_SOURCE,
     VALUE_TO_LOCK_STATUS,
+    VALUE_TO_OPERATION_ERROR,
     AutoLockMode,
     AutoLockState,
     BatteryState,
@@ -39,6 +40,7 @@ from .const import (
     LockOperationSource,
     LockStateValue,
     LockStatus,
+    OperationError,
     SettingType,
     StatusType,
 )
@@ -128,6 +130,11 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
+        # byte[15] of the most recent op-response: 0x00 success, non-zero =
+        # OperationError enum value (MECH_* = jam). None until the first op.
+        # Retained so a follow-up can expose the failure reason as a
+        # diagnostic.
+        self._last_op_error: int | None = None
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
@@ -217,17 +224,27 @@ class Lock:
 
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
         if state[0] == 0xBB:
-            # Check for LOCK/UNLOCK command responses (0xBB + 0x0A/0x0B)
-            # These can contain actual status in byte[3] when operation fails/jams
+            # Op-response for LOCK/UNLOCK (0xBB + 0x0A/0x0B), emitted when the
+            # motor stops. The operation result is byte[15]: 0x00 = success,
+            # any non-zero = failure (0x1E-0x23 = MECH_* motor stall / jam).
             if (
                 state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
-                and len(state) > 3
+                and len(state) > 0x0F
             ):
-                lock_status_byte = state[0x03]
-                if lock_status_byte in VALUE_TO_LOCK_STATUS:
-                    return [VALUE_TO_LOCK_STATUS[lock_status_byte]]
+                result = state[0x0F]
+                self._last_op_error = result
+                if result != OperationError.COMM_SUCCESS:
+                    error = VALUE_TO_OPERATION_ERROR.get(result)
+                    _LOGGER.warning(
+                        "%s: Operation failed with result 0x%02X (%s)",
+                        self.name,
+                        result,
+                        error.name if error else "unknown",
+                    )
+                    return [LockStatus.JAMMED]
+                return ()  # success: recognized, no state update
             if state[1] == Commands.LOCK_ACTIVITY.value:
-                return None  # Ignore lock activity as these are historical events
+                return ()  # Ignore lock activity as these are historical events
             if state[1] == Commands.GETSTATUS.value:
                 if state[4] == StatusType.LOCK_ONLY.value:
                     lock_status = state[0x08]
@@ -255,10 +272,14 @@ class Lock:
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
         _LOGGER.debug("%s: State changed: %s", self.name, state.hex())
-        if (parsed_state := self._parse_state(state)) is not None:
-            self._state_callback(parsed_state)
-        else:
+        parsed_state = self._parse_state(state)
+        if parsed_state is None:
+            # Unrecognized frame - surface it for diagnosis.
             _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
+        elif parsed_state:
+            # Non-empty iterable - emit the state(s) to the consumer.
+            self._state_callback(parsed_state)
+        # else: empty () - a recognized frame that carries no state update; ignore.
 
     async def _setup_session(self) -> None:
         """Setup the session."""
