@@ -154,12 +154,13 @@ class Session:
         )
         notify_future = self._notify_future
         if notify_future is None:
-            _LOGGER.debug("%s: Ignoring notify; no request is waiting", self.name)
             return
         if notify_future.done():
             # The awaiter was already cancelled by a timeout or disconnect;
-            # clear the slot and ignore the notify.
-            _LOGGER.debug(
+            # clear the slot and ignore the notify. Logged above debug because
+            # a lock that chronically answers late is a real fault that would
+            # otherwise be invisible in installs without debug logging.
+            _LOGGER.warning(
                 "%s: Ignoring notify; the waiting request already gave up", self.name
             )
             self._notify_future = None
