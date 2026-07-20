@@ -100,7 +100,7 @@ async def test_invalid_response_retries_then_succeeds() -> None:
     """An invalid response fails the future, and the retry loop recovers."""
     session = _build_session()
     command = bytearray(0x12)
-    responses = [bytearray(0x12), _valid_response()]  # first has a bad checksum
+    responses = [bytearray(0x12), _valid_response()]  # first has a bad flag byte
 
     async def fake_write(*_args, **_kwargs):
         session.loop.call_soon(session._notify, 0, responses.pop(0))
@@ -120,6 +120,7 @@ async def test_invalid_response_raises_after_final_attempt() -> None:
     command = bytearray(0x12)
 
     async def fake_write(*_args, **_kwargs):
+        # All-zero packet: the checksum is valid, the flag byte is not.
         session.loop.call_soon(session._notify, 0, bytearray(0x12))
 
     session.client.write_gatt_char.side_effect = fake_write
@@ -150,13 +151,8 @@ async def test_late_notify_after_timeout_is_ignored() -> None:
     cancelled.cancel()
     session._notify_future = cancelled
 
-    # A valid-looking response. _notify must not call set_result on it.
-    response = bytearray(0x12)
-    response[0x00] = 0xBB
-    response[0x03] = (-sum(response[:0x12])) & 0xFF
-
     # Should be a no-op — no exception propagates from the notify callback.
-    session._notify(0, response)
+    session._notify(0, _valid_response())
 
     # And the stale reference is cleared so future calls start fresh.
     assert session._notify_future is None

@@ -153,10 +153,15 @@ class Session:
             "%s: Decrypted response via notify: %s", self.name, decrypted_data.hex()
         )
         notify_future = self._notify_future
-        if notify_future is None or notify_future.done():
-            # Future may already be done if the awaiter was cancelled by a
-            # timeout or disconnect; clear the slot and ignore the notify.
-            _LOGGER.debug("%s: Ignoring late notify; awaiter already gone", self.name)
+        if notify_future is None:
+            _LOGGER.debug("%s: Ignoring notify; no request is waiting", self.name)
+            return
+        if notify_future.done():
+            # The awaiter was already cancelled by a timeout or disconnect;
+            # clear the slot and ignore the notify.
+            _LOGGER.debug(
+                "%s: Ignoring notify; the waiting request already gave up", self.name
+            )
             self._notify_future = None
             return
         try:
