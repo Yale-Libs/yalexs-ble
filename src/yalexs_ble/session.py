@@ -191,7 +191,7 @@ class Session:
         )
 
         try:
-            for attempt in range(3):
+            for _ in range(3):
                 future: asyncio.Future[bytes] = self.loop.create_future()
                 self._notify_future = future
                 _LOGGER.debug(
@@ -207,13 +207,13 @@ class Session:
                             self.write_characteristic, command, True
                         )
                         result = await future
-                    except ResponseError:
-                        if attempt == 2:
-                            raise
+                    except ResponseError as ex:
                         _LOGGER.debug("%s: Invalid response, retrying", self.name)
-                        continue
+                        last_error = ex
                     else:
                         break
+            else:
+                raise last_error
         finally:
             # Drop the reference even on success — _notify already cleared it,
             # but on timeout / BleakError / cancellation it would point at a
