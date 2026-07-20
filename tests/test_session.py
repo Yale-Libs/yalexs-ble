@@ -1,10 +1,11 @@
 """Session-level tests for the solicited-response matcher."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from yalexs_ble import util
 from yalexs_ble.const import Commands, SettingType
 from yalexs_ble.lock import _settings_response_matcher
 from yalexs_ble.session import ResponseError, Session
@@ -118,3 +119,85 @@ async def test_corrupt_frame_on_every_attempt_raises_and_leaves_the_slot_empty()
     assert session.client.write_gatt_char.await_count == 3
     assert session._notify_future is None
     assert session._notify_matcher is None
+
+
+def _short_timeout(_seconds: float) -> object:
+    """Replacement for util.asyncio_timeout that expires almost immediately."""
+    return asyncio.timeout(0.01)
+
+
+@pytest.mark.asyncio
+async def test_locked_write_clears_slot_on_success() -> None:
+    """On the happy path the notify slot is empty when _locked_write returns."""
+    received: list[bytes] = []
+    session = _make_session(received)
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(READ_ANSWER))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    result = await session._locked_write(bytearray(18), "auto_lock_status")
+
+    assert result == READ_ANSWER
+    assert session._notify_future is None
+    assert session._notify_matcher is None
+
+
+@pytest.mark.asyncio
+async def test_locked_write_clears_slot_on_timeout() -> None:
+    """When no response arrives, the timeout path disarms the notify slot."""
+    received: list[bytes] = []
+    session = _make_session(received)
+    # The write succeeds but no notify is ever delivered.
+    session.client.write_gatt_char = AsyncMock()
+
+    with patch.object(util, "asyncio_timeout", _short_timeout):
+        with pytest.raises(TimeoutError):
+            await session._locked_write(bytearray(18), "auto_lock_status")
+
+    assert session._notify_future is None
+    assert session._notify_matcher is None
+
+
+@pytest.mark.asyncio
+async def test_late_notify_after_timeout_is_ignored() -> None:
+    """A frame arriving after the timeout cleared the slot is a no-op.
+
+    The timeout leaves ``_notify_future`` at None, so a late frame reaches the
+    state callback but resolves no wait and raises nothing.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+    session.client.write_gatt_char = AsyncMock()
+
+    with patch.object(util, "asyncio_timeout", _short_timeout):
+        with pytest.raises(TimeoutError):
+            await session._locked_write(bytearray(18), "auto_lock_status")
+
+    assert session._notify_future is None
+    session._notify(0, bytearray(READ_ANSWER))
+    assert session._notify_future is None
+    # The late frame still reached the state callback.
+    assert received == [READ_ANSWER]
+
+
+@pytest.mark.asyncio
+async def test_fresh_command_rearms_slot_after_timeout() -> None:
+    """After a timeout, a fresh command re-arms the slot and completes normally."""
+    received: list[bytes] = []
+    session = _make_session(received)
+    session.client.write_gatt_char = AsyncMock()
+
+    with patch.object(util, "asyncio_timeout", _short_timeout):
+        with pytest.raises(TimeoutError):
+            await session._locked_write(bytearray(18), "auto_lock_status")
+    assert session._notify_future is None
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(READ_ANSWER))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    result = await session._locked_write(bytearray(18), "auto_lock_status")
+
+    assert result == READ_ANSWER
+    assert session._notify_future is None

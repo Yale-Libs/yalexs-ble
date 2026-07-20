@@ -463,6 +463,62 @@ async def test_set_auto_lock_round_trips_through_decode() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_set_auto_lock_timed_accepts_upper_bound() -> None:
+    """Timed(0xFFFE) is the largest accepted duration.
+
+    Both 16-bit halves take the seconds, so [8:12] = 0xFFFE|(0xFFFE<<16).
+    """
+    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 0xFFFE)
+    assert cmd[0x08:0x0C] == bytes.fromhex("fefffeff")
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_timed_zero_duration_encodes_off_shape() -> None:
+    """Timed with a zero duration collapses to the off shape: an all-zero value."""
+    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 0)
+    assert cmd[0x08:0x0C] == bytes(4)
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_status_issues_read_and_returns_none() -> None:
+    """auto_lock_status sends a READSETTING for the auto-lock setting.
+
+    The wait completes on the acknowledgment, which carries no value, so the
+    method returns nothing; the stored setting arrives later as a settings
+    response on the notify path.
+    """
+    lock = _make_lock()
+    session = _CommandCaptureSession()
+    lock.session = session  # type: ignore[assignment]
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+    assert await lock.auto_lock_status() is None
+    assert len(session.sent) == 1
+    assert session.sent[0][0x01] == Commands.READSETTING.value
+    assert session.sent[0][0x04] == SettingType.AUTOLOCK.value
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_instant_round_trips_through_decode() -> None:
+    """Instant(5), encoded then decoded, returns Instant(5)."""
+    lock = _make_lock()
+    cmd = await _set_auto_lock_payload(AutoLockMode.INSTANT, 5)
+    echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
+    assert lock._parse_auto_lock_state(echoed) == AutoLockState(
+        AutoLockMode.INSTANT, 5
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_off_round_trips_through_decode() -> None:
+    """Off, encoded then decoded, returns Off with a zero duration."""
+    lock = _make_lock()
+    cmd = await _set_auto_lock_payload(AutoLockMode.OFF, 0)
+    echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
+    assert lock._parse_auto_lock_state(echoed) == AutoLockState(AutoLockMode.OFF, 0)
+
+
 def test_parse_state_readsetting_ack_ignored() -> None:
     """The READSETTING (0x04) transport ACK carries no state -> recognized, ignored.
 
@@ -479,7 +535,7 @@ def test_parse_state_writesetting_ack_ignored() -> None:
 
     Real ACK frame for an auto-lock write of Timed(90) (2026-07-16 capture); the
     stored value is echoed at [8:12] but the frame is only the acknowledgment --
-    the authoritative echo is the 0xBB frame that follows.
+    the authoritative value is the 0xBB settings response that follows.
     """
     lock = _make_lock()
     ack = bytes.fromhex("aa030075280000005a005a00000000000200")

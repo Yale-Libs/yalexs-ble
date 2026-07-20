@@ -532,11 +532,17 @@ class Lock:
         """Parse the auto lock state from a READSETTING (setting 0x28) response.
 
         The auto-lock time is a single little-endian uint32 at
-        ``response[8:12]``; there is no mode byte. A Timed relock is
-        encoded by the lock as ``seconds | (seconds << 16)`` -- the same seconds
-        in both 16-bit halves -- so a non-zero high half signals Timed and
-        carries the seconds. A value with only the low half set is Instant; zero
-        is off. The mode is derived from the value, never read from a wire byte.
+        ``response[8:12]``; there is no mode byte. It packs two 16-bit timers:
+        the low half (bytes [8:10]) is the never-opened timer and the high half
+        (bytes [10:12]) is the door-close timer. A Timed relock is encoded by
+        the lock as ``seconds | (seconds << 16)`` -- the same seconds in both
+        halves -- so a non-zero high half signals Timed and carries the seconds.
+        A value with only the low half set is Instant; zero is off. The mode is
+        derived from the value, never read from a wire byte.
+
+        The Timed decode keeps the door-close half and drops the never-opened
+        half, so a write derived from this state sets both timers to the same
+        value.
         """
         value = util._bytes_to_int(response[0x08:0x0C])
         if value == 0:
@@ -586,21 +592,23 @@ class Lock:
         return self._parse_battery_state(response)
 
     @raise_if_not_connected
-    async def auto_lock_status(self) -> AutoLockState:
+    async def auto_lock_status(self) -> None:
+        """Request the auto-lock setting.
+
+        The wait completes on the READSETTING acknowledgment, whose value field
+        is zero, so it carries no setting; there is nothing to return. The
+        stored setting arrives moments later as a 0xBB settings response on the
+        notify path, which the push layer decodes and applies. Waiting for that
+        settings response instead would stall the poll for the full write
+        timeout on a lock that never answers READSETTING (no auto-lock support).
+        """
         _LOGGER.debug("%s: Executing auto_lock_status", self.name)
-        # Deliberately untyped wait: it completes on the READSETTING
-        # acknowledgment, whose value field is zero, so the return value is
-        # not the stored setting. The 0xBB settings response arrives moments
-        # later on the notify path and the push layer applies it from there.
-        # A typed wait would stall the poll for the full write timeout on a
-        # lock that never answers READSETTING (no auto-lock support).
-        response = await self._execute_command(
+        await self._execute_command(
             Commands.READSETTING,
             SettingType.AUTOLOCK,
             "auto_lock_status",
         )
         _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
-        return self._parse_auto_lock_state(response)
 
     def _parse_unix_timestamp(self, timestamp_bytes: bytes) -> datetime:
         """Parse the unix timestamp to datetime from the bytes."""

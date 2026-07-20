@@ -132,9 +132,11 @@ VALUE_TO_DOOR_STATUS = {status.value: status for status in DoorStatus}
 
 
 class AutoLockMode(IntEnum):
-    # Derived from the setting's stored value, NOT read from a wire byte -- the
-    # auto-lock response carries no mode byte (see Lock._parse_auto_lock_state).
-    # The int values are retained only as the mode marker the write path emits.
+    # The int values are the wire constants from the old single-value encoding,
+    # kept so the public enum values stay stable. The mode is no longer read
+    # from or written to a wire byte: it is derived from the stored value's
+    # shape on read (see Lock._parse_auto_lock_state) and implied by that shape
+    # on write (see Lock.set_auto_lock), which emits no mode byte.
     INSTANT = 0x00
     TIMER = 0x5A
     # Not a valid value from the lock, but used to signal that auto lock is disabled
