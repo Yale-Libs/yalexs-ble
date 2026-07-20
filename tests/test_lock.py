@@ -564,6 +564,21 @@ def test_parse_state_writesetting_ack_ignored() -> None:
     assert lock._parse_state(ack) == ()
 
 
+def test_parse_state_ack_for_other_opcode_is_unknown() -> None:
+    """ACK recognition is scoped to the settings opcodes.
+
+    An 0xAA frame whose opcode is neither a lock/unlock ack nor a settings ack
+    is not claimed: it falls through to None, so a new acknowledgment type on
+    another model still surfaces as an unknown frame instead of being silently
+    dropped. Frame built from the READSETTING ACK capture above with the opcode
+    byte changed to LOCK_ACTIVITY (0x2D), which is recognized on the 0xBB flag
+    only.
+    """
+    lock = _make_lock()
+    ack = bytes.fromhex("aa2d00282800000000000000000000000200")
+    assert lock._parse_state(ack) is None
+
+
 def test_settings_response_matcher_takes_value_frame_not_ack() -> None:
     """The matcher keys on 0xBB + the settings opcode + the setting id.
 
