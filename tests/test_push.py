@@ -1464,9 +1464,7 @@ async def test_lock_operation_sets_unknown_when_command_already_dispatched() -> 
     mock_lock.force_unlock = AsyncMock(side_effect=TimeoutError("write timed out"))
 
     with (
-        patch.object(
-            push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
-        ),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         pytest.raises(TimeoutError),
     ):
         await push_lock.unlock()
