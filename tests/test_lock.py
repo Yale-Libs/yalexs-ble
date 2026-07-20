@@ -603,8 +603,8 @@ async def test_force_unlatch_issues_unlock_with_operation_byte() -> None:
 async def test_unlatch_delegates_to_force_unlatch() -> None:
     """unlatch() always fires force_unlatch(), with no status short-circuit."""
     lock, _ = _make_lock_with_mock_client()
-    lock.force_unlatch = AsyncMock()
 
-    await lock.unlatch()
+    with patch.object(lock, "force_unlatch", AsyncMock()) as mock_force_unlatch:
+        await lock.unlatch()
 
-    lock.force_unlatch.assert_awaited_once()
+    mock_force_unlatch.assert_awaited_once()
