@@ -656,9 +656,10 @@ class PushLock:
             await getattr(lock, op_attr)()
         except Exception as ex:
             self._update_any_state([LockStatus.UNKNOWN])
-            # The retry_bluetooth_connection_error wrapper invokes
-            # _async_handle_disconnected for known transient errors; other
-            # exceptions propagate without disconnecting.
+            # The retry_bluetooth_connection_error wrapper calls
+            # _async_handle_disconnected for RETRY_EXCEPTIONS /
+            # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
+            # any other exception propagate without disconnecting.
             _LOGGER.debug(
                 "%s: Failed to execute lock operation due to %s",
                 self.name,
@@ -731,9 +732,10 @@ class PushLock:
             self._cancel_future_update()
             await lock.set_auto_lock(mode, duration)
         except Exception as ex:
-            # The retry_bluetooth_connection_error wrapper invokes
-            # _async_handle_disconnected for known transient errors; other
-            # exceptions propagate without disconnecting.
+            # The retry_bluetooth_connection_error wrapper calls
+            # _async_handle_disconnected for RETRY_EXCEPTIONS /
+            # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
+            # any other exception propagate without disconnecting.
             _LOGGER.debug(
                 "%s: Failed to execute set auto lock operation due to %s",
                 self.name,
