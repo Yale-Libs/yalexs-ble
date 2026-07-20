@@ -70,6 +70,10 @@ RESYNC_DELAY = 0.01
 
 KEEP_ALIVE_TIME = 25.0  # Lock will disconnect after 30 seconds of inactivity
 
+# How many unanswered auto lock setting reads to issue per session before
+# concluding the lock does not support auto lock.
+AUTO_LOCK_READ_ATTEMPTS = 3
+
 # Number of seconds to wait after the first connection
 # to disconnect to free up the bluetooth adapter.
 FIRST_CONNECTION_DISCONNECT_TIME = 2.1
@@ -290,6 +294,7 @@ class PushLock:
         self._seen_this_session: set[
             type[LockStatus | DoorStatus | BatteryState | AuthState | AutoLockState]
         ] = set()
+        self._auto_lock_read_attempts = 0
         self._disconnect_timer: asyncio.TimerHandle | None = None
         self._keep_alive_timer: asyncio.TimerHandle | None = None
         self._idle_disconnect_delay_pending_update = (
@@ -610,6 +615,7 @@ class PushLock:
             self._next_disconnect_delay = self._idle_disconnect_delay
             self._reset_disconnect_timer()
             self._seen_this_session.clear()
+            self._auto_lock_read_attempts = 0
             self._slow_params_set = False
             return self._client
 
@@ -929,6 +935,39 @@ class PushLock:
         _LOGGER.debug("Obtained lock info: %s", lock_info)
         return lock_info
 
+    async def _read_auto_lock_setting(self, lock: Lock) -> bool:
+        """Request the auto lock setting; return whether a read was issued.
+
+        The solicited wait returns the READSETTING acknowledgment, whose
+        value field is zero -- never the stored setting. Issue the read only
+        to trigger the 0xBB settings response, which the notify path decodes
+        and applies; the end-of-update restore in _update carries that value
+        into the cycle's result. A lock that never sends that response would
+        otherwise be asked again on every update cycle, so the read is
+        capped per session; the counter resets on reconnect beside
+        _seen_this_session. Incrementing before the await also bounds a lock
+        that is silent to the command entirely, whose timeout would re-enter
+        here through the update retries.
+        """
+        if AutoLockState in self._seen_this_session:
+            return False
+        if self._auto_lock_read_attempts < AUTO_LOCK_READ_ATTEMPTS:
+            self._auto_lock_read_attempts += 1
+            await lock.auto_lock_status()
+            return True
+        if self._auto_lock_read_attempts == AUTO_LOCK_READ_ATTEMPTS:
+            # The final increment marks the message as sent so it logs once
+            # per session.
+            self._auto_lock_read_attempts += 1
+            _LOGGER.info(
+                "%s: Auto lock setting request unanswered after %s attempts; "
+                "the lock may not support auto lock; not asking again this "
+                "session",
+                self.name,
+                AUTO_LOCK_READ_ATTEMPTS,
+            )
+        return False
+
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
@@ -960,14 +999,8 @@ class PushLock:
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
             state = replace(state, door=door_status, auth=AuthState(successful=True))
 
-        if AutoLockState not in self._seen_this_session:
+        if await self._read_auto_lock_setting(lock):
             made_request = True
-            # The solicited wait returns the READSETTING acknowledgment,
-            # whose value field is zero -- never the stored setting. Issue
-            # the read only to trigger the 0xBB settings response, which
-            # the notify path decodes and applies; the end-of-update
-            # restore below carries that value into this cycle's result.
-            await lock.auto_lock_status()
             _AUTH_FAILURE_HISTORY.auth_success(self.address)
             state = replace(state, auth=AuthState(successful=True))
 

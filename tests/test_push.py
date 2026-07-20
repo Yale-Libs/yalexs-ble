@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -1459,3 +1460,89 @@ async def test_set_auto_lock_wrappers_choose_the_written_pair(
         mock_set.assert_not_awaited()
     else:
         mock_set.assert_awaited_once_with(*expected)
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_latches_after_unanswered_attempts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The settings read stops after three unanswered attempts per session."""
+    caplog.set_level(logging.INFO)
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:0d",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    mock_lock = MagicMock()
+    mock_lock.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
+    mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    mock_lock.auto_lock_status = AsyncMock(return_value=None)
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        # The response never arrives, so AutoLockState never enters
+        # _seen_this_session; the read must stop after three attempts.
+        for _ in range(5):
+            await push_lock._update()
+
+    assert mock_lock.auto_lock_status.await_count == 3
+    latch_records = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.INFO
+        and "may not support auto lock" in record.getMessage()
+    ]
+    assert len(latch_records) == 1
+
+    # A new session resets the counter and the read resumes.
+    push_lock._auto_lock_read_attempts = 0
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        await push_lock._update()
+    assert mock_lock.auto_lock_status.await_count == 4
+
+    # Once the state has been seen, the read is not issued at all.
+    push_lock._seen_this_session.add(AutoLockState)
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        await push_lock._update()
+    assert mock_lock.auto_lock_status.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_connect_resets_the_auto_lock_read_counter() -> None:
+    """A new session grants the settings read a fresh set of attempts."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:0e",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._auto_lock_read_attempts = 4
+    push_lock._seen_this_session.add(AutoLockState)
+
+    mock_lock = MagicMock()
+    mock_lock.connect = AsyncMock()
+
+    with patch.object(push_lock, "_get_lock_instance", return_value=mock_lock):
+        client = await push_lock._ensure_connected()
+
+    assert client is mock_lock
+    assert push_lock._auto_lock_read_attempts == 0
+    assert AutoLockState not in push_lock._seen_this_session
+    push_lock._cancel_disconnect_timer()
