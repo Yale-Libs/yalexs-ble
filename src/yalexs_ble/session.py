@@ -156,6 +156,7 @@ class Session:
         if notify_future is None or notify_future.done():
             # Future may already be done if the awaiter was cancelled by a
             # timeout or disconnect; clear the slot and ignore the notify.
+            _LOGGER.debug("%s: Ignoring late notify; awaiter already gone", self.name)
             self._notify_future = None
             return
         try:
