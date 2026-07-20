@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 from collections.abc import Callable, Iterable
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,6 +15,7 @@ from yalexs_ble.const import (
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
     AutoLockState,
+    Commands,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
@@ -25,6 +27,7 @@ from yalexs_ble.lock import (
     Lock,
     convert_voltage_to_percentage,
 )
+from yalexs_ble.session import Session
 
 
 def test_aa_battery_voltage_to_percentage_is_monotonic() -> None:
@@ -314,6 +317,51 @@ def test_parse_ack_still_reports_state() -> None:
     result = lock._parse_state(bytes.fromhex("aa0b00490000000000000000000000000200"))
     assert result is not None
     assert list(result) == [LockStatus.LOCKED]
+
+
+@pytest.mark.asyncio
+async def test_force_securemode_ack_round_trips_to_securemode() -> None:
+    """The qualifier force_securemode sends is the one the parser decodes.
+
+    Closes the loop that PR #216 left open: the command side gained a
+    securemode qualifier in byte[4] but the ack decode never learned to
+    read it back.
+    """
+    lock = _make_lock()
+    session = MagicMock()
+    session.build_command = partial(Session.build_command, session)
+    session.build_operation_command = partial(Session.build_operation_command, session)
+    session.execute = AsyncMock()
+    lock.session = session
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+
+    await lock.force_securemode()
+
+    command = session.execute.await_args.args[0]
+    assert command[0x01] == Commands.LOCK.value
+
+    ack = bytearray(0x12)
+    ack[0x00] = 0xAA
+    ack[0x01] = command[0x01]
+    ack[0x04] = command[0x04]
+    result = lock._parse_state(bytes(ack))
+    assert result is not None
+    assert list(result) == [LockStatus.SECUREMODE]
+
+
+def test_parse_securemode_ack_reports_securemode() -> None:
+    """A securemode ack (LOCK opcode, byte[4]=0x04) parses as SECUREMODE.
+
+    force_securemode sends the LOCK opcode with byte[4]=0x04, and the ack
+    echoes that qualifier. Decoding it as LOCKED reported a spurious
+    LOCKED transition before the lock settled into SECUREMODE.
+    """
+    lock = _make_lock()
+
+    result = lock._parse_state(bytes.fromhex("aa0b00490400000000000000000000000200"))
+    assert result is not None
+    assert list(result) == [LockStatus.SECUREMODE]
 
 
 def test_parse_settings_read_ack_is_none_and_logs_unknown(

@@ -35,6 +35,7 @@ from .const import (
     DoorStatus,
     LockActivity,
     LockActivityType,
+    LockCommandType,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
@@ -266,6 +267,11 @@ class Lock:
             if state[1] == Commands.UNLOCK.value:
                 return [LockStatus.UNLOCKED]
             if state[1] == Commands.LOCK.value:
+                # The ack echoes the command's byte[4] qualifier. Lock and
+                # securemode share the LOCK opcode, so without it a securemode
+                # ack decodes as LOCKED and reports a spurious transition.
+                if state[4] == LockCommandType.SECUREMODE.value:
+                    return [LockStatus.SECUREMODE]
                 return [LockStatus.LOCKED]
         return None
 
@@ -382,7 +388,9 @@ class Lock:
         _LOGGER.debug("%s: Securing", self.name)
         assert self.session is not None  # nosec
         await self.session.execute(
-            self.session.build_operation_command(Commands.LOCK, 0x04),
+            self.session.build_operation_command(
+                Commands.LOCK, LockCommandType.SECUREMODE
+            ),
             "force_securemode",
         )
         _LOGGER.debug("%s: Finished securemode", self.name)
