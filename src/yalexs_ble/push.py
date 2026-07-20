@@ -686,7 +686,7 @@ class PushLock:
             if self.auto_lock and self.auto_lock.mode == AutoLockMode.OFF:
                 _LOGGER.debug("%s: Auto lock is already off", self.name)
                 return
-            await self._set_auto_lock(AutoLockMode.OFF, 0)
+            await self._set_auto_lock_or_warn(AutoLockMode.OFF, 0)
             return
 
         duration = AUTO_LOCK_DEFAULT_DURATION
@@ -695,7 +695,7 @@ class PushLock:
         elif self.auto_lock_prev and self.auto_lock_prev.mode != AutoLockMode.OFF:
             # If the auto lock is currently off, use the previous duration
             duration = self.auto_lock_prev.duration
-        await self._set_auto_lock(mode, duration)
+        await self._set_auto_lock_or_warn(mode, duration)
 
     async def set_auto_lock_duration(self, duration: int) -> None:
         """Set auto lock setting."""
@@ -703,7 +703,7 @@ class PushLock:
             if self.auto_lock and self.auto_lock.mode == AutoLockMode.OFF:
                 _LOGGER.debug("%s: Auto lock is already off", self.name)
                 return
-            await self._set_auto_lock(AutoLockMode.OFF, 0)
+            await self._set_auto_lock_or_warn(AutoLockMode.OFF, 0)
             return
 
         mode = AutoLockMode.TIMER
@@ -712,7 +712,22 @@ class PushLock:
         elif self.auto_lock_prev and self.auto_lock_prev.mode != AutoLockMode.OFF:
             # If the auto lock is currently off, use the previous mode
             mode = self.auto_lock_prev.mode
-        await self._set_auto_lock(mode, duration)
+        await self._set_auto_lock_or_warn(mode, duration)
+
+    async def _set_auto_lock_or_warn(self, mode: AutoLockMode, duration: int) -> None:
+        """Set auto lock, surfacing a write the lock never confirmed."""
+        try:
+            await self._set_auto_lock(mode, duration)
+        except TimeoutError as err:
+            _LOGGER.warning(
+                "%s: Lock did not confirm the auto lock setting write "
+                "after %s attempts; the lock may not support auto lock",
+                self.name,
+                DEFAULT_ATTEMPTS,
+            )
+            raise TimeoutError(
+                f"{self.name}: Lock did not confirm the auto lock setting write"
+            ) from err
 
     @retry_bluetooth_connection_error
     async def _set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:

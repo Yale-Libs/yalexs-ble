@@ -1341,3 +1341,32 @@ async def test_retry_backoff_exceptions_sleep_between_attempts() -> None:
         with pytest.raises(TimeoutError):
             await op_nobackoff(lock2)
         assert sleep_mock.await_args_list == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setter", ["set_auto_lock_duration", "set_auto_lock_mode"])
+async def test_set_auto_lock_timeout_warns_and_names_the_failure(
+    caplog: pytest.LogCaptureFixture, setter: str
+) -> None:
+    """An unconfirmed auto lock write warns once and re-raises with a message."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:0b",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    with patch.object(push_lock, "_set_auto_lock", new_callable=AsyncMock) as mock_set:
+        mock_set.side_effect = TimeoutError()
+        with pytest.raises(TimeoutError) as exc_info:
+            if setter == "set_auto_lock_duration":
+                await push_lock.set_auto_lock_duration(30)
+            else:
+                await push_lock.set_auto_lock_mode(AutoLockMode.TIMER)
+
+    assert "Lock did not confirm the auto lock setting write" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "the lock may not support auto lock" in warnings[0].getMessage()
