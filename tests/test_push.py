@@ -1,6 +1,6 @@
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from bleak.backends.scanner import AdvertisementData
@@ -19,6 +19,7 @@ from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
     AUTH_FAILURE_TO_START_REAUTH,
     BATTERY_REFRESH_INTERVAL,
+    DEFAULT_ATTEMPTS,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
     SLOW_LATENCY,
@@ -29,6 +30,7 @@ from yalexs_ble.push import (
     operation_lock,
     retry_bluetooth_connection_error,
 )
+from yalexs_ble.session import DisconnectedError, ResponseError
 
 # Shared battery-supporting lock used across tests. model is NOT in
 # NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
@@ -1129,3 +1131,137 @@ async def test_async_handle_disconnected_executes_disconnect_when_idle() -> None
 
     mock_cancel.assert_called_once()
     mock_disconnect.assert_called_once()
+
+
+class _MockRetryLock:
+    """Minimal PushLock surface needed by retry_bluetooth_connection_error."""
+
+    def __init__(self) -> None:
+        self.address = "aa:bb:cc:dd:ee:ff"
+        self._async_handle_disconnected = AsyncMock()
+
+    @property
+    def name(self) -> str:
+        return "lock"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BleakDBusError("org.bluez.Error.Failed", []),
+        DisconnectedError("disconnected"),
+        BleakError("bleak error"),
+        TimeoutError(),
+        ResponseError("response"),
+    ],
+)
+async def test_retry_eventually_succeeds_for_all_retryable_exceptions(
+    exc: Exception,
+) -> None:
+    """All retryable exceptions get retried, then succeed on a later attempt."""
+    lock = _MockRetryLock()
+    calls = 0
+
+    @retry_bluetooth_connection_error
+    async def op(self):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise exc
+        return "ok"
+
+    with patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()):
+        result = await op(lock)
+
+    assert result == "ok"
+    assert calls == 2
+    lock._async_handle_disconnected.assert_awaited_once_with(exc)
+
+
+@pytest.mark.asyncio
+async def test_retry_disconnected_error_reraised_unchanged_at_max_attempts() -> None:
+    """DisconnectedError is not a BleakError, so it re-raises unchanged."""
+    lock = _MockRetryLock()
+    err = DisconnectedError("gone")
+
+    @retry_bluetooth_connection_error
+    async def op(self):
+        raise err
+
+    with (
+        patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()),
+        pytest.raises(DisconnectedError) as exc_info,
+    ):
+        await op(lock)
+
+    assert exc_info.value is err
+    # Called once per attempt.
+    assert lock._async_handle_disconnected.await_count == DEFAULT_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_retry_disconnect_bleak_error_converted_to_disconnected_error() -> None:
+    """A BleakError that reads as a disconnect converts to DisconnectedError."""
+    lock = _MockRetryLock()
+    err = BleakError("device disconnected")
+
+    @retry_bluetooth_connection_error
+    async def op(self):
+        raise err
+
+    with (
+        patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()),
+        pytest.raises(DisconnectedError) as exc_info,
+    ):
+        await op(lock)
+
+    assert exc_info.value.__cause__ is err
+    assert lock._async_handle_disconnected.await_count == DEFAULT_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_retry_bleak_error_raises_at_max_attempts() -> None:
+    """Non-disconnect retryable exceptions propagate their original type."""
+    lock = _MockRetryLock()
+    err = BleakError("nope")
+
+    @retry_bluetooth_connection_error
+    async def op(self):
+        raise err
+
+    with (
+        patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()),
+        pytest.raises(BleakError),
+    ):
+        await op(lock)
+
+    assert lock._async_handle_disconnected.await_count == DEFAULT_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_exceptions_sleep_between_attempts() -> None:
+    """RETRY_BACKOFF_EXCEPTIONS pause 0.25s between retries; others do not."""
+    lock = _MockRetryLock()
+
+    @retry_bluetooth_connection_error
+    async def op_backoff(self):
+        raise BleakDBusError("org.bluez.Error.Failed", [])
+
+    @retry_bluetooth_connection_error
+    async def op_nobackoff(self):
+        raise TimeoutError
+
+    with patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+        with pytest.raises(BleakError):
+            await op_backoff(lock)
+        backoff_calls = list(sleep_mock.await_args_list)
+
+    # Sleeps happen only between non-final attempts.
+    assert backoff_calls == [call(0.25)] * (DEFAULT_ATTEMPTS - 1)
+
+    lock2 = _MockRetryLock()
+    with patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+        with pytest.raises(TimeoutError):
+            await op_nobackoff(lock2)
+        assert sleep_mock.await_args_list == []

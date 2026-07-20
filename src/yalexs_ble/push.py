@@ -108,6 +108,8 @@ RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
 
 RETRY_EXCEPTIONS = (ResponseError, *BLEAK_RETRY_EXCEPTIONS)
 
+RETRYABLE_EXCEPTIONS = (*RETRY_BACKOFF_EXCEPTIONS, *RETRY_EXCEPTIONS)
+
 # 255 seems to be broadcast randomly when
 # there is no update from the lock.
 VALID_ADV_VALUES = {0, 1}
@@ -207,7 +209,7 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
                 # The lock cannot be found so there is no
                 # point in retrying.
                 raise
-            except RETRY_BACKOFF_EXCEPTIONS as err:
+            except RETRYABLE_EXCEPTIONS as err:
                 await self._async_handle_disconnected(err)
                 if attempt >= max_attempts:
                     _LOGGER.debug(
@@ -222,41 +224,21 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
                     if is_disconnected_error(err):
                         raise DisconnectedError(str(err)) from err
                     raise
+                # Backoff-class errors (BleakDBusError, DisconnectedError) get
+                # a brief pause so the BLE stack can settle before reconnecting.
+                backoff = 0.25 if isinstance(err, RETRY_BACKOFF_EXCEPTIONS) else 0
                 _LOGGER.debug(
-                    "%s: %s error calling %s, backing off %ss, retrying (%s/%s)...",
+                    "%s: %s error calling %s, retrying in %ss (%s/%s)...",
                     self.name,
                     type(err),
                     func,
-                    0.25,
+                    backoff,
                     attempt,
                     max_attempts,
                     exc_info=True,
                 )
-                await asyncio.sleep(0.25)
-            except RETRY_EXCEPTIONS as err:
-                await self._async_handle_disconnected(err)
-                if attempt >= max_attempts:
-                    _LOGGER.debug(
-                        "%s: %s error calling %s, reach max attempts (%s/%s)",
-                        self.name,
-                        type(err),
-                        func,
-                        attempt,
-                        max_attempts,
-                        exc_info=True,
-                    )
-                    if is_disconnected_error(err):
-                        raise DisconnectedError(str(err)) from err
-                    raise
-                _LOGGER.debug(
-                    "%s: %s error calling %s, retrying  (%s/%s)...",
-                    self.name,
-                    type(err),
-                    func,
-                    attempt,
-                    max_attempts,
-                    exc_info=True,
-                )
+                if backoff:
+                    await asyncio.sleep(backoff)
         return None
 
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
