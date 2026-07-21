@@ -4,10 +4,12 @@ import time
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
 
 from yalexs_ble.const import (
+    AuthState,
     AutoLockMode,
     AutoLockState,
     BatteryState,
@@ -16,9 +18,15 @@ from yalexs_ble.const import (
     LockState,
     LockStatus,
 )
+from yalexs_ble.lock import Lock
 from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
     AUTH_FAILURE_TO_START_REAUTH,
+    AUTO_LOCK_READ_FAILURE_BACKOFF,
+    AUTO_LOCK_READ_FAILURE_THRESHOLD,
+    AUTO_LOCK_READ_REFRESH_INTERVAL,
+    AUTO_LOCK_READ_RESPONSE_TIMEOUT,
+    AUTO_LOCK_WRITE_ATTEMPTS,
     BATTERY_REFRESH_INTERVAL,
     DEFAULT_ATTEMPTS,
     NEVER_TIME,
@@ -27,6 +35,7 @@ from yalexs_ble.push import (
     SLOW_MAX_INTERVAL,
     SLOW_MIN_INTERVAL,
     SLOW_TIMEOUT,
+    YALE_MFR_ID,
     PushLock,
     operation_lock,
     retry_bluetooth_connection_error,
@@ -1353,6 +1362,7 @@ async def test_set_auto_lock_timeout_warns_and_names_the_failure(
     warnings = [record for record in caplog.records if record.levelname == "WARNING"]
     assert len(warnings) == 1
     assert "the lock may not support auto lock" in warnings[0].getMessage()
+    assert f"after {AUTO_LOCK_WRITE_ATTEMPTS} attempts" in warnings[0].getMessage()
 
 
 @pytest.mark.asyncio
@@ -1444,14 +1454,233 @@ async def test_set_auto_lock_wrappers_choose_the_written_pair(
         mock_set.assert_awaited_once_with(*expected)
 
 
+@pytest.mark.parametrize("always_connected", [False, True])
 @pytest.mark.asyncio
-async def test_auto_lock_read_latches_after_unanswered_attempts(
-    caplog: pytest.LogCaptureFixture,
+async def test_auto_lock_read_backoff_arms_after_threshold_timeouts(
+    always_connected: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The settings read stops after three unanswered attempts per session."""
+    """The read backs off only after THRESHOLD consecutive timeouts, not before.
+
+    The arm path is mode-independent, so it is exercised with and without
+    always_connected for symmetry with the response-timeout arming test.
+    """
     caplog.set_level(logging.INFO)
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:0d",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=always_connected,
+    )
+    push_lock._name = "Test Lock"
+
+    mock_lock = MagicMock()
+    mock_lock.auto_lock_status = AsyncMock(side_effect=TimeoutError)
+
+    # Below the threshold: each timeout is counted, but the backoff is not armed.
+    for expected in range(1, AUTO_LOCK_READ_FAILURE_THRESHOLD):
+        assert await push_lock._read_auto_lock_setting(mock_lock) is False
+        assert push_lock._auto_lock_read_ack_failures == expected
+        assert push_lock._earliest_auto_lock_read_time == NEVER_TIME
+    assert not [
+        r for r in caplog.records if "may not support auto lock" in r.getMessage()
+    ]
+
+    # The threshold-th consecutive timeout arms the backoff and logs once.
+    # Arming restarts the count, so the field reads zero afterwards.
+    before = time.monotonic()
+    assert await push_lock._read_auto_lock_setting(mock_lock) is False
+    assert push_lock._auto_lock_read_ack_failures == 0
+    assert (
+        push_lock._earliest_auto_lock_read_time
+        >= before + AUTO_LOCK_READ_FAILURE_BACKOFF
+    )
+    latch = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "may not support auto lock" in r.getMessage()
+    ]
+    assert len(latch) == 1
+    assert mock_lock.auto_lock_status.await_count == AUTO_LOCK_READ_FAILURE_THRESHOLD
+
+    # Now backed off: the read is skipped without ever touching the lock.
+    assert await push_lock._read_auto_lock_setting(mock_lock) is False
+    assert mock_lock.auto_lock_status.await_count == AUTO_LOCK_READ_FAILURE_THRESHOLD
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_backoff_reearned_after_window() -> None:
+    """When the backoff window expires the count restarts and is re-earned."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:0d",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    # Arriving as if a prior window has just armed and reset: no failures held,
+    # and the window is already past so reads resume.
+    push_lock._auto_lock_read_ack_failures = 0
+    push_lock._earliest_auto_lock_read_time = NEVER_TIME
+
+    mock_lock = MagicMock()
+    mock_lock.auto_lock_status = AsyncMock(side_effect=TimeoutError)
+
+    # A fresh run of consecutive timeouts is needed to arm the backoff again.
+    for expected in range(1, AUTO_LOCK_READ_FAILURE_THRESHOLD):
+        assert await push_lock._read_auto_lock_setting(mock_lock) is False
+        assert push_lock._auto_lock_read_ack_failures == expected
+        assert push_lock._earliest_auto_lock_read_time == NEVER_TIME
+
+    before = time.monotonic()
+    assert await push_lock._read_auto_lock_setting(mock_lock) is False
+    assert push_lock._auto_lock_read_ack_failures == 0
+    assert (
+        push_lock._earliest_auto_lock_read_time
+        >= before + AUTO_LOCK_READ_FAILURE_BACKOFF
+    )
+    assert mock_lock.auto_lock_status.await_count == AUTO_LOCK_READ_FAILURE_THRESHOLD
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_success_resets_failure_count() -> None:
+    """A settings response arriving clears the failures and arms the refresh."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:0d",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._auto_lock_read_ack_failures = AUTO_LOCK_READ_FAILURE_THRESHOLD - 1
+    push_lock._auto_lock_read_response_failures = 1
+    push_lock._awaiting_auto_lock_response = True
+    push_lock._auto_lock_response_deadline = time.monotonic() + 10.0
+    push_lock._earliest_auto_lock_read_time = time.monotonic() + 100.0
+
+    before = time.monotonic()
+    push_lock._update_any_state([AutoLockState(mode=AutoLockMode.TIMER, duration=30)])
+
+    # The value landing -- not the read call returning -- is the success signal:
+    # it clears both failure counts and disarms the pending-response deadline.
+    assert push_lock._auto_lock_read_ack_failures == 0
+    assert push_lock._auto_lock_read_response_failures == 0
+    assert push_lock._awaiting_auto_lock_response is False
+    assert push_lock._earliest_auto_lock_read_time == NEVER_TIME
+    assert (
+        push_lock._next_auto_lock_read_time >= before + AUTO_LOCK_READ_REFRESH_INTERVAL
+    )
+    assert AutoLockState in push_lock._seen_this_session
+    assert push_lock.auto_lock == AutoLockState(mode=AutoLockMode.TIMER, duration=30)
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_backoff_survives_reconnect() -> None:
+    """The failure backoff outlives a reconnect -- the W2 regression guard."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:0e",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+    deadline = time.monotonic() + AUTO_LOCK_READ_FAILURE_BACKOFF
+    push_lock._earliest_auto_lock_read_time = deadline
+    push_lock._auto_lock_read_ack_failures = AUTO_LOCK_READ_FAILURE_THRESHOLD
+    push_lock._seen_this_session.add(AutoLockState)
+
+    mock_lock = MagicMock()
+    mock_lock.connect = AsyncMock()
+    mock_lock.auto_lock_status = AsyncMock(side_effect=TimeoutError)
+
+    with patch.object(push_lock, "_get_lock_instance", return_value=mock_lock):
+        client = await push_lock._ensure_connected()
+
+    # The reconnect cleared _seen_this_session but must NOT clear the backoff.
+    assert AutoLockState not in push_lock._seen_this_session
+    assert push_lock._earliest_auto_lock_read_time == deadline
+    assert push_lock._auto_lock_read_ack_failures == AUTO_LOCK_READ_FAILURE_THRESHOLD
+
+    # Still backed off after the reconnect: the read stays skipped, so the
+    # case-2 storm cannot restart.
+    assert await push_lock._read_auto_lock_setting(client) is False
+    mock_lock.auto_lock_status.assert_not_called()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_refresh_evicts_only_when_due() -> None:
+    """The refresh re-reads only after the interval, mirroring the battery refresh."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:0f",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+    mock_lock = MagicMock()
+    mock_lock.auto_lock_status = AsyncMock(return_value=None)
+    push_lock._seen_this_session.add(AutoLockState)
+
+    # Not yet due: the seen gate holds, no re-read.
+    push_lock._next_auto_lock_read_time = (
+        time.monotonic() + AUTO_LOCK_READ_REFRESH_INTERVAL
+    )
+    assert await push_lock._read_auto_lock_setting(mock_lock) is False
+    assert AutoLockState in push_lock._seen_this_session
+    mock_lock.auto_lock_status.assert_not_called()
+
+    # Deadline passed: evict AutoLockState and issue a fresh read.
+    push_lock._next_auto_lock_read_time = time.monotonic() - 1.0
+    assert await push_lock._read_auto_lock_setting(mock_lock) is True
+    mock_lock.auto_lock_status.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_no_evict_outside_always_connected() -> None:
+    """Outside always_connected mode the refresh never evicts a seen value."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:10",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    mock_lock = MagicMock()
+    mock_lock.auto_lock_status = AsyncMock(return_value=None)
+    push_lock._seen_this_session.add(AutoLockState)
+    # Deadline long past, but the eviction is gated on always_connected.
+    push_lock._next_auto_lock_read_time = time.monotonic() - 1.0
+
+    assert await push_lock._read_auto_lock_setting(mock_lock) is False
+    assert AutoLockState in push_lock._seen_this_session
+    mock_lock.auto_lock_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_transport_error_does_not_arm_backoff() -> None:
+    """A transport fault mirrors _poll_battery: skip without arming the backoff."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:14",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    mock_lock = MagicMock()
+    mock_lock.auto_lock_status = AsyncMock(side_effect=BleakError("boom"))
+
+    # A non-timeout fault is not the "alive but silent" signature: the read is
+    # skipped, but the failure count and backoff are left untouched.
+    assert await push_lock._read_auto_lock_setting(mock_lock) is False
+    assert push_lock._auto_lock_read_ack_failures == 0
+    assert push_lock._earliest_auto_lock_read_time == NEVER_TIME
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_timeout_does_not_propagate_out_of_update() -> None:
+    """A read timeout is caught in the helper, so _update completes normally."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:11",
         key="0800200c9a66",
         key_index=1,
         always_connected=False,
@@ -1462,7 +1691,7 @@ async def test_auto_lock_read_latches_after_unanswered_attempts(
     mock_lock.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
     mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.auto_lock_status = AsyncMock(return_value=None)
+    mock_lock.auto_lock_status = AsyncMock(side_effect=TimeoutError)
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
 
     push_lock._lock_info = TEST_LOCK_INFO
@@ -1478,53 +1707,463 @@ async def test_auto_lock_read_latches_after_unanswered_attempts(
     )
 
     with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
-        # The response never arrives, so AutoLockState never enters
-        # _seen_this_session; the read must stop after three attempts.
-        for _ in range(5):
-            await push_lock._update()
+        state = await push_lock._update()
 
-    assert mock_lock.auto_lock_status.await_count == 3
-    latch_records = [
-        record
-        for record in caplog.records
-        if record.levelno == logging.INFO
-        and "may not support auto lock" in record.getMessage()
-    ]
-    assert len(latch_records) == 1
-
-    # A new session resets the counter and the read resumes.
-    push_lock._auto_lock_read_attempts = 0
-    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
-        await push_lock._update()
-    assert mock_lock.auto_lock_status.await_count == 4
-
-    # Once the state has been seen, the read is not issued at all.
-    push_lock._seen_this_session.add(AutoLockState)
-    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
-        await push_lock._update()
-    assert mock_lock.auto_lock_status.await_count == 4
+    # The update returned instead of raising: no forced disconnect, and the
+    # timeout was counted as a failure rather than propagated.
+    assert state.lock == LockStatus.LOCKED
+    assert push_lock._auto_lock_read_ack_failures == 1
+    mock_lock.auto_lock_status.assert_awaited_once()
+    push_lock._cancel_disconnect_timer()
 
 
 @pytest.mark.asyncio
-async def test_connect_resets_the_auto_lock_read_counter() -> None:
-    """A new session grants the settings read a fresh set of attempts."""
+async def test_set_auto_lock_write_resets_read_backoff() -> None:
+    """A confirmed write clears the backoff and evicts the seen value."""
     push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:0e",
+        address="aa:bb:cc:dd:ee:12",
         key="0800200c9a66",
         key_index=1,
         always_connected=False,
     )
     push_lock._name = "Test Lock"
-    push_lock._auto_lock_read_attempts = 4
+    push_lock._running = True
+    push_lock._auto_lock_read_ack_failures = AUTO_LOCK_READ_FAILURE_THRESHOLD
+    push_lock._auto_lock_read_response_failures = 2
+    push_lock._awaiting_auto_lock_response = True
+    push_lock._auto_lock_response_deadline = time.monotonic() + 10.0
+    push_lock._earliest_auto_lock_read_time = (
+        time.monotonic() + AUTO_LOCK_READ_FAILURE_BACKOFF
+    )
+    push_lock._next_auto_lock_read_time = (
+        time.monotonic() + AUTO_LOCK_READ_REFRESH_INTERVAL
+    )
+    push_lock._seen_this_session.add(AutoLockState)
+
+    mock_lock = MagicMock()
+    mock_lock.set_auto_lock = AsyncMock()
+
+    with (
+        patch.object(push_lock, "_ensure_connected", return_value=mock_lock),
+        patch.object(push_lock, "_complete_operation"),
+    ):
+        await push_lock._set_auto_lock(AutoLockMode.TIMER, 30)
+
+    mock_lock.set_auto_lock.assert_awaited_once_with(AutoLockMode.TIMER, 30)
+    assert push_lock._auto_lock_read_ack_failures == 0
+    assert push_lock._auto_lock_read_response_failures == 0
+    assert push_lock._awaiting_auto_lock_response is False
+    assert push_lock._earliest_auto_lock_read_time == NEVER_TIME
+    assert push_lock._next_auto_lock_read_time == NEVER_TIME
+    assert AutoLockState not in push_lock._seen_this_session
+
+    # With the value evicted and no backoff, the next read is issued again.
+    mock_lock.auto_lock_status = AsyncMock(return_value=None)
+    assert await push_lock._read_auto_lock_setting(mock_lock) is True
+
+
+# ---------------------------------------------------------------------------
+# Auto lock read: the four settings-command outcomes (see
+# notes/yale/autolock_settings_command_outcome_taxonomy.md), each with and
+# without always_connected, plus dropout and advert-driven connect-on-demand.
+#
+#   Case 1 -- dead lock, answers nothing. Caught by the earlier unguarded reads
+#            in _update, so the auto lock read is never reached.
+#   Case 2 -- alive but silent to the read: the ack times out.
+#   Case 3 -- acks the read but withholds the 0xBB value: the response window
+#            lapses with the value unseen.
+#   Case 4 -- full working lock: ack, then the 0xBB value on the notify path.
+# ---------------------------------------------------------------------------
+
+
+def _auto_lock_push_lock(address: str, *, always_connected: bool) -> PushLock:
+    """A named PushLock for the auto lock read outcome tests."""
+    push_lock = PushLock(
+        address=address,
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=always_connected,
+    )
+    push_lock._name = "Test Lock"
+    return push_lock
+
+
+def _auto_lock_update_lock(auto_lock_status: AsyncMock) -> MagicMock:
+    """A mock Lock answering every read so _update reaches the auto lock read.
+
+    The auto lock read itself is wired per the outcome under test.
+    """
+    lock = MagicMock()
+    lock.connect = AsyncMock()
+    lock.is_connected = True
+    lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
+    lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
+    lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
+    lock.auto_lock_status = auto_lock_status
+    return lock
+
+
+@pytest.mark.parametrize("always_connected", [False, True])
+@pytest.mark.asyncio
+async def test_auto_lock_read_response_timeout_arms_backoff(
+    always_connected: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Case 3: the lock acks the read but withholds the 0xBB value.
+
+    The read completes on the ack, so no timeout fires; the pending-response
+    deadline lapses on the next cycle with the value still unseen. After
+    THRESHOLD such response timeouts in a row the read backs off, and the INFO
+    log reports the ack and response counts separately.
+    """
+    caplog.set_level(logging.INFO)
+    push_lock = _auto_lock_push_lock(
+        "aa:bb:cc:dd:ee:20", always_connected=always_connected
+    )
+    mock_lock = MagicMock()
+    mock_lock.auto_lock_status = AsyncMock(return_value=None)  # ack ok, no 0xBB
+
+    # First cycle issues the read and arms the pending-response deadline.
+    assert await push_lock._read_auto_lock_setting(mock_lock) is True
+    assert push_lock._awaiting_auto_lock_response is True
+    assert push_lock._auto_lock_read_response_failures == 0
+
+    # Each later cycle finds the window lapsed with the value still unseen: a
+    # response timeout, which re-reads until the threshold is reached.
+    for expected in range(1, AUTO_LOCK_READ_FAILURE_THRESHOLD):
+        push_lock._auto_lock_response_deadline = time.monotonic() - 1.0
+        assert await push_lock._read_auto_lock_setting(mock_lock) is True
+        assert push_lock._auto_lock_read_response_failures == expected
+        assert push_lock._auto_lock_read_ack_failures == 0
+        assert push_lock._earliest_auto_lock_read_time == NEVER_TIME
+
+    # The threshold-th response timeout arms the backoff and logs the breakdown.
+    push_lock._auto_lock_response_deadline = time.monotonic() - 1.0
+    before = time.monotonic()
+    assert await push_lock._read_auto_lock_setting(mock_lock) is False
+    assert push_lock._auto_lock_read_response_failures == 0
+    assert (
+        push_lock._earliest_auto_lock_read_time
+        >= before + AUTO_LOCK_READ_FAILURE_BACKOFF
+    )
+    latch = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO
+        and f"0 ack timeouts, {AUTO_LOCK_READ_FAILURE_THRESHOLD} response timeouts"
+        in r.getMessage()
+    ]
+    assert len(latch) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_value_in_flight_holds_without_strike() -> None:
+    """Case 3 timing: within the response window the read waits, not strikes.
+
+    Before the deadline the 0xBB may still be in flight, so the read neither
+    books a response timeout nor issues another read.
+    """
+    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:21", always_connected=True)
+    mock_lock = MagicMock()
+    mock_lock.auto_lock_status = AsyncMock(return_value=None)
+
+    assert await push_lock._read_auto_lock_setting(mock_lock) is True  # arms pending
+    mock_lock.auto_lock_status.reset_mock()
+
+    # Still inside the window (deadline is ~now + AUTO_LOCK_READ_RESPONSE_TIMEOUT).
+    assert push_lock._auto_lock_response_deadline > time.monotonic()
+    assert await push_lock._read_auto_lock_setting(mock_lock) is False
+    mock_lock.auto_lock_status.assert_not_awaited()
+    assert push_lock._awaiting_auto_lock_response is True
+    assert push_lock._auto_lock_read_response_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_value_landing_during_ack_does_not_arm_pending() -> None:
+    """A 0xBB that lands in the same loop turn as the ack is not waited on.
+
+    If the notify path delivers the value before the read coroutine resumes,
+    AutoLockState is already seen, so the read must not arm a pending-response
+    deadline for a value already in hand -- otherwise the next cycle would book
+    one spurious response timeout.
+    """
+    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:2a", always_connected=True)
+
+    def _ack_and_value(*_args: object) -> None:
+        # The 0xBB is dispatched on the notify path before the await resumes.
+        push_lock._update_any_state(
+            [AutoLockState(mode=AutoLockMode.TIMER, duration=30)]
+        )
+
+    mock_lock = MagicMock()
+    mock_lock.auto_lock_status = AsyncMock(side_effect=_ack_and_value)
+
+    assert await push_lock._read_auto_lock_setting(mock_lock) is True
+    assert push_lock._awaiting_auto_lock_response is False
+    assert AutoLockState in push_lock._seen_this_session
+
+    # A later cycle finds the value already seen, not a phantom pending read.
+    assert await push_lock._read_auto_lock_setting(mock_lock) is False
+    assert push_lock._auto_lock_read_response_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_pending_survives_reconnect() -> None:
+    """Dropout: a reconnect mid-read keeps the pending-response state.
+
+    The hold must outlive the connection, so the pending flag, its deadline, and
+    the response count all persist across the reconnect that clears the seen set.
+    """
+    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:23", always_connected=True)
+    deadline = time.monotonic() + AUTO_LOCK_READ_RESPONSE_TIMEOUT
+    push_lock._awaiting_auto_lock_response = True
+    push_lock._auto_lock_response_deadline = deadline
+    push_lock._auto_lock_read_response_failures = 1
     push_lock._seen_this_session.add(AutoLockState)
 
     mock_lock = MagicMock()
     mock_lock.connect = AsyncMock()
+    mock_lock.is_connected = True
 
     with patch.object(push_lock, "_get_lock_instance", return_value=mock_lock):
-        client = await push_lock._ensure_connected()
+        await push_lock._ensure_connected()
 
-    assert client is mock_lock
-    assert push_lock._auto_lock_read_attempts == 0
+    # The reconnect cleared _seen_this_session but preserved the pending state.
     assert AutoLockState not in push_lock._seen_this_session
+    assert push_lock._awaiting_auto_lock_response is True
+    assert push_lock._auto_lock_response_deadline == deadline
+    assert push_lock._auto_lock_read_response_failures == 1
     push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.parametrize("always_connected", [False, True])
+@pytest.mark.asyncio
+async def test_auto_lock_read_success_ack_then_value(always_connected: bool) -> None:
+    """Case 4: a full working lock. The ack arms the pending-response deadline;
+    the 0xBB value landing afterwards clears it and arms the refresh timer."""
+    push_lock = _auto_lock_push_lock(
+        "aa:bb:cc:dd:ee:24", always_connected=always_connected
+    )
+    push_lock._lock_info = TEST_LOCK_INFO
+    mock_lock = _auto_lock_update_lock(AsyncMock(return_value=None))
+
+    before = time.monotonic()
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        await push_lock._update()
+
+    # The ack completed the read and armed both the pending flag and its
+    # deadline; the value has not arrived yet. The flag is read into a typed
+    # local so asserting it True does not narrow the later is-False check away.
+    mock_lock.auto_lock_status.assert_awaited_once()
+    armed: bool = push_lock._awaiting_auto_lock_response
+    assert armed is True
+    assert push_lock._auto_lock_response_deadline > before
+    assert AutoLockState not in push_lock._seen_this_session
+
+    # The 0xBB then lands on the notify path and clears the pending state.
+    push_lock._update_any_state([AutoLockState(mode=AutoLockMode.TIMER, duration=30)])
+    cleared: bool = push_lock._awaiting_auto_lock_response
+    assert cleared is False
+    assert AutoLockState in push_lock._seen_this_session
+    assert (
+        push_lock._next_auto_lock_read_time >= before + AUTO_LOCK_READ_REFRESH_INTERVAL
+    )
+    assert push_lock.auto_lock == AutoLockState(mode=AutoLockMode.TIMER, duration=30)
+    push_lock._cancel_disconnect_timer()
+    push_lock._cancel_keepalive_timer()
+
+
+@pytest.mark.asyncio
+async def test_update_any_state_auth_change_is_applied() -> None:
+    """An AuthState change through _update_any_state updates the auth field.
+
+    Covers the auth branch of _update_any_state, which sits directly beside the
+    auto lock success block; the two share the "if lock_state.x != state" shape,
+    so an inserted auto lock block anchors against the auth branch in the diff.
+    """
+    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:29", always_connected=False)
+    assert push_lock._get_current_state().auth is None
+
+    push_lock._update_any_state([AuthState(successful=True)])
+
+    assert push_lock.auth == AuthState(successful=True)
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_response_backoff_survives_connect_on_demand(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Case 3 under connect-on-demand: the hold outlives each connection.
+
+    A not-always-connected lock that acks the read but withholds the value
+    idle-disconnects between adverts. Each advert reconnects (clearing the seen
+    set), yet the pending state and response count carry across, so the response
+    backoff still latches instead of the read repeating on every connection.
+    """
+    caplog.set_level(logging.INFO)
+    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:25", always_connected=False)
+
+    async def _advert_connect() -> Lock:
+        # A fresh advert-driven connection: was disconnected, now reconnects,
+        # which clears _seen_this_session exactly as _update's connect does.
+        push_lock._client = None
+        lock = MagicMock()
+        lock.connect = AsyncMock()
+        lock.is_connected = True
+        lock.auto_lock_status = AsyncMock(return_value=None)  # ack ok, no 0xBB
+        with patch.object(push_lock, "_get_lock_instance", return_value=lock):
+            return await push_lock._ensure_connected()
+
+    # First connection: the read is issued and the pending deadline armed.
+    client = await _advert_connect()
+    assert await push_lock._read_auto_lock_setting(client) is True
+
+    # Each later connection: the inter-advert gap lapsed the window, so the
+    # withheld value books a response timeout that survived the reconnect.
+    for expected in range(1, AUTO_LOCK_READ_FAILURE_THRESHOLD):
+        push_lock._auto_lock_response_deadline = time.monotonic() - 1.0
+        client = await _advert_connect()
+        assert push_lock._awaiting_auto_lock_response is True  # survived reconnect
+        assert await push_lock._read_auto_lock_setting(client) is True
+        assert push_lock._auto_lock_read_response_failures == expected
+        assert push_lock._earliest_auto_lock_read_time == NEVER_TIME
+
+    # The threshold connection finally arms the backoff.
+    push_lock._auto_lock_response_deadline = time.monotonic() - 1.0
+    client = await _advert_connect()
+    before = time.monotonic()
+    assert await push_lock._read_auto_lock_setting(client) is False
+    assert (
+        push_lock._earliest_auto_lock_read_time
+        >= before + AUTO_LOCK_READ_FAILURE_BACKOFF
+    )
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_ack_backoff_survives_connect_on_demand() -> None:
+    """Case 2 under connect-on-demand: a lock silent to the read accumulates ack
+    timeouts across reconnects and backs off, rather than being re-asked on
+    every connection."""
+    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:26", always_connected=False)
+
+    async def _advert_connect() -> Lock:
+        push_lock._client = None
+        lock = MagicMock()
+        lock.connect = AsyncMock()
+        lock.is_connected = True
+        lock.auto_lock_status = AsyncMock(side_effect=TimeoutError)
+        with patch.object(push_lock, "_get_lock_instance", return_value=lock):
+            return await push_lock._ensure_connected()
+
+    for expected in range(1, AUTO_LOCK_READ_FAILURE_THRESHOLD):
+        client = await _advert_connect()
+        assert await push_lock._read_auto_lock_setting(client) is False
+        assert push_lock._auto_lock_read_ack_failures == expected
+        assert push_lock._earliest_auto_lock_read_time == NEVER_TIME
+
+    client = await _advert_connect()
+    before = time.monotonic()
+    assert await push_lock._read_auto_lock_setting(client) is False
+    assert push_lock._auto_lock_read_ack_failures == 0
+    assert (
+        push_lock._earliest_auto_lock_read_time
+        >= before + AUTO_LOCK_READ_FAILURE_BACKOFF
+    )
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_read_connects_after_advertisement() -> None:
+    """Connect-on-demand wiring: an advertisement drives the connect, then the
+    read runs on that connection.
+
+    The lock is disconnected; an advertisement arrives and schedules the update;
+    the deferred update connects on demand and issues the auto lock read.
+    """
+    push_lock = _auto_lock_push_lock("aa:bb:cc:dd:ee:27", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    mock_lock = _auto_lock_update_lock(AsyncMock(return_value=None))
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+    ad = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={YALE_MFR_ID: b"\x01"},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    with patch.object(push_lock, "_get_lock_instance", return_value=mock_lock):
+        # The advertisement schedules a connect-on-demand update.
+        push_lock.update_advertisement(ble_device, ad)
+        assert push_lock._cancel_deferred_update is not None
+        # Drive the scheduled update to completion.
+        push_lock._deferred_update()
+        assert push_lock._update_task is not None
+        await push_lock._update_task
+
+    # The connect happened after the advertisement, and the read ran on it.
+    mock_lock.connect.assert_awaited()
+    mock_lock.auto_lock_status.assert_awaited_once()
+    assert push_lock._awaiting_auto_lock_response is True
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
+    push_lock._cancel_keepalive_timer()
+
+
+@pytest.mark.parametrize("always_connected", [False, True])
+@pytest.mark.asyncio
+async def test_dead_lock_read_not_reached_earlier_read_propagates(
+    always_connected: bool,
+) -> None:
+    """Case 1: a dead lock answers nothing. The unguarded door read runs before
+    the auto lock read in _update and its timeout propagates (the connection
+    layer handles the dead lock), so the auto lock read is never reached and its
+    counters stay clean.
+    """
+    push_lock = _auto_lock_push_lock(
+        "aa:bb:cc:dd:ee:28", always_connected=always_connected
+    )
+    push_lock._lock_info = TEST_LOCK_INFO
+    mock_lock = _auto_lock_update_lock(AsyncMock(return_value=None))
+    mock_lock.door_status = AsyncMock(side_effect=TimeoutError)
+
+    with (
+        patch.object(push_lock, "_ensure_connected", return_value=mock_lock),
+        pytest.raises(TimeoutError),
+    ):
+        await push_lock._update()
+
+    mock_lock.auto_lock_status.assert_not_awaited()
+    assert push_lock._auto_lock_read_ack_failures == 0
+    assert push_lock._auto_lock_read_response_failures == 0
+    assert push_lock._awaiting_auto_lock_response is False
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_write_retries_twice_then_gives_up() -> None:
+    """The write retries AUTO_LOCK_WRITE_ATTEMPTS times, not the default four."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:13",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+
+    mock_lock = MagicMock()
+    mock_lock.set_auto_lock = AsyncMock(side_effect=ResponseError("no confirmation"))
+
+    with (
+        patch.object(push_lock, "_ensure_connected", return_value=mock_lock),
+        patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
+        patch("yalexs_ble.push.asyncio.sleep", new_callable=AsyncMock),
+        pytest.raises(ResponseError),
+    ):
+        await push_lock._set_auto_lock(AutoLockMode.TIMER, 30)
+
+    assert mock_lock.set_auto_lock.await_count == AUTO_LOCK_WRITE_ATTEMPTS
