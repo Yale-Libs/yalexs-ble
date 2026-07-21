@@ -176,6 +176,119 @@ def test_needs_battery_workaround():
 
 
 @pytest.mark.asyncio
+async def test_background_task_logs_exception(caplog):
+    """Background task failures should be logged with the lock name."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    async def boom():
+        raise BleakError("simulated background failure")
+
+    with caplog.at_level("ERROR", logger="yalexs_ble.push"):
+        push_lock.background_task(boom())
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if not push_lock._background_tasks:
+                break
+
+    assert not push_lock._background_tasks
+    assert any(
+        "Background task failed" in record.message
+        and "Test Lock" in record.message
+        and "simulated background failure" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_task_cancellation_not_logged(caplog):
+    """Cancelled background tasks should not emit an error log."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    async def long_running():
+        await asyncio.sleep(60)
+
+    with caplog.at_level("ERROR", logger="yalexs_ble.push"):
+        push_lock.background_task(long_running())
+        await asyncio.sleep(0)
+        task = next(iter(push_lock._background_tasks))
+        task.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if not push_lock._background_tasks:
+                break
+
+    assert not push_lock._background_tasks
+    assert not any(
+        "Background task failed" in record.message for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_task_success_not_logged(caplog):
+    """Successful background tasks should not emit an error log."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    async def ok():
+        return None
+
+    with caplog.at_level("ERROR", logger="yalexs_ble.push"):
+        push_lock.background_task(ok())
+        for _ in range(5):
+            await asyncio.sleep(0)
+            if not push_lock._background_tasks:
+                break
+
+    assert not push_lock._background_tasks
+    assert not any(
+        "Background task failed" in record.message for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_task_done_callback_is_idempotent():
+    """_on_background_task_done should tolerate being called for an absent task."""
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+
+    async def ok():
+        return None
+
+    push_lock.background_task(ok())
+    await asyncio.sleep(0)
+    task = next(iter(push_lock._background_tasks), None)
+    if task is None:
+        task = asyncio.create_task(ok())
+        await task
+
+    push_lock._on_background_task_done(task)
+    push_lock._on_background_task_done(task)
+    assert task not in push_lock._background_tasks
+
+
+@pytest.mark.asyncio
 async def test_update_continues_after_battery_timeout():
     """
     Test that _update() continues and completes successfully
