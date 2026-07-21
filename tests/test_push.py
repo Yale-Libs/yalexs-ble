@@ -7,6 +7,7 @@ from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
 
 from yalexs_ble.const import (
+    AuthState,
     AutoLockMode,
     AutoLockState,
     BatteryState,
@@ -491,6 +492,176 @@ async def test_update_preserves_notify_state_from_cache() -> None:
         assert final_state.door == DoorStatus.CLOSED, (
             f"Door status should be CLOSED from cache, got {final_state.door}"
         )
+
+
+@pytest.mark.asyncio
+async def test_update_preserves_notify_updates_for_unfetched_fields() -> None:
+    """
+    Test that _update() does not clobber concurrent notify updates for fields
+    that were NOT re-fetched in this update cycle.
+
+    Regression scenario: in always_connected mode after first sync,
+    battery/door/auto_lock are already seen and are NOT re-polled. _update()
+    takes a snapshot, polls only lock_status, then writes the snapshot back.
+    If a notify callback updates door/battery/auto_lock during the lock_status
+    await, the writeback overwrites the notify update with the stale snapshot.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+    push_lock._lock_info = LockInfo(
+        manufacturer="August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+
+    # All fields already populated and "seen" — typical post-first-update state
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=BatteryState(voltage=6.0, percentage=80),
+        # Seeded as a failure so the test also proves a successful update clears
+        # the retry decorator's auth-failure latch instead of reverting to it.
+        auth=AuthState(successful=False),
+        auto_lock=AutoLockState(mode=AutoLockMode.OFF, duration=0),
+        auto_lock_prev=None,
+    )
+    push_lock._seen_this_session.update(
+        {LockStatus, DoorStatus, BatteryState, AutoLockState}
+    )
+    # Post-first-update state: the periodic battery refresh deadline is set
+    # forward, so battery is not re-polled and stays an unfetched field.
+    push_lock._next_battery_refresh_time = time.monotonic() + 3600
+
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    # Gate lock_status so we can inject notify updates mid-_update
+    lock_status_in_progress = asyncio.Event()
+    allow_lock_status = asyncio.Event()
+
+    async def lock_status():
+        lock_status_in_progress.set()
+        await allow_lock_status.wait()
+        return LockStatus.LOCKED
+
+    mock_lock = MagicMock()
+    mock_lock.lock_status = AsyncMock(side_effect=lock_status)
+    mock_client = MagicMock()
+    mock_client.set_connection_params = AsyncMock()
+    mock_lock.client = mock_client
+
+    new_door = DoorStatus.OPENED
+    new_battery = BatteryState(voltage=5.5, percentage=60)
+    new_auto_lock = AutoLockState(mode=AutoLockMode.TIMER, duration=90)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        update_task = asyncio.create_task(push_lock._update())
+        await lock_status_in_progress.wait()
+        # Simulate notify callbacks landing while _update awaits lock_status
+        push_lock._update_any_state([new_door, new_battery, new_auto_lock])
+        # Sanity: notify did update the live cache
+        assert push_lock._lock_state.door == new_door
+        assert push_lock._lock_state.battery == new_battery
+        assert push_lock._lock_state.auto_lock == new_auto_lock
+        allow_lock_status.set()
+        final_state = await update_task
+
+    # Critical assertions: notify updates must survive the snapshot writeback
+    assert final_state.door == new_door, (
+        f"Door notify update must survive _update writeback, got {final_state.door}"
+    )
+    assert final_state.battery == new_battery, (
+        f"Battery notify update must survive _update writeback, "
+        f"got {final_state.battery}"
+    )
+    assert final_state.auto_lock == new_auto_lock, (
+        f"Auto-lock notify update must survive _update writeback, "
+        f"got {final_state.auto_lock}"
+    )
+    # Lock was re-fetched, so polled value wins
+    assert final_state.lock == LockStatus.LOCKED
+    # auth is not reconciled against the cache, so a successful poll clears the
+    # latched failure rather than being reverted to it.
+    assert final_state.auth is not None
+    assert final_state.auth.successful is True
+
+
+@pytest.mark.asyncio
+async def test_update_falls_back_to_cache_when_fetched_values_are_unknown() -> None:
+    """
+    Test that a fetched field returning UNKNOWN falls back to the cached value.
+
+    This is the rollback retained from #291: the field IS in ``fetched``, so the
+    unfetched-field reconciliation skips it, and only the UNKNOWN guard can
+    restore the real cached value.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+    push_lock._lock_info = LockInfo(
+        manufacturer="August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+
+    # Cache holds real values that the UNKNOWN poll results must not clobber.
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=BatteryState(voltage=6.0, percentage=80),
+        auth=AuthState(successful=True),
+        auto_lock=AutoLockState(mode=AutoLockMode.OFF, duration=0),
+        auto_lock_prev=None,
+    )
+    # Battery/auto_lock already seen so this cycle fetches only lock and door.
+    push_lock._seen_this_session.update({BatteryState, AutoLockState})
+    push_lock._next_battery_refresh_time = time.monotonic() + 3600
+
+    push_lock._advertisement_data = AdvertisementData(
+        local_name="Test Lock",
+        service_data={},
+        service_uuids=[],
+        rssi=-50,
+        manufacturer_data={},
+        platform_data=(),
+        tx_power=0,
+    )
+
+    mock_lock = MagicMock()
+    mock_lock.lock_status = AsyncMock(return_value=LockStatus.UNKNOWN)
+    mock_lock.door_status = AsyncMock(return_value=DoorStatus.UNKNOWN)
+    mock_client = MagicMock()
+    mock_client.set_connection_params = AsyncMock()
+    mock_lock.client = mock_client
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        final_state = await push_lock._update()
+
+    assert final_state.lock == LockStatus.LOCKED
+    assert final_state.door == DoorStatus.CLOSED
 
 
 @pytest.mark.asyncio
