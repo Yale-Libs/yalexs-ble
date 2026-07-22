@@ -206,9 +206,7 @@ async def test_update_continues_after_battery_timeout():
 
     # But other calls succeed
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.auto_lock_status = AsyncMock(
-        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
-    )
+    mock_lock.auto_lock_status = AsyncMock()
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
 
     push_lock._lock_info = TEST_LOCK_INFO
@@ -586,9 +584,7 @@ async def test_update_continues_when_lock_info_probe_fails() -> None:
     mock_lock.lock_info = AsyncMock(side_effect=TimeoutError("probe timed out"))
     mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.auto_lock_status = AsyncMock(
-        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
-    )
+    mock_lock.auto_lock_status = AsyncMock()
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
 
     push_lock._advertisement_data = AdvertisementData(
@@ -639,9 +635,7 @@ async def test_update_continues_when_lock_info_probe_bleak_error() -> None:
     )
     mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=6.0, percentage=80))
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.auto_lock_status = AsyncMock(
-        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
-    )
+    mock_lock.auto_lock_status = AsyncMock()
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
 
     push_lock._advertisement_data = AdvertisementData(
@@ -684,9 +678,7 @@ async def test_update_sets_slow_connection_params_when_always_connected():
     mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=5.5, percentage=95))
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
-    mock_lock.auto_lock_status = AsyncMock(
-        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
-    )
+    mock_lock.auto_lock_status = AsyncMock()
 
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._advertisement_data = AdvertisementData(
@@ -727,9 +719,7 @@ async def test_update_does_not_set_connection_params_when_not_always_connected()
     mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=5.5, percentage=95))
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
-    mock_lock.auto_lock_status = AsyncMock(
-        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
-    )
+    mock_lock.auto_lock_status = AsyncMock()
 
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._advertisement_data = AdvertisementData(
@@ -770,9 +760,7 @@ async def test_update_handles_connection_params_failure():
     mock_lock.battery = AsyncMock(return_value=BatteryState(voltage=5.5, percentage=95))
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
-    mock_lock.auto_lock_status = AsyncMock(
-        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
-    )
+    mock_lock.auto_lock_status = AsyncMock()
 
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._advertisement_data = AdvertisementData(
@@ -811,9 +799,7 @@ async def test_battery_refresh_clears_seen_and_repoll_when_due():
     mock_lock.battery = AsyncMock(return_value=battery_state)
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.auto_lock_status = AsyncMock(
-        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
-    )
+    mock_lock.auto_lock_status = AsyncMock()
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
 
@@ -864,9 +850,7 @@ async def test_battery_refresh_not_due_skips_repoll():
     mock_lock.battery = AsyncMock()
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.auto_lock_status = AsyncMock(
-        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
-    )
+    mock_lock.auto_lock_status = AsyncMock()
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
 
@@ -912,9 +896,7 @@ async def test_battery_refresh_does_not_fire_when_not_always_connected():
     mock_lock.battery = AsyncMock()
     mock_lock.lock_status = AsyncMock(return_value=LockStatus.LOCKED)
     mock_lock.door_status = AsyncMock(return_value=DoorStatus.CLOSED)
-    mock_lock.auto_lock_status = AsyncMock(
-        return_value=AutoLockState(mode=AutoLockMode.OFF, duration=0)
-    )
+    mock_lock.auto_lock_status = AsyncMock()
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
 
