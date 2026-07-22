@@ -2144,8 +2144,19 @@ async def test_dead_lock_read_not_reached_earlier_read_propagates(
 
 
 @pytest.mark.asyncio
-async def test_set_auto_lock_write_retries_twice_then_gives_up() -> None:
-    """The write retries AUTO_LOCK_WRITE_ATTEMPTS times, not the default four."""
+@pytest.mark.parametrize(
+    "error",
+    [ResponseError("no confirmation"), TimeoutError("no confirmation")],
+)
+async def test_set_auto_lock_write_retries_twice_then_gives_up(
+    error: Exception,
+) -> None:
+    """The write retries AUTO_LOCK_WRITE_ATTEMPTS times, not the default four.
+
+    A stalled write surfaces as either a ResponseError or, when the settings
+    response never lands, a TimeoutError; both are retryable, so the count holds
+    for the actual field failure as well as the synthetic one.
+    """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:13",
         key="0800200c9a66",
@@ -2156,13 +2167,13 @@ async def test_set_auto_lock_write_retries_twice_then_gives_up() -> None:
     push_lock._running = True
 
     mock_lock = MagicMock()
-    mock_lock.set_auto_lock = AsyncMock(side_effect=ResponseError("no confirmation"))
+    mock_lock.set_auto_lock = AsyncMock(side_effect=error)
 
     with (
         patch.object(push_lock, "_ensure_connected", return_value=mock_lock),
         patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
         patch("yalexs_ble.push.asyncio.sleep", new_callable=AsyncMock),
-        pytest.raises(ResponseError),
+        pytest.raises(type(error)),
     ):
         await push_lock._set_auto_lock(AutoLockMode.TIMER, 30)
 
