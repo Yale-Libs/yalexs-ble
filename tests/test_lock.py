@@ -350,7 +350,7 @@ def _make_lock(
 
 
 def test_parse_auto_lock_state_timed_from_wire() -> None:
-    """Real capture: value 1800 stored as seconds|(seconds<<16) -> Timed 30 min.
+    """Real capture: both uint16 timers set to 1800 -> Timed 30 min.
 
     Front Door READSETTING response, YUR/DEL fw 2.1.0 (2026-07-05 capture).
     """
@@ -374,9 +374,9 @@ def test_parse_auto_lock_state_off_from_wire() -> None:
 def test_parse_auto_lock_state_old_encoding_reads_user_value() -> None:
     """A value written by a release before the two-timer encoding -> Timed 30.
 
-    Earlier releases stored the user's seconds in the never-opened half and a
-    fixed 90 in the door-close half, so Timed(30) was written as 1e 00 5a 00.
-    The decode reports the never-opened half, so the value reads back as set.
+    Earlier releases stored the user's seconds in the never-opened timer and a
+    fixed 90 in the door-close timer, so Timed(30) was written as 1e 00 5a 00.
+    The decode reports the never-opened timer, so the value reads back as set.
     """
     lock = _make_lock()
     response = bytes(8) + bytes.fromhex("1e005a00")
@@ -385,7 +385,7 @@ def test_parse_auto_lock_state_old_encoding_reads_user_value() -> None:
 
 
 def test_parse_auto_lock_state_zero_never_opened_falls_back() -> None:
-    """A zero never-opened half falls back to the door-close half.
+    """A zero never-opened timer falls back to the door-close timer.
 
     Synthetic value exercising the branch; not a captured device value.
     """
@@ -395,8 +395,8 @@ def test_parse_auto_lock_state_zero_never_opened_falls_back() -> None:
     assert result == AutoLockState(AutoLockMode.TIMER, 90)
 
 
-def test_parse_auto_lock_state_instant_low_half_only() -> None:
-    """Derivation branch: low 16 bits set, high half zero -> Instant.
+def test_parse_auto_lock_state_instant_never_opened_only() -> None:
+    """Derivation branch: never-opened timer set, door-close timer zero -> Instant.
 
     Synthetic value exercising the branch; not a captured device value.
     """
@@ -447,8 +447,8 @@ async def _set_auto_lock_payload(mode: AutoLockMode, duration: int) -> bytearray
 
 
 @pytest.mark.asyncio
-async def test_set_auto_lock_timed_encodes_seconds_in_both_halves() -> None:
-    """Timed(1800) -> value = 1800|(1800<<16) -> [8:12] = 08 07 08 07."""
+async def test_set_auto_lock_timed_encodes_seconds_in_both_timers() -> None:
+    """Timed(1800) -> both uint16 timers = 1800 -> [8:12] = 08 07 08 07."""
     cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 1800)
     assert cmd[0x01] == Commands.WRITESETTING.value
     assert cmd[0x04] == 0x28  # auto-lock setting id
@@ -456,8 +456,8 @@ async def test_set_auto_lock_timed_encodes_seconds_in_both_halves() -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_auto_lock_instant_encodes_low_half_only() -> None:
-    """Instant(5) -> value = 5 -> [8:12] = 05 00 00 00."""
+async def test_set_auto_lock_instant_encodes_never_opened_only() -> None:
+    """Instant(5) -> never-opened timer = 5, door-close 0 -> [8:12] = 05 00 00 00."""
     cmd = await _set_auto_lock_payload(AutoLockMode.INSTANT, 5)
     assert cmd[0x08:0x0C] == bytes.fromhex("05000000")
 
@@ -471,7 +471,7 @@ async def test_set_auto_lock_off_encodes_zero() -> None:
 
 @pytest.mark.asyncio
 async def test_set_auto_lock_duration_out_of_range_raises() -> None:
-    """Durations must fit a 16-bit half; 0xFFFF+ is rejected (app rule 1-65534)."""
+    """Durations must fit a uint16 timer; 0xFFFF+ is rejected (app rule 1-65534)."""
     with pytest.raises(ValueError, match="out of range"):
         await _set_auto_lock_payload(AutoLockMode.TIMER, 0xFFFF)
 
@@ -491,7 +491,7 @@ async def test_set_auto_lock_round_trips_through_decode() -> None:
 async def test_set_auto_lock_timed_accepts_upper_bound() -> None:
     """Timed(0xFFFE) is the largest accepted duration.
 
-    Both 16-bit halves take the seconds, so [8:12] = 0xFFFE|(0xFFFE<<16).
+    Both uint16 timers take the seconds, so [8:12] = fe ff fe ff.
     """
     cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 0xFFFE)
     assert cmd[0x08:0x0C] == bytes.fromhex("fefffeff")

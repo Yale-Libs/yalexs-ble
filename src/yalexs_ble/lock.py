@@ -444,13 +444,13 @@ class Lock:
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
         """Change the auto lock setting (0x28).
 
-        The value is a little-endian uint32 at [8:12] holding two 16-bit
-        timers: the never-opened timer at [8:10] and the door-close timer at
-        [10:12]. 0 = off; ``n`` in the never-opened half alone = instant with
-        an ``n`` second delay; ``N | (N << 16)`` = timed relock after ``N``
-        seconds, with both timers set to the same value. There is no mode
-        byte -- the mode is implied by the value shape, and the read side
-        reports the never-opened half (see ``_parse_auto_lock_state``).
+        The value is two little-endian uint16 timers laid consecutively at
+        [8:12]: the never-opened timer at [8:10] and the door-close timer at
+        [10:12]. Both zero = off; ``n`` in the never-opened timer alone =
+        instant with an ``n`` second delay; a timed relock sets both timers to
+        the same ``n`` seconds. There is no mode byte -- the mode is implied by
+        which timers are set, and the read side reports the never-opened timer
+        (see ``_parse_auto_lock_state``).
         """
         _LOGGER.debug(
             "%s: Setting auto lock to mode=%d, dur=%d", self.name, mode, duration
@@ -459,8 +459,8 @@ class Lock:
         if mode == AutoLockMode.OFF or duration == 0:
             value = 0
         elif not 1 <= duration <= 0xFFFE:
-            # The seconds live in a 16-bit half; cap conservatively below
-            # the field maximum.
+            # Each timer is a uint16; cap conservatively below the field
+            # maximum.
             raise ValueError(f"Auto lock duration out of range (1-65534): {duration}")
         elif mode == AutoLockMode.TIMER:
             value = duration | (duration << 16)
@@ -533,19 +533,18 @@ class Lock:
     def _parse_auto_lock_state(self, response: bytes) -> AutoLockState:
         """Parse the auto lock state from a READSETTING (setting 0x28) response.
 
-        The auto-lock time is a single little-endian uint32 at
-        ``response[8:12]``; there is no mode byte. It packs two 16-bit timers:
-        the low half (bytes [8:10]) is the never-opened timer and the high half
-        (bytes [10:12]) is the door-close timer. A Timed relock is encoded by
-        the lock as ``seconds | (seconds << 16)`` -- the same seconds in both
-        halves -- so a non-zero high half signals Timed. A value with only the
-        low half set is Instant; zero is off. The mode is derived from the
-        value, never read from a wire byte.
+        The auto-lock time is two little-endian uint16 timers laid
+        consecutively at ``response[8:12]``; there is no mode byte. The
+        never-opened timer is at [8:10] and the door-close timer at [10:12]. A
+        Timed relock sets both timers to the same seconds, so a non-zero
+        door-close timer signals Timed. A value with only the never-opened
+        timer set is Instant; both zero is off. The mode is derived from which
+        timers are set, never read from a wire byte.
 
-        The Timed decode reports the never-opened half: it is the field the
+        The Timed decode reports the never-opened timer: it is the field the
         app displays, and releases before the two-timer encoding stored the
         user's seconds there, so those values read back as set. A zero
-        never-opened half falls back to the door-close half. A write derived
+        never-opened timer falls back to the door-close timer. A write derived
         from this state sets both timers to the same value.
         """
         value = util._bytes_to_int(response[0x08:0x0C])

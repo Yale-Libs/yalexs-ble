@@ -12,7 +12,7 @@ from yalexs_ble.session import ResponseError, Session
 
 # Verbatim field frames (2026-07-16 capture, YUR/DEL fw 2.1.0): the READSETTING
 # acknowledgment and, ~40 ms later, the 0xBB frame carrying the stored value
-# (Timed 1800 as seconds|(seconds<<16)).
+# (Timed 1800: both uint16 timers set to 1800).
 READ_ACK = bytes.fromhex("aa0400282800000000000000000000000200")
 READ_ANSWER = bytes.fromhex("bb0400fb2800000008070807000000000000")
 # The same value frame with its checksum byte cleared, so _validate_response
