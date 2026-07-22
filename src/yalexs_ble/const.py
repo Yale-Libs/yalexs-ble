@@ -132,13 +132,12 @@ VALUE_TO_DOOR_STATUS = {status.value: status for status in DoorStatus}
 
 
 class AutoLockMode(IntEnum):
-    INSTANT = 0x00
-    TIMER = 0x5A
-    # Not a valid value from the lock, but used to signal that auto lock is disabled
-    OFF = 0xFF
-
-
-VALUE_TO_AUTO_LOCK_MODE = {status.value: status for status in AutoLockMode}
+    # The values are arbitrary; the mode never crosses the wire. It is derived
+    # from the stored value's shape on read (see Lock._parse_auto_lock_state)
+    # and implied by that shape on write (see Lock.set_auto_lock).
+    INSTANT = 0
+    TIMER = 1
+    OFF = 2
 
 
 class LockActivityType(Enum):

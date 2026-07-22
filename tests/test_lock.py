@@ -14,15 +14,18 @@ from yalexs_ble.const import (
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
     AutoLockState,
+    Commands,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
     LockStateValue,
     LockStatus,
+    SettingType,
 )
 from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
     Lock,
+    _settings_response_matcher,
     convert_voltage_to_percentage,
 )
 
@@ -316,25 +319,6 @@ def test_parse_ack_still_reports_state() -> None:
     assert list(result) == [LockStatus.LOCKED]
 
 
-def test_parse_settings_read_ack_is_none_and_logs_unknown(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """An AA ack echoing a non-operation command is not recognized as state.
-
-    Production capture: the ack to the startup auto-lock READSETTING (command
-    0x04 echoed in byte[1], setting 0x28 in byte[4]). Only the Lock/Unlock
-    acks carry a state meaning; other acks surface via the unknown-state log.
-    """
-    lock = _make_lock()
-
-    frame = bytes.fromhex("aa0400282800000000000000000000000200")
-    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
-        assert lock._parse_state(frame) is None
-        lock._internal_state_callback(frame)
-
-    assert "Unknown state" in caplog.text
-
-
 def test_internal_state_callback_emits_recognized_state() -> None:
     """A recognized frame with state content reaches the state callback."""
     received: list[list[LockStateValue]] = []
@@ -353,11 +337,6 @@ def test_jammed_maps_to_the_settled_static_position_value() -> None:
     assert VALUE_TO_LOCK_STATUS[0x07] is LockStatus.JAMMED
 
 
-def _make_auto_lock_response(mode_byte: int, duration: int) -> bytes:
-    """Build a minimal _parse_auto_lock_state response buffer."""
-    return bytes(8) + duration.to_bytes(2, "little") + bytes([mode_byte])
-
-
 def _make_lock(
     state_callback: Callable[[Iterable[LockStateValue]], None] = lambda _: None,
 ) -> Lock:
@@ -370,33 +349,257 @@ def _make_lock(
     )
 
 
-def test_parse_auto_lock_state_known_mode() -> None:
-    """Known mode byte returns the matching AutoLockMode with its duration."""
+def test_parse_auto_lock_state_timed_from_wire() -> None:
+    """Real capture: both uint16 timers set to 1800 -> Timed 30 min.
+
+    Front Door READSETTING response, YUR/DEL fw 2.1.0 (2026-07-05 capture).
+    """
     lock = _make_lock()
-    response = _make_auto_lock_response(AutoLockMode.TIMER, 30)
+    response = bytes.fromhex("bb0400fb2800000008070807000000000000")
+    result = lock._parse_auto_lock_state(response)
+    assert result == AutoLockState(AutoLockMode.TIMER, 1800)
+
+
+def test_parse_auto_lock_state_off_from_wire() -> None:
+    """Real capture: all-zero setting value -> auto-lock off.
+
+    Back Door READSETTING response (2026-07-05 capture).
+    """
+    lock = _make_lock()
+    response = bytes.fromhex("bb0400192800000000000000000000000000")
+    result = lock._parse_auto_lock_state(response)
+    assert result == AutoLockState(AutoLockMode.OFF, 0)
+
+
+def test_parse_auto_lock_state_old_encoding_reads_user_value() -> None:
+    """A value written by a release before the two-timer encoding -> Timed 30.
+
+    Earlier releases stored the user's seconds in the never-opened timer and a
+    fixed 90 in the door-close timer, so Timed(30) was written as 1e 00 5a 00.
+    The decode reports the never-opened timer, so the value reads back as set.
+    """
+    lock = _make_lock()
+    response = bytes(8) + bytes.fromhex("1e005a00")
     result = lock._parse_auto_lock_state(response)
     assert result == AutoLockState(AutoLockMode.TIMER, 30)
 
 
-def test_parse_auto_lock_state_unknown_mode_logs_and_returns_off(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Unrecognized mode byte falls back to OFF and logs a warning."""
-    lock = _make_lock()
-    response = _make_auto_lock_response(0xAB, 15)
-    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
-        result = lock._parse_auto_lock_state(response)
-    assert result.mode is AutoLockMode.OFF
-    assert "0xab" in caplog.text.lower()
+def test_parse_auto_lock_state_zero_never_opened_falls_back() -> None:
+    """A zero never-opened timer falls back to the door-close timer.
 
-
-def test_parse_auto_lock_state_both_zero_means_disabled() -> None:
-    """When mode byte maps to 0 (INSTANT) and duration is 0, state is OFF."""
+    Synthetic value exercising the branch; not a captured device value.
+    """
     lock = _make_lock()
-    response = _make_auto_lock_response(AutoLockMode.INSTANT, 0)
+    response = bytes(8) + bytes.fromhex("00005a00")
     result = lock._parse_auto_lock_state(response)
-    assert result.mode is AutoLockMode.OFF
-    assert result.duration == 0
+    assert result == AutoLockState(AutoLockMode.TIMER, 90)
+
+
+def test_parse_auto_lock_state_instant_never_opened_only() -> None:
+    """Derivation branch: never-opened timer set, door-close timer zero -> Instant.
+
+    Synthetic value exercising the branch; not a captured device value.
+    """
+    lock = _make_lock()
+    response = bytes(8) + (0x0005).to_bytes(4, "little")
+    result = lock._parse_auto_lock_state(response)
+    assert result == AutoLockState(AutoLockMode.INSTANT, 5)
+
+
+class _CommandCaptureSession:
+    """Minimal Session stand-in that captures executed commands.
+
+    build_operation_command mirrors Session's 18-byte frame layout
+    (EE, opcode, cmd byte at [4], ClearText trailer marker at [16]).
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[bytearray] = []
+
+    def build_operation_command(self, opcode: int, cmd_byte: int) -> bytearray:
+        cmd = bytearray(0x12)
+        cmd[0x00] = 0xEE
+        cmd[0x01] = opcode
+        cmd[0x04] = cmd_byte
+        cmd[0x10] = 0x02
+        return cmd
+
+    async def execute(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        self.sent.append(command)
+        return b""
+
+
+async def _set_auto_lock_payload(mode: AutoLockMode, duration: int) -> bytearray:
+    """Run set_auto_lock against a capture session; return the sent command."""
+    lock = _make_lock()
+    session = _CommandCaptureSession()
+    lock.session = session  # type: ignore[assignment]
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+    await lock.set_auto_lock(mode, duration)
+    assert len(session.sent) == 1
+    return session.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_timed_encodes_seconds_in_both_timers() -> None:
+    """Timed(1800) -> both uint16 timers = 1800 -> [8:12] = 08 07 08 07."""
+    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 1800)
+    assert cmd[0x01] == Commands.WRITESETTING.value
+    assert cmd[0x04] == 0x28  # auto-lock setting id
+    assert cmd[0x08:0x0C] == bytes.fromhex("08070807")
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_instant_encodes_never_opened_only() -> None:
+    """Instant(5) -> never-opened timer = 5, door-close 0 -> [8:12] = 05 00 00 00."""
+    cmd = await _set_auto_lock_payload(AutoLockMode.INSTANT, 5)
+    assert cmd[0x08:0x0C] == bytes.fromhex("05000000")
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_off_encodes_zero() -> None:
+    """Off -> value = 0 regardless of the duration argument."""
+    cmd = await _set_auto_lock_payload(AutoLockMode.OFF, 1800)
+    assert cmd[0x08:0x0C] == bytes(4)
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_duration_out_of_range_raises() -> None:
+    """Durations must fit a uint16 timer; 0xFFFF+ is rejected (app rule 1-65534)."""
+    with pytest.raises(ValueError, match="out of range"):
+        await _set_auto_lock_payload(AutoLockMode.TIMER, 0xFFFF)
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_round_trips_through_decode() -> None:
+    """A value we write, echoed back by the lock, decodes to what we set."""
+    lock = _make_lock()
+    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 1800)
+    echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
+    assert lock._parse_auto_lock_state(echoed) == AutoLockState(
+        AutoLockMode.TIMER, 1800
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_timed_accepts_upper_bound() -> None:
+    """Timed(0xFFFE) is the largest accepted duration.
+
+    Both uint16 timers take the seconds, so [8:12] = fe ff fe ff.
+    """
+    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 0xFFFE)
+    assert cmd[0x08:0x0C] == bytes.fromhex("fefffeff")
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_timed_zero_duration_encodes_off_shape() -> None:
+    """Timed with a zero duration collapses to the off shape: an all-zero value."""
+    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 0)
+    assert cmd[0x08:0x0C] == bytes(4)
+
+
+@pytest.mark.asyncio
+async def test_auto_lock_status_issues_read() -> None:
+    """auto_lock_status sends a READSETTING for the auto-lock setting.
+
+    The wait completes on the acknowledgment, which carries no value, so the
+    method returns nothing; the stored setting arrives later as a settings
+    response on the notify path.
+    """
+    lock = _make_lock()
+    session = _CommandCaptureSession()
+    lock.session = session  # type: ignore[assignment]
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+    await lock.auto_lock_status()
+    assert len(session.sent) == 1
+    assert session.sent[0][0x01] == Commands.READSETTING.value
+    assert session.sent[0][0x04] == SettingType.AUTOLOCK.value
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_instant_round_trips_through_decode() -> None:
+    """Instant(5), encoded then decoded, returns Instant(5)."""
+    lock = _make_lock()
+    cmd = await _set_auto_lock_payload(AutoLockMode.INSTANT, 5)
+    echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
+    assert lock._parse_auto_lock_state(echoed) == AutoLockState(AutoLockMode.INSTANT, 5)
+
+
+@pytest.mark.asyncio
+async def test_set_auto_lock_off_round_trips_through_decode() -> None:
+    """Off, encoded then decoded, returns Off with a zero duration."""
+    lock = _make_lock()
+    cmd = await _set_auto_lock_payload(AutoLockMode.OFF, 0)
+    echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
+    assert lock._parse_auto_lock_state(echoed) == AutoLockState(AutoLockMode.OFF, 0)
+
+
+def test_parse_state_readsetting_ack_ignored() -> None:
+    """The READSETTING (0x04) transport ACK carries no state -> recognized, ignored.
+
+    Real ACK frame for an auto-lock READSETTING (2026-07-05 capture); must return
+    an empty iterable (not None), so it is never logged as an unknown frame.
+    """
+    lock = _make_lock()
+    ack = bytes.fromhex("aa0400282800000000000000000000000200")
+    assert lock._parse_state(ack) == ()
+
+
+def test_parse_state_writesetting_ack_ignored() -> None:
+    """The WRITESETTING (0x03) transport ACK carries no state -> recognized, ignored.
+
+    Real ACK frame for an auto-lock write of Timed(90) (2026-07-16 capture); the
+    stored value is echoed at [8:12] but the frame is only the acknowledgment --
+    the authoritative value is the 0xBB settings response that follows.
+    """
+    lock = _make_lock()
+    ack = bytes.fromhex("aa030075280000005a005a00000000000200")
+    assert lock._parse_state(ack) == ()
+
+
+def test_parse_state_ack_for_other_opcode_is_unknown() -> None:
+    """ACK recognition is scoped to the settings opcodes.
+
+    An 0xAA frame whose opcode is neither a lock/unlock ack nor a settings ack
+    is not claimed: it falls through to None, so a new acknowledgment type on
+    another model still surfaces as an unknown frame instead of being silently
+    dropped. Frame built from the READSETTING ACK capture above with the opcode
+    byte changed to LOCK_ACTIVITY (0x2D), which is recognized on the 0xBB flag
+    only.
+    """
+    lock = _make_lock()
+    ack = bytes.fromhex("aa2d00282800000000000000000000000200")
+    assert lock._parse_state(ack) is None
+
+
+def test_settings_response_matcher_takes_value_frame_not_ack() -> None:
+    """The matcher keys on 0xBB + the settings opcode + the setting id.
+
+    All frames verbatim from the 2026-07-16 field capture: a settings command
+    is answered by an 0xAA acknowledgment ~40 ms before the 0xBB value frame,
+    and the acknowledgment's zero value field decodes as auto-lock off.
+    """
+    write_matcher = _settings_response_matcher(
+        Commands.WRITESETTING.value, SettingType.AUTOLOCK.value
+    )
+
+    read_response = bytes.fromhex("bb0400fb2800000008070807000000000000")
+    write_ack = bytes.fromhex("aa030075280000005a005a00000000000200")
+    write_response = bytes.fromhex("bb030066280000005a005a00000000000000")
+    battery_answer = bytes.fromhex("bb0200a50f00000079140000000000000200")
+
+    assert write_matcher(write_response)
+    assert not write_matcher(write_ack)
+    assert not write_matcher(read_response)  # wrong opcode for the write
+    assert not write_matcher(battery_answer)
+    assert not write_matcher(write_response[:4])  # truncated below the setting id
 
 
 _CHAR_DATA: dict[str, bytes] = {

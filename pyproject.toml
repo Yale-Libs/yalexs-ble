@@ -67,6 +67,9 @@ exclude_lines = [
 profile = "black"
 known_first_party = ["yalexs_ble", "tests"]
 
+[tool.codespell]
+ignore-words-list = "yur"
+
 [tool.mypy]
 check_untyped_defs = true
 disallow_any_generics = true
