@@ -21,7 +21,6 @@ from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
-    VALUE_TO_AUTO_LOCK_MODE,
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_OPERATION_REMOTE_TYPE,
     VALUE_TO_LOCK_OPERATION_SOURCE,
@@ -106,6 +105,29 @@ def convert_voltage_to_percentage(voltage: float) -> int:
     if pos != 0:
         pos -= 1
     return AA_BATTERY_VOLTAGE_MAP[AA_BATTERY_VOLTAGE_LIST[pos]]
+
+
+def _settings_response_matcher(
+    command_value: int, setting_value: int
+) -> Callable[[bytes], bool]:
+    """Match the 0xBB settings frame answering one command/setting pair.
+
+    A settings command (READSETTING/WRITESETTING) is answered by two frames:
+    an 0xAA acknowledgment echoing the request, then the 0xBB frame carrying
+    the stored value. The acknowledgment's value field is zero, so completing
+    the solicited wait on it misreads every setting; the wait must hold out
+    for the 0xBB frame that echoes the command opcode and the setting id.
+    """
+
+    def matches(data: bytes) -> bool:
+        return (
+            len(data) >= 0x0C
+            and data[0x00] == 0xBB
+            and data[0x01] == command_value
+            and data[0x04] == setting_value
+        )
+
+    return matches
 
 
 class Lock:
@@ -267,6 +289,17 @@ class Lock:
                 return [LockStatus.UNLOCKED]
             if state[1] == Commands.LOCK.value:
                 return [LockStatus.LOCKED]
+            if state[1] in (
+                Commands.READSETTING.value,
+                Commands.WRITESETTING.value,
+            ):
+                # ACK for a settings command (for example auto-lock, setting
+                # 0x28). It carries no state -- the value arrives in the 0xBB
+                # settings response -- so
+                # recognize and ignore it rather than logging "Unknown state".
+                # Kept specific to the settings opcodes so a new ACK type on
+                # another model still surfaces as an unknown frame.
+                return ()
         return None
 
     def _internal_state_callback(self, state: bytes) -> None:
@@ -409,21 +442,42 @@ class Lock:
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
-        """Change the auto lock setting."""
+        """Change the auto lock setting (0x28).
+
+        The value is two little-endian uint16 timers laid consecutively at
+        [8:12]: the never-opened timer at [8:10] and the door-close timer at
+        [10:12]. Both zero = off; ``n`` in the never-opened timer alone =
+        instant with an ``n`` second delay; a timed relock sets both timers to
+        the same ``n`` seconds. There is no mode byte -- the mode is implied by
+        which timers are set, and the read side reports the never-opened timer
+        (see ``_parse_auto_lock_state``).
+        """
         _LOGGER.debug(
             "%s: Setting auto lock to mode=%d, dur=%d", self.name, mode, duration
         )
         assert self.session is not None  # nosec
-        if mode == AutoLockMode.OFF:
-            mode = AutoLockMode.INSTANT
-            duration = 0
+        if mode == AutoLockMode.OFF or duration == 0:
+            value = 0
+        elif not 1 <= duration <= 0xFFFE:
+            # Each timer is a uint16; cap conservatively below the field
+            # maximum.
+            raise ValueError(f"Auto lock duration out of range (1-65534): {duration}")
+        elif mode == AutoLockMode.TIMER:
+            value = duration | (duration << 16)
+        else:  # INSTANT
+            value = duration
 
         cmd = self.session.build_operation_command(
             Commands.WRITESETTING, SettingType.AUTOLOCK
         )
-        util._copy(cmd, util._int_to_bytes(duration, 2), destLocation=0x08)
-        cmd[0x0A] = mode
-        await self.session.execute(cmd, "set_auto_lock")
+        util._copy(cmd, util._int_to_bytes(value, 4), destLocation=0x08)
+        await self.session.execute(
+            cmd,
+            "set_auto_lock",
+            _settings_response_matcher(
+                Commands.WRITESETTING.value, SettingType.AUTOLOCK.value
+            ),
+        )
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
 
     async def securemode(self) -> None:
@@ -477,18 +531,30 @@ class Lock:
         return door_status_enum
 
     def _parse_auto_lock_state(self, response: bytes) -> AutoLockState:
-        """Parse the auto lock state from the response."""
-        duration = util._bytes_to_int(response[0x08:0x0A])
-        raw_mode = response[0x0A]
-        mode = VALUE_TO_AUTO_LOCK_MODE.get(raw_mode, AutoLockMode.OFF)
-        if raw_mode not in VALUE_TO_AUTO_LOCK_MODE:
-            _LOGGER.info(
-                "%s: Unrecognized auto lock mode code: %s", self.name, hex(raw_mode)
-            )
-        if mode == 0 and duration == 0:
-            # If both values are 0, auto lock is disabled
-            mode = AutoLockMode.OFF
-        return AutoLockState(mode, duration)
+        """Parse the auto lock state from a READSETTING (setting 0x28) response.
+
+        The auto-lock time is two little-endian uint16 timers laid
+        consecutively at ``response[8:12]``; there is no mode byte. The
+        never-opened timer is at [8:10] and the door-close timer at [10:12]. A
+        Timed relock sets both timers to the same seconds, so a non-zero
+        door-close timer signals Timed. A value with only the never-opened
+        timer set is Instant; both zero is off. The mode is derived from which
+        timers are set, never read from a wire byte.
+
+        The Timed decode reports the never-opened timer: it is the field the
+        app displays, and releases before the two-timer encoding stored the
+        user's seconds there, so those values read back as set. A zero
+        never-opened timer falls back to the door-close timer. A write derived
+        from this state sets both timers to the same value.
+        """
+        value = util._bytes_to_int(response[0x08:0x0C])
+        if value == 0:
+            return AutoLockState(AutoLockMode.OFF, 0)
+        never_opened = value & 0xFFFF
+        door_close = (value >> 16) & 0xFFFF
+        if door_close:
+            return AutoLockState(AutoLockMode.TIMER, never_opened or door_close)
+        return AutoLockState(AutoLockMode.INSTANT, never_opened)
 
     @raise_if_not_connected
     async def lock_status(self) -> LockStatus:
@@ -531,13 +597,23 @@ class Lock:
         return self._parse_battery_state(response)
 
     @raise_if_not_connected
-    async def auto_lock_status(self) -> AutoLockState:
+    async def auto_lock_status(self) -> None:
+        """Request the auto-lock setting.
+
+        The wait completes on the READSETTING acknowledgment, whose value field
+        is zero, so it carries no setting; there is nothing to return. The
+        stored setting arrives moments later as a 0xBB settings response on the
+        notify path, which the push layer decodes and applies. Waiting for that
+        settings response instead would stall the poll for the full write
+        timeout on a lock that never answers READSETTING (no auto-lock support).
+        """
         _LOGGER.debug("%s: Executing auto_lock_status", self.name)
-        response = await self._execute_command(
-            Commands.READSETTING, SettingType.AUTOLOCK, "auto_lock_status"
+        await self._execute_command(
+            Commands.READSETTING,
+            SettingType.AUTOLOCK,
+            "auto_lock_status",
         )
         _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
-        return self._parse_auto_lock_state(response)
 
     def _parse_unix_timestamp(self, timestamp_bytes: bytes) -> datetime:
         """Parse the unix timestamp to datetime from the bytes."""

@@ -1,6 +1,6 @@
 [project]
 name = "yalexs-ble"
-version = "3.4.2"
+version = "4.0.0"
 description = "Bluetooth control of Yale and August locks"
 authors = [{ name = "J. Nick Koston", email = "nick@koston.org" }]
 license = "GPL-3.0-only"
@@ -67,6 +67,9 @@ exclude_lines = [
 profile = "black"
 known_first_party = ["yalexs_ble", "tests"]
 
+[tool.codespell]
+ignore-words-list = "yur"
+
 [tool.mypy]
 check_untyped_defs = true
 disallow_any_generics = true
@@ -105,6 +108,7 @@ ignore = [
     "PLR0912", # too many to fix right now
     "TID252", # skip
     "PLR0913", # too late to make changes here
+    "PLR0917", # too late to make changes here
     "PLR0911", # would be breaking change
     "TRY003", # too many to fix
     "SLF001", # design choice
