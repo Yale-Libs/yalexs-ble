@@ -133,6 +133,85 @@ async def test_corrupt_frame_on_every_attempt_raises_and_leaves_the_slot_empty()
     assert session._notify_matcher is None
 
 
+@pytest.mark.asyncio
+async def test_the_last_frames_error_is_the_one_raised_after_the_retries() -> None:
+    """Exhausting the retries surfaces the final frame, not a generic summary.
+
+    Each attempt's error is held until the attempts run out; the caller must
+    get the last frame's hex rather than a message that only counts attempts.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+    # A distinct corrupt frame per attempt, so the raised error identifies
+    # which one it came from.
+    frames = [
+        bytes.fromhex("bb0400002800000008070807000000000000"),
+        bytes.fromhex("bb0400002800000008070807000000000011"),
+        bytes.fromhex("bb0400002800000008070807000000000022"),
+    ]
+    sent = frames.copy()
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(sent.pop(0)))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    with pytest.raises(ResponseError) as caught:
+        await session._locked_write(bytearray(18), "auto_lock_status")
+
+    assert frames[2].hex() in str(caught.value)
+    assert session.client.write_gatt_char.await_count == 3
+    assert session._notify_future is None
+    assert session._notify_matcher is None
+
+
+@pytest.mark.asyncio
+async def test_locked_write_disarms_the_wait_when_the_write_itself_fails() -> None:
+    """A BleakError out of the GATT write leaves the notify slot disarmed.
+
+    The wait is armed before the write, so a write that raises leaves it
+    unresolved -- a late frame would otherwise land on a wait nobody awaits.
+    """
+    received: list[bytes] = []
+    session = _make_session(received)
+    armed: list[asyncio.Future[bytes]] = []
+
+    async def _fail(*_args: object, **_kwargs: object) -> None:
+        assert session._notify_future is not None
+        armed.append(session._notify_future)
+        raise BleakError("write failed")
+
+    session.client.write_gatt_char = AsyncMock(side_effect=_fail)
+
+    with pytest.raises(BleakError, match="write failed"):
+        await session._locked_write(bytearray(18), "auto_lock_status")
+
+    assert session._notify_future is None
+    assert session._notify_matcher is None
+    # The write raised on the first attempt, so it was not retried.
+    assert len(armed) == 1
+    # A frame racing the failed write finds nothing armed and resolves nothing.
+    session._notify(0, bytearray(READ_ANSWER))
+    assert not armed[0].done()
+    assert received == [READ_ANSWER]
+
+
+@pytest.mark.asyncio
+async def test_locked_write_refuses_a_disconnected_client_before_arming() -> None:
+    """Writing on a disconnected client fails fast, before the wait is armed."""
+    received: list[bytes] = []
+    session = _make_session(received)
+    session.client.is_connected = False
+    session.client.write_gatt_char = AsyncMock()
+
+    with pytest.raises(BleakError, match="disconnected"):
+        await session._locked_write(bytearray(18), "auto_lock_status")
+
+    # The slots start out None, so asserting they are None proves nothing
+    # here; the testable claim is that the guard fired before any write.
+    assert session.client.write_gatt_char.await_count == 0
+
+
 def _short_timeout(_seconds: float) -> object:
     """Replacement for util.asyncio_timeout that expires almost immediately."""
     return asyncio.timeout(0.01)

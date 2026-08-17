@@ -23,6 +23,10 @@ _LOGGER = logging.getLogger(__name__)
 
 COOLDOWN_TIME = 0.25
 
+# How many times a command is re-sent when the frame answering it fails
+# admission. Exhausting them raises the last frame's error to the caller.
+WRITE_ATTEMPTS = 3
+
 
 class YaleXSBLEError(Exception):
     """Base class for YaleXSBLE errors."""
@@ -276,10 +280,9 @@ class Session:
         )
 
         future: asyncio.Future[bytes] | None = None
+        last_error: ResponseError | None = None
         try:
-            # The loop never exhausts: the last attempt re-raises, so the only
-            # ways out are break and raise.
-            for attempt in range(3):  # pragma: no branch
+            for _ in range(WRITE_ATTEMPTS):
                 future = self.loop.create_future()
                 self._notify_future = future
                 self._notify_matcher = response_matcher
@@ -296,13 +299,26 @@ class Session:
                             self.write_characteristic, command, True
                         )
                         result = await future
-                    except ResponseError:
-                        if attempt == 2:
-                            raise
-                        _LOGGER.debug("%s: Invalid response, retrying", self.name)
+                    except ResponseError as ex:
+                        # Each attempt gets its own timeout window, so the
+                        # retry is issued outside this one.
+                        _LOGGER.debug(
+                            "%s: Invalid response, retrying: %s", self.name, ex
+                        )
+                        last_error = ex
                         continue
                     else:
                         break
+            else:
+                # Every attempt's frame failed admission. Raise the last one's
+                # error rather than a summary of our own: it carries the frame
+                # that failed, which is the only evidence of what went wrong.
+                # It is bound whenever the loop exhausts -- the loop body's
+                # only other exits are break and an exception -- and asserting
+                # that keeps the attempt count from silently coupling to a
+                # fallback error nobody would read.
+                assert last_error is not None  # nosec
+                raise last_error
         finally:
             # A timeout or a disconnect interrupt leaves the wait armed with a
             # future the waiter has abandoned. Disarm it so a late frame
