@@ -43,7 +43,10 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    OperationFailedError,
+    OperationIncompleteError,
     ResponseError,
+    UnlatchError,
     YaleXSBLEError,
 )
 from .util import asyncio_timeout, is_disconnected_error, local_name_is_unique
@@ -79,6 +82,12 @@ FIRST_CONNECTION_DISCONNECT_TIME = 2.1
 # update its state or it will return a stale state.
 LOCK_STALE_STATE_DEBOUNCE_DELAY = 6.1
 
+# How long to hold a read off the lock from an observed op-response. The
+# op-response is the end of the movement itself, so it needs less margin than
+# the 6.1 s measured from a command that has not answered yet. It is the hold
+# an operation another central ran gets, since nothing else here marks one.
+POST_OP_RESPONSE_DEBOUNCE_DELAY = 4.1
+
 # How long to wait before processing an advertisement change
 ADV_UPDATE_COALESCE_SECONDS = 0.05
 
@@ -92,18 +101,74 @@ HK_UPDATE_COALESCE_SECONDS = 0.025
 MANUAL_UPDATE_COALESCE_SECONDS = 0.05
 
 # BLE connection parameters for always-connected mode (battery saving)
-# After the initial sync, we switch to slow intervals to conserve battery.
+# After the initial sync, we switch to a low duty cycle to conserve battery.
 # Values are in BLE units: intervals in 1.25ms, timeout in 10ms.
-SLOW_MIN_INTERVAL = 800  # 1000ms
-SLOW_MAX_INTERVAL = 800  # 1000ms
-SLOW_LATENCY = 0
-SLOW_TIMEOUT = 600  # 6000ms
+#
+# The idle duty cycle is set by peripheral latency, not by the interval: the
+# lock may skip up to SLOW_LATENCY connection events, so it wakes about every
+# (1 + SLOW_LATENCY) * interval = 510ms. Keeping the interval short means the
+# lock drops latency and drains its notifications at the base interval as soon
+# as it has something to send. Pinning min == max at a long interval instead
+# (1000ms) makes notification delivery, which is acknowledgement gated at one
+# frame per two connection events, take ~2s per frame; a lock operation's
+# three-frame reply then needs >6s to drain and the next command is issued
+# while the previous operation's frames are still arriving.
+SLOW_MIN_INTERVAL = 24  # 30ms
+SLOW_MAX_INTERVAL = 24  # 30ms
+SLOW_LATENCY = 16  # up to 16 skipped connection events (510ms)
+SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
 
+# How long a fresh JAMMED status stays pinned on display, as a deadline that
+# every admitted jam event pushes out again (now + JAMMED_HOLD_TIME, the
+# _poll_battery deadline pattern). Post-jam GETSTATUS fabricates a plain
+# position (14/14 field jams; JAMMED was clobbered in under a second), and
+# the end of a jam cannot be determined remotely, so the hold's primary
+# purpose is making the user aware of the jam via the UI. The hold masks
+# only the reported lock status and books no poll while it runs, so it has
+# no connection side effect; a wakeup at the hold's end schedules the
+# follow-up poll that reads the lock's current state back. 30 s is a
+# nominal visibility window.
+JAMMED_HOLD_TIME = 30.0
+
+# How long to wait before checking again when an update falls due while an
+# operation is running. No update cycle may be created during an operation,
+# because the cycle would wait on the operation lock and run the instant the
+# operation ends, inside the settle window. The check backs off briefly
+# instead and lets the retry find the operation finished or the moment still
+# passed.
+DEADLINE_WAKEUP_RETRY_DELAY = 1.0
+
 # How long to wait if we get an update storm from the lock
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
+
+# Lock statuses that report a position the lock is holding, and holds until an
+# operation or a person moves it. UNKNOWN_01 and UNKNOWN_06 belong here because
+# calibration and polarity discovery are setup conditions that end at the lock
+# by hand, so the reported value stands until someone acts on it.
+#
+# Every other status is a mechanism still moving, the momentary UNLATCHED the
+# lock leaves on its own once the latch returns, or the UNKNOWN a failed
+# operation stamps. Holding one of those must not count as having seen the lock
+# status this session, because that suppresses the follow-up lock_status() poll
+# in _update, and that poll's reading is what replaces the value once the
+# mechanism stops.
+#
+# The positions are the side that is enumerated, so a status this set does not
+# name costs a poll rather than leaving the display on a value with nothing
+# booked to replace it.
+POSITION_READINGS = frozenset(
+    {
+        LockStatus.LOCKED,
+        LockStatus.UNLOCKED,
+        LockStatus.SECUREMODE,
+        LockStatus.JAMMED,
+        LockStatus.UNKNOWN_01,
+        LockStatus.UNKNOWN_06,
+    }
+)
 
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
 
@@ -114,6 +179,12 @@ RETRYABLE_EXCEPTIONS = (*RETRY_BACKOFF_EXCEPTIONS, *RETRY_EXCEPTIONS)
 # 255 seems to be broadcast randomly when
 # there is no update from the lock.
 VALID_ADV_VALUES = {0, 1}
+
+# The HomeKit advertisement fields read below end at byte 15: the global state
+# number sits at [11:13] inside the <HHBB record that starts at byte 9. A
+# payload shorter than this carries no state number to read, so it is skipped
+# rather than unpacked.
+HAP_STATE_RECORD_END = 15
 
 AUTH_FAILURE_TO_START_REAUTH = 5
 
@@ -281,8 +352,58 @@ def retry_bluetooth_connection_error(
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
 
+class _DeadlineWakeup:
+    """A wakeup timer serving a monotonic deadline field owned by the caller.
+
+    The deadline field stays the source of truth: every time the timer fires
+    the deadline is read again, and a deadline that moved out after the wakeup
+    was armed re-arms the timer for the remainder instead of firing early.
+    fire runs only once the deadline has truly passed, so the caller never
+    has to keep the timer in step with every deadline write.
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        get_deadline: Callable[[], float],
+        fire: Callable[[], None],
+    ) -> None:
+        self._loop = loop
+        self._get_deadline = get_deadline
+        self._fire = fire
+        self._timer: asyncio.TimerHandle | None = None
+
+    def arm(self, delay: float | None = None) -> None:
+        """Arm the wakeup, at the deadline or after an explicit delay."""
+        self.cancel()
+        if delay is None:
+            delay = max(0.0, self._get_deadline() - time.monotonic())
+        self._timer = self._loop.call_later(delay, self._on_timer)
+
+    def cancel(self) -> None:
+        """Cancel the wakeup if one is armed."""
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+
+    def _on_timer(self) -> None:
+        """Fire if the deadline has passed, or re-arm for the remainder."""
+        self._timer = None
+        remaining = self._get_deadline() - time.monotonic()
+        if remaining > 0.0:
+            self.arm(remaining)
+            return
+        self._fire()
+
+
 class PushLock:
     """A lock with push updates."""
+
+    # Declared here rather than in __init__ because _init_operation_state,
+    # which is where they are set, is defined below the methods that write
+    # them.
+    _pending_op_state: LockStatus | None
+    _operation_outcome: LockStatus | None
 
     def __init__(
         self,
@@ -336,7 +457,19 @@ class PushLock:
         self._next_disconnect_delay = idle_disconnect_delay
         self._first_update_future: asyncio.Future[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
-        self._last_lock_operation_complete_time = NEVER_TIME
+        self._init_operation_state()
+        # A booked status poll owes one lock_status() read that the seen set
+        # may not suppress: the reading the seen mark records can be the very
+        # one the poll exists to replace. Not reset on reconnect, since it is
+        # an obligation, not session state.
+        self._force_lock_status_poll = False
+        self._init_jam_state()
+        # Earliest moment an update cycle may read the lock. Every booking is
+        # held to it, so a read cannot be taken while the reported state is
+        # still settling, whichever path booked the cycle and however short
+        # the debounce made it. Not reset on reconnect: a mechanism still
+        # moving does not care which link watches it.
+        self._earliest_update_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
         self._slow_params_set = False
@@ -490,6 +623,8 @@ class PushLock:
             self._state_callback,
             self._lock_info,
             self._disconnected_callback,
+            ack_callback=self._ack_callback,
+            op_response_callback=self._op_response_callback,
         )
 
     def _disconnected_callback(self) -> None:
@@ -674,28 +809,367 @@ class PushLock:
 
     async def securemode(self) -> None:
         """Set the lock into securemode."""
-        self._update_any_state([LockStatus.LOCKING])
-        self._cancel_future_update()
-        await self._execute_lock_operation(
+        await self._run_lock_operation(
             "force_securemode", LockStatus.LOCKING, LockStatus.SECUREMODE
         )
 
     async def lock(self) -> None:
         """Lock the lock."""
-        self._update_any_state([LockStatus.LOCKING])
-        self._cancel_future_update()
-        await self._execute_lock_operation(
+        await self._run_lock_operation(
             "force_lock", LockStatus.LOCKING, LockStatus.LOCKED
         )
 
     async def unlock(self) -> None:
         """Unlock the lock."""
-        self._update_any_state([LockStatus.UNLOCKING])
-        self._cancel_future_update()
-        await self._execute_lock_operation(
+        await self._run_lock_operation(
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
 
+    async def unlatch(self) -> None:
+        """Unlatch (momentarily open) the lock.
+
+        The op-response arrives when the latch has returned from its open
+        dwell, so the completed state is UNLOCKED; a settled UNLATCHED push
+        displays only outside an operation window.
+        """
+        await self._run_lock_operation(
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLOCKED
+        )
+
+    def _init_operation_state(self) -> None:
+        """Initialise everything that describes the operation in flight.
+
+        Only one is ever in play, the operation lock enforces it, so these
+        four describe that one operation: the transitional to stamp when its
+        command write reaches the lock, whether any of its attempts got a
+        write through, what it learned about the position, and whether its
+        display window is open. _run_lock_operation resets the first three at
+        the start of each operation and _settle_operation clears the rest at
+        the end, so this initialisation is what makes them readable before the
+        first one runs.
+        """
+        self._pending_op_state = None
+        self._operation_command_written = False
+        self._operation_outcome = None
+        self._operation_window_open = False
+
+    async def _run_lock_operation(
+        self, op_attr: str, pending_state: LockStatus, complete_state: LockStatus
+    ) -> None:
+        """Run a lock operation and settle the display once the retries are done.
+
+        This sits outside the retry decorator, so it runs once per operation
+        rather than once per attempt, which makes it the only place where the
+        operation as a whole has ended. _settle_operation is called from the
+        finally, so every way out reaches it, and the attempt exits below
+        record what they know in _operation_outcome instead of settling the
+        display and booking a status poll each for themselves.
+
+        The unknown position is decided here for the same reason.
+        _execute_lock_operation leaves the last attempt's transitional on
+        display through a retryable failure, because the next attempt re-stamps
+        it at its own write-success; when there is no next attempt that
+        transitional would stay on display with no result coming, so the
+        position is unknown. The test is that one of our own writes stamped it
+        and it is still what the display holds: a write that never got through
+        stamped nothing, and between attempts the window is closed, so the lock
+        can report a position that replaces the transitional. Both halves are
+        needed, because the lock reports the same transitionals for an
+        operation someone else started.
+
+        An UnlatchError is the one exit the display cannot answer for. It is
+        raised from the write attempt onward, so the latch may have fired
+        while the write-success hook never ran and the pre-operation position
+        is still on display, reading as a position the operation left alone.
+        The exception type is the evidence there.
+
+        A cancelled operation does not take that arm, since CancelledError is a
+        BaseException: a cancel is not evidence the lock did or did not move.
+        """
+        self._cancel_future_update()
+        self._operation_outcome = None
+        self._operation_command_written = False
+        try:
+            await self._execute_lock_operation(op_attr, pending_state, complete_state)
+        except Exception as err:
+            if self._operation_outcome is None and (
+                (self._operation_command_written and self.lock_status == pending_state)
+                or isinstance(err, UnlatchError)
+            ):
+                self._operation_outcome = LockStatus.UNKNOWN
+            raise
+        finally:
+            self._settle_operation()
+
+    def _operation_write_success(self) -> None:
+        """The command write reached the lock: the single state-action moment.
+
+        Order matters: release any JAMMED display hold first (a fresh operation
+        supersedes it), then stamp the operation's transitional while the window
+        is still closed, so the stamp passes the filter, then open the window.
+
+        Clearing _seen_jam is the backstop for its invariant, that every
+        operation exit applies a jam it recorded, so no record reaches a new
+        command's write-success. A record that did reach here would answer the
+        same way the hold does: the command a caller issued after the jam is
+        the manual intervention a jam calls for, and its outcome is the newer
+        truth.
+        """
+        if time.monotonic() < self._jammed_hold_deadline:
+            _LOGGER.debug(
+                "%s: New operation write succeeded; releasing the JAMMED display hold",
+                self.name,
+            )
+        self._release_jam_hold()
+        self._seen_jam = False
+        self._operation_command_written = True
+        if self._pending_op_state is not None:
+            # Narrowing only: _pending_op_state is typed LockStatus | None and
+            # _update_any_state takes an iterable of values, and every path
+            # here is inside an operation that set it.
+            self._update_any_state([self._pending_op_state], arm_resync=False)
+        self._operation_window_open = True
+
+    def _ack_callback(self) -> None:
+        """Hold a read off the lock from the acknowledgement of a command.
+
+        Keyed on the opcode, not on whose command it answers. Our own
+        operations are the expected source; whether another central's operation
+        is ever echoed to us as an acknowledgement is unverified, but if one is,
+        the only effect here is a longer hold, which costs a later read.
+
+        The acknowledgement is a moment of its own because the command issue is
+        up to ~2 s ahead of it on a slow connection interval, so it is not a
+        proxy for the command.
+        """
+        self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+
+    def _op_response_callback(self) -> None:
+        """Hold a read off the lock from an op-response, ours or external.
+
+        An operation started at the lock, in the app, or by auto-lock issues no
+        command through us, and whether it is echoed to us as an
+        acknowledgement is unverified, so this is the moment to count on for
+        one.
+        """
+        self._hold_update(POST_OP_RESPONSE_DEBOUNCE_DELAY)
+
+    def _close_operation_window(self) -> None:
+        """Close the operation window and drop everything it recorded.
+
+        _seen_jam is cleared here rather than at each exit that applies it, so
+        the record cannot outlive the window that took it whatever the exit.
+        _settle_operation reads it into the outcome before calling this, and
+        the retry path reaches this only when it is already clear, so nothing
+        that owes the display a jam loses one to the line below.
+        """
+        self._operation_window_open = False
+        self._pending_op_state = None
+        self._seen_jam = False
+
+    def _settle_operation(self) -> None:
+        """Settle the display and book the status poll: the operation's one exit.
+
+        Every way an operation can end reaches this, a raise and a return
+        alike, so the window is closed and, on a lock still being watched, the
+        outcome applied and the status poll booked, once and in one place. A
+        cancel reaches it too, which is what keeps the window from leaking open
+        with no operation in flight: the displayed status would otherwise
+        freeze on the transitional, since the filter drops everything the lock
+        sends while the window is open.
+
+        _operation_outcome is what the exit knew, and None means it knew
+        nothing about where the mechanism is. A jam recorded while the window
+        was open outranks it either way: an outcome is a target state inferred
+        from the command, while the jam is a reading of where the mechanism
+        actually stopped. This is also the only chance to apply that jam,
+        because the post-jam register fabricates a plain position, so the
+        status poll booked below would put that on display instead, and no later
+        signal marks the jam.
+
+        A jam hold still live from an earlier jam outranks the outcome too, by
+        the admission rule rather than here: it holds JAMMED on display, so the
+        unknown position an unlatch that failed at its write asks for is
+        masked. That is the same ruling as the recorded jam above, for the same
+        reason, and it is bounded: the hold's wakeup discards the seen mark and
+        asks the lock again when the hold lapses.
+
+        Order matters. The window closes first, so the outcome passes the
+        filter rather than being dropped by it, and an applied JAMMED
+        discharges the record on its way through.
+
+        When the display is left holding a position, the status poll is booked at
+        the keep-alive interval, the cadence an always-connected lock polls at
+        anyway. When it is left holding anything else, a transitional a cancel
+        could not resolve or the unknown of a result that never came, only a
+        read can settle it and it is booked at the settle debounce instead.
+        That is the earliest such a read is worth taking, because a command
+        already at the lock is still driving the motor and a read taken
+        immediately returns the pre-operation position. The delay follows from
+        the displayed status rather than from the exit taken, so an exit added
+        later inherits the answer instead of choosing one.
+
+        What keeps that read out of the settle window is the floor stamped
+        here, not the delay asked for below. A booking names the latest moment
+        a cycle may run and the deferred-update machinery shortens it freely:
+        a pending booking due inside the coalescing interval rewrites this
+        request to that interval, and a pending booking due sooner keeps its
+        own time. The floor is held by every path that arms a cycle and
+        re-applied when one falls due, so the read waits for the mechanism
+        however short the booking became.
+        """
+        outcome = self._operation_outcome
+        if self._seen_jam:
+            outcome = LockStatus.JAMMED
+            _LOGGER.debug(
+                "%s: A jam was reported while the operation was in flight; "
+                "displaying JAMMED",
+                self.name,
+            )
+        self._close_operation_window()
+        if not self._running:
+            # The watcher was stopped while this operation was in flight. The
+            # window is closed above so the object is left consistent, but
+            # neither action below is wanted now: both arm a timer holding the
+            # lock past the stop, the booking its own and a jam outcome the
+            # display hold's, with nothing left to run either.
+            return
+        if outcome is not None:
+            self._update_any_state([outcome], arm_resync=False)
+        self._force_lock_status_poll = True
+        self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+        self._schedule_future_update_with_debounce(
+            KEEP_ALIVE_TIME
+            if self.lock_status in POSITION_READINGS
+            else LOCK_STALE_STATE_DEBOUNCE_DELAY
+        )
+
+    def _init_jam_state(self) -> None:
+        """Initialise everything that carries a jam between events.
+
+        _jammed_hold_deadline is the moment a displayed JAMMED stops being
+        pinned; every admitted jam event pushes it out again (NEVER_TIME = no
+        hold). The deadline and its wakeup survive a reconnect: a jammed
+        mechanism outlives the link that reported it, and the wakeup is a
+        host-side timer. They do not survive a stop, which releases the hold
+        (see _cancel). _seen_jam carries a jam the operation window filtered
+        out until the operation applies it, and it is cleared when the window
+        closes, so it is discharged well before any reconnect could reach it.
+        Outside this initialisation the deadline and the wakeup are written
+        only through _arm_jam_hold and _release_jam_hold, so the two cannot
+        diverge.
+        """
+        self._jammed_hold_deadline = NEVER_TIME
+        self._jam_hold_wakeup = _DeadlineWakeup(
+            self.loop, lambda: self._jammed_hold_deadline, self._jam_hold_ended
+        )
+        self._seen_jam = False
+
+    def _arm_jam_hold(self, now: float) -> None:
+        """Set the hold deadline and arm the wakeup that ends it, as one action.
+
+        Paired with _release_jam_hold: the deadline field and its wakeup are
+        written only through this pair, so the two cannot diverge.
+        """
+        self._jammed_hold_deadline = now + JAMMED_HOLD_TIME
+        self._jam_hold_wakeup.arm()
+
+    def _release_jam_hold(self) -> None:
+        """Clear the hold deadline and cancel its wakeup, as one action."""
+        self._jammed_hold_deadline = NEVER_TIME
+        self._jam_hold_wakeup.cancel()
+
+    def _jam_hold_ended(self) -> None:
+        """The jam hold has ended: poll the lock's current state.
+
+        The end of a jam cannot be determined remotely, so once the hold has
+        lapsed the display's JAMMED is only a guess and one follow-up poll is
+        owed. The poll is booked near-term, which is safe where a far-future
+        booking was not: _disconnect_with_timer converts a pending deferred
+        update into an immediate one at every idle expiry, so a booking
+        further out than the idle disconnect is pulled forward repeatedly and
+        holds the link up for the whole wait. A near-zero booking runs once,
+        right now, on whatever connection state the lock is in.
+        """
+        if self._operation_lock.locked():
+            # No update cycle may be created while an operation runs (it
+            # would wait on the operation lock and run the instant the
+            # operation ends, inside the settle window). Check again shortly:
+            # the retry finds the hold released by the operation's
+            # write-success, pushed out by a new jam, or still ended.
+            self._jam_hold_wakeup.arm(DEADLINE_WAKEUP_RETRY_DELAY)
+            return
+        # The jam kept its seen mark because it is a real reading of the
+        # position. Discard the mark so the cycle asks the lock instead of
+        # trusting the held value.
+        self._seen_this_session.discard(LockStatus)
+        self._schedule_future_update_with_debounce(0)
+
+    def _admit_lock_status(
+        self, incoming: LockStatus, current: LockStatus
+    ) -> LockStatus:
+        """Decide the displayed lock status for an incoming value.
+
+        Every lock status reaches the state through _update_any_state, whether
+        a poll asked for it or the lock pushed it, so this is the one place a
+        status is judged; any code path that applies one must pass through here.
+        """
+        if self._operation_window_open:
+            # Literal filter: between our command's write-success and its
+            # op-response no received lock status is accepted, whatever the
+            # source (our own stale reads, mid-motion readings, foreign
+            # centrals, jam evidence). The operation applies its own outcome
+            # when it completes. Door and battery members of the same frame
+            # are dispatched by type in _update_any_state and are unaffected
+            # by this filter.
+            if incoming == LockStatus.JAMMED:
+                # A dropped jam is not assumed to arrive again. In the jams
+                # captured from another central the failure report and the
+                # position settle behind it landed within a couple of seconds
+                # of each other, close enough for one window to swallow both,
+                # and no later frame in those captures carried the jam. The
+                # record is what lets the operation apply it at its own exit.
+                self._seen_jam = True
+            _LOGGER.debug(
+                "%s: Operation in flight, not accepting lock status %s",
+                self.name,
+                incoming,
+            )
+            return current
+        now = time.monotonic()
+        if incoming == LockStatus.JAMMED:
+            # Admitted jam evidence, whatever the bearer (our own op-response
+            # applied after the window closes, a settled 0x07 push, a poll
+            # answer, a foreign failure op-response): every event sets a new
+            # hold end. A jam is a real reading of the position, so it keeps
+            # its seen mark; the wakeup armed here discards the mark and
+            # schedules the follow-up poll once the hold actually ends (see
+            # _jam_hold_ended). A jam the window filter dropped is discharged
+            # here, whichever path carried it back: it has reached the display.
+            self._seen_jam = False
+            self._arm_jam_hold(now)
+            return incoming
+        if current == LockStatus.JAMMED and now < self._jammed_hold_deadline:
+            # Display hold: after a jam the polled register fabricates a plain
+            # locked/unlocked position and no remote signal marks the jam's
+            # end, so JAMMED stays pinned until the deadline or until a new
+            # operation's write-success releases it. Masking books nothing:
+            # the hold's own wakeup carries the follow-up poll, so the hold has
+            # no connection side effect.
+            _LOGGER.debug(
+                "%s: Holding JAMMED, not accepting lock status %s",
+                self.name,
+                incoming,
+            )
+            return current
+        return incoming
+
+    # The two wrappers run in the reverse of the order they read: operation_lock
+    # holds self._operation_lock for the whole call, and inside it
+    # retry_bluetooth_connection_error runs this body up to DEFAULT_ATTEMPTS
+    # times. Another attempt follows only from an AuthError or a member of
+    # RETRYABLE_EXCEPTIONS; every other type, the operation errors below
+    # included, leaves on its first raise.
     @operation_lock
     @retry_bluetooth_connection_error
     async def _execute_lock_operation(
@@ -707,29 +1181,78 @@ class PushLock:
                 f"{self.name}: Lock operation not possible because not running"
             )
         _LOGGER.debug("%s: Starting %s", self.name, pending_state)
-        self._update_any_state([pending_state])
-        self._cancel_future_update()
+        # Re-set on every retry attempt: the transitional to stamp when this
+        # attempt's command write reaches the lock (write-success).
+        self._pending_op_state = pending_state
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
-            await getattr(lock, op_attr)()
+            # Re-stamped per attempt, so a retry moves the floor forward with
+            # it rather than leaving the first attempt's window to expire.
+            self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+            # Hand the write-success hook to this operation alone. The window it
+            # opens is closed only on the paths below, so nothing that did not
+            # come through here can open it.
+            await getattr(lock, op_attr)(self._operation_write_success)
+        except OperationFailedError:
+            # The op-response arrived and its result byte named a failure
+            # (mechanical codes are a motor stall, the rest name their own
+            # cause): the exchange completed, the operation did not. The
+            # parser's JAMMED emission fell inside our own window, so the
+            # operation records it as the outcome and the settle applies it,
+            # then propagates: the display carries the jam, the exception tells
+            # the caller the operation did not happen.
+            self._operation_outcome = LockStatus.JAMMED
+            _LOGGER.debug(
+                "%s: %s reported failure; displaying JAMMED", self.name, op_attr
+            )
+            self._complete_operation(time.monotonic())
+            raise
+        except (OperationIncompleteError, UnlatchError):
+            # Non-retryable: this propagates to the caller. No outcome is
+            # recorded because this exit has no evidence of the position: our
+            # write may have succeeded, leaving a transitional on display with
+            # no result coming, which _run_lock_operation answers with the
+            # unknown position. An UnlatchError is raised from the write
+            # attempt onward, so the latch may have fired even where the
+            # write-success hook never ran; _run_lock_operation answers that
+            # one the same way, from the exception type rather than from the
+            # display.
+            _LOGGER.debug(
+                "%s: %s did not complete; the result never arrived",
+                self.name,
+                op_attr,
+            )
+            raise
         except Exception as ex:
-            self._update_any_state([LockStatus.UNKNOWN])
-            # The retry_bluetooth_connection_error wrapper calls
-            # _async_handle_disconnected for RETRY_EXCEPTIONS /
-            # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
-            # any other exception propagate without disconnecting.
+            if self._seen_jam:
+                # The attempt ladder ends here. These types mean the command
+                # may not have been delivered, so the next attempt would send
+                # it again, driving the motor into a mechanism the lock has
+                # just reported jammed; clearing a jam is work for a person at
+                # the lock. OperationIncompleteError carries that to the
+                # caller: it is outside the retry set, and it states what is
+                # true of this operation, that its result never arrived.
+                raise OperationIncompleteError(
+                    f"{self.name}: a jam was reported while {op_attr} was in "
+                    f"flight; the command was not re-sent and the result is "
+                    f"unknown"
+                ) from ex
+            # Retryable (or terminal after the retries run out): close the
+            # window so normal acceptance resumes; the next attempt re-stamps at
+            # its own write-success. No UNKNOWN stamp here: through send and
+            # acknowledgement stage retries the display stays untouched, and
+            # _run_lock_operation settles it if the attempts run out.
+            self._close_operation_window()
             _LOGGER.debug(
                 "%s: Failed to execute lock operation due to %s",
                 self.name,
                 ex,
             )
             raise
-        self._update_any_state([complete_state])
+        self._operation_outcome = complete_state
         _LOGGER.debug("%s: Finished %s", self.name, complete_state)
-        now = time.monotonic()
-        self._last_lock_operation_complete_time = now
-        self._complete_operation(now)
+        self._complete_operation(time.monotonic())
 
     @property
     def auto_lock_durations(self) -> list[int]:
@@ -850,7 +1373,21 @@ class PushLock:
             self.auto_lock_prev,
         )
 
-    def _update_any_state(self, states: Iterable[LockStateValue | AuthState]) -> None:
+    def _update_any_state(
+        self,
+        states: Iterable[LockStateValue | AuthState],
+        arm_resync: bool = True,
+    ) -> None:
+        """Apply states to the display.
+
+        arm_resync is False for the states an operation applies itself. A
+        status change coming from the lock arms a resync cycle to read the
+        settled value back; a status the operation stamped needs no such read,
+        and arming one from inside an operation creates a cycle that waits on
+        the operation lock and runs the instant the operation ends, inside the
+        settle window. Those states are read by the operation's own follow-up
+        status poll instead (see _settle_operation).
+        """
         _LOGGER.debug("%s: State changed: %s", self.name, states)
         lock_state = self._get_current_state()
         original_lock_status = lock_state.lock
@@ -862,14 +1399,44 @@ class PushLock:
                 if lock_state.auth != state:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
-                if lock_state.lock != state:
-                    changes["lock"] = state
+                # Route every incoming lock status through the policy before the
+                # equality check: a repeated identical reading must still reach
+                # the admission filter, because a repeated JAMMED re-arms the
+                # display hold deadline (see _admit_lock_status), so short-
+                # circuiting an unchanged value would let the hold lapse.
+                admitted = self._admit_lock_status(state, lock_state.lock)
+                if admitted is not state or admitted not in POSITION_READINGS:
+                    # The seen set suppresses the follow-up lock_status() poll
+                    # in _update, so it may only record a reading we hold. A
+                    # reading the policy discarded is not a reading we hold, and
+                    # a value the lock is not holding still says nothing about
+                    # where the mechanism will stop, so in both cases the poll
+                    # has to stay armed.
+                    #
+                    # _admit_lock_status returns current, which is the same
+                    # singleton as the incoming value when the two are equal, so
+                    # an equal-but-filtered reading counts as admitted here.
+                    # That is deliberate and harmless: the displayed value
+                    # already is the reading.
+                    self._seen_this_session.discard(state_type)
+                if lock_state.lock != admitted:
+                    changes["lock"] = admitted
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
             elif isinstance(state, BatteryState):
                 if state.voltage <= 3.0:
-                    _LOGGER.debug(
+                    # A refused reading is not a reading, so it must not count
+                    # as having seen the battery this session: the seen mark
+                    # suppresses the next poll, and the reading it would
+                    # suppress it for was never published.
+                    self._seen_this_session.discard(BatteryState)
+                    # A checksum-clean frame reporting 3.0 V or less is
+                    # 0.75 V per cell, against a table that already treats
+                    # 1.24 V per cell as empty. That is unexpected lock
+                    # behavior, so it is surfaced rather than silently
+                    # dropped.
+                    _LOGGER.warning(
                         "%s: Battery voltage is impossible: %s",
                         self.name,
                         state.voltage,
@@ -900,13 +1467,27 @@ class PushLock:
 
         lock_state = replace(lock_state, **changes)
         if (
-            original_lock_status != lock_state.lock
+            arm_resync
+            and original_lock_status != lock_state.lock
             and (not lock_state.auth or lock_state.auth.successful)
             and original_lock_status != LockStatus.UNKNOWN
         ):
             self._schedule_future_update(RESYNC_DELAY)
 
         self._callback_state(lock_state)
+
+    def _record_auth_success(self) -> None:
+        """Record a successful round trip with the lock.
+
+        Resets the consecutive-failure count that arms the auth latch, and
+        publishes the auth state itself. This is the only producer of
+        AuthState(successful=True); the latch in the retry decorator is the
+        only producer of the failure, so both publish through the same path.
+        _update_any_state drops a repeat, so a keep-alive cycle that changes
+        nothing publishes nothing.
+        """
+        _AUTH_FAILURE_HISTORY.auth_success(self.address)
+        self._update_any_state([AuthState(successful=True)])
 
     async def update(self) -> None:
         """Request that status be updated."""
@@ -921,16 +1502,18 @@ class PushLock:
         await self._update()
         _LOGGER.debug("%s: Finished validate", self.name)
 
-    async def _poll_battery(
-        self, lock: Lock, state: LockState
-    ) -> tuple[LockState, bool]:
+    async def _poll_battery(self, lock: Lock) -> bool:
         """Poll battery if needed: periodic refresh, timeout cooldown, errors.
 
         Battery state requires a poll of the lock to update. In always_connected mode
         _seen_this_session never clears, so once the refresh deadline passes
         BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
 
-        Returns tuple of (updated_state, made_request).
+        The read is issued for its effect on the receive path, which applies
+        and publishes the value before the await here resolves, so the
+        fetched value is discarded.
+
+        Returns whether a request was made.
         """
         assert self._lock_info is not None  # nosec
         if self._lock_info.model in NO_BATTERY_SUPPORT_MODELS:
@@ -939,7 +1522,7 @@ class PushLock:
                 self.name,
                 self._lock_info.model,
             )
-            return state, False
+            return False
 
         now = time.monotonic()
         # Skip while in cooldown after a prior battery timeout.
@@ -950,7 +1533,7 @@ class PushLock:
                 self.name,
                 self._earliest_battery_attempt_time - now,
             )
-            return state, False
+            return False
 
         # Periodic refresh: evict BatteryState once its deadline has passed.
         if (
@@ -960,14 +1543,11 @@ class PushLock:
         ):
             self._seen_this_session.discard(BatteryState)
         if BatteryState in self._seen_this_session:
-            return state, False
+            return False
 
         try:
-            battery_state = await lock.battery()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(
-                state, battery=battery_state, auth=AuthState(successful=True)
-            )
+            await lock.battery()
+            self._record_auth_success()
             # Success: disable cooldown and schedule the next refresh.
             self._earliest_battery_attempt_time = NEVER_TIME
             self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
@@ -988,7 +1568,7 @@ class PushLock:
                 err,
             )
 
-        return state, True
+        return True
 
     async def _probe_lock_info(self, lock: Lock) -> LockInfo:
         """Probe the lock for info, falling back to defaults on failure."""
@@ -1115,7 +1695,12 @@ class PushLock:
     @operation_lock
     @retry_bluetooth_connection_error
     async def _update(self) -> LockState:
-        """Update the lock state."""
+        """Update the lock state.
+
+        Each read publishes through the receive path as its answer lands, so
+        the return value is the live state after the cycle rather than a copy
+        this method assembled. Both callers discard it.
+        """
         has_lock_info = self._lock_info is not None
 
         _LOGGER.debug(
@@ -1124,13 +1709,17 @@ class PushLock:
         lock = await self._ensure_connected()
         if not self._lock_info:
             self._lock_info = await self._probe_lock_info(lock)
-        state = self._get_current_state()
+
+        # Each read below is issued for its effect on the receive path:
+        # session._notify hands every frame to the state path before it
+        # resolves the waiter the read is blocked on, so the answer has
+        # already been applied and published by the time the await returns.
+        # The fetched values therefore carry nothing new and are discarded.
         made_request = False
 
         # Asking for battery first seems to reduce the chance of the lock
         # getting into a bad state.
-        state, battery_requested = await self._poll_battery(lock, state)
-        if battery_requested:
+        if await self._poll_battery(lock):
             made_request = True
 
         if (
@@ -1139,14 +1728,12 @@ class PushLock:
             and self._lock_info.door_sense
         ):
             made_request = True
-            door_status = await lock.door_status()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, door=door_status, auth=AuthState(successful=True))
+            await lock.door_status()
+            self._record_auth_success()
 
         if await self._read_auto_lock_setting(lock):
             made_request = True
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, auth=AuthState(successful=True))
+            self._record_auth_success()
 
         # Only ask for the lock status if we haven't seen
         # it this session since notify callbacks will happen
@@ -1155,53 +1742,35 @@ class PushLock:
         #
         # However, we always want to poll lock
         # state to keep the connection alive if we are always connected.
-        if LockStatus not in self._seen_this_session or (
-            not made_request and self._always_connected
+        #
+        # A status poll booked after an operation asks regardless: the seen
+        # mark may record the very reading the poll exists to replace.
+        if (
+            self._force_lock_status_poll
+            or LockStatus not in self._seen_this_session
+            or (not made_request and self._always_connected)
         ):
             made_request = True
-            lock_status = await lock.lock_status()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, lock=lock_status, auth=AuthState(successful=True))
+            await lock.lock_status()
+            # One-shot, discharged only by a read that answered: a cycle that
+            # failed before this point leaves the obligation for the retry.
+            self._force_lock_status_poll = False
+            self._record_auth_success()
 
         _LOGGER.debug("%s: Finished update", self.name)
 
-        # Prevent regression to UNKNOWN when notify callbacks updated state
-        # during awaited operations in this update cycle.
-        # Only overwrite lock/door if this update actually fetched a value.
-        cached_state = self._get_current_state()
-        if state.lock == LockStatus.UNKNOWN and cached_state.lock != LockStatus.UNKNOWN:
-            state = replace(state, lock=cached_state.lock)
-        if state.door == DoorStatus.UNKNOWN and cached_state.door != DoorStatus.UNKNOWN:
-            state = replace(state, door=cached_state.door)
-
-        # Auto-lock is owned by the notify path: the 0xBB settings responses
-        # (read and write) publish it mid-update, while the poll's own return
-        # value is the acknowledgment constant and is discarded above. Always
-        # carry the cached value forward so this wholesale application cannot
-        # clobber a value published during the cycle.
-        state = replace(
-            state,
-            auto_lock=cached_state.auto_lock,
-            auto_lock_prev=cached_state.auto_lock_prev,
-        )
-
-        self._callback_state(state)
-
-        if state.battery and state.battery.voltage <= 3.0:
-            _LOGGER.debug(
-                "%s: Battery voltage is impossible: %s",
-                self.name,
-                state.battery.voltage,
-            )
-            # If the battery voltage is impossible, reconnect.
-            await self._execute_forced_disconnect("impossible battery voltage")
-
-        if state.lock in (LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06):
-            _LOGGER.debug("%s: Lock is in an unknown state: %s", self.name, state.lock)
-            # If the lock is in a bad state, reconnect.
-            await self._execute_forced_disconnect(
-                f"lock is in unknown state: {state.lock}"
-            )
+        current = self._get_current_state()
+        # One publish per cycle, of the live state. Every reading this cycle
+        # took was applied and published as its frame landed, so this hands
+        # back exactly what is already held and cannot change any member.
+        #
+        # It exists because a consumer may read the callback as a liveness
+        # signal rather than only as a change notification. The Home Assistant
+        # entities do: they mark themselves unavailable from their own
+        # advertisement tracking and have no path back other than this
+        # callback, so a cycle that read the same values as the last one still
+        # has to report.
+        self._callback_state(current)
 
         if not has_lock_info:
             # On first update free up the connection
@@ -1219,7 +1788,7 @@ class PushLock:
         if made_request:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
-        return state
+        return self._get_current_state()
 
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""
@@ -1288,10 +1857,12 @@ class PushLock:
         self.set_advertisement_data(ad)
         next_update = 0.0
         mfr_data = ad.manufacturer_data
-        if APPLE_MFR_ID in mfr_data:
-            first_byte = mfr_data[APPLE_MFR_ID][0]
-            if first_byte == HAP_FIRST_BYTE:
-                hk_state = get_homekit_state_num(mfr_data[APPLE_MFR_ID])
+        # An empty payload is skipped rather than indexed: the advertisement is
+        # radio input and its length is not ours to assume.
+        if apple_data := mfr_data.get(APPLE_MFR_ID):
+            first_byte = apple_data[0]
+            if first_byte == HAP_FIRST_BYTE and len(apple_data) >= HAP_STATE_RECORD_END:
+                hk_state = get_homekit_state_num(apple_data)
                 # Sometimes the yale data is glued on to the end of the HomeKit data
                 # but in that case it seems wrong so we don't process it
                 #
@@ -1317,10 +1888,11 @@ class PushLock:
         # static 0x00 header of the 18-byte format causes repeated
         # connections if it differs from the 1-byte value.
         is_first_advertisement = self._last_adv_value == -1
-        if YALE_MFR_ID in mfr_data and (
-            len(mfr_data[YALE_MFR_ID]) == 1 or is_first_advertisement
+        # As above, an empty payload is skipped rather than indexed.
+        if (yale_data := mfr_data.get(YALE_MFR_ID)) and (
+            len(yale_data) == 1 or is_first_advertisement
         ):
-            current_value = mfr_data[YALE_MFR_ID][0]
+            current_value = yale_data[0]
             if not next_update:
                 if is_first_advertisement:
                     # We haven't seen a valid value yet so we schedule an update
@@ -1384,6 +1956,13 @@ class PushLock:
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
+        # The hold exists to make a user aware of a jam through the UI, and a
+        # stopped watcher has no display to hold it on. Releasing it takes the
+        # wakeup with it, which would otherwise fire after the stop and book a
+        # cycle on a lock nothing is watching. Leaving the deadline behind
+        # instead would mask the lock's status on a restarted watcher with no
+        # wakeup left to end the hold or to ask the lock again.
+        self._release_jam_hold()
         self.background_task(self._execute_forced_disconnect("stopping"))
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:
@@ -1410,6 +1989,17 @@ class PushLock:
             ) from ex
         finally:
             self._first_update_future = None
+
+    def _hold_update(self, seconds: float) -> None:
+        """Hold any update cycle off the lock for seconds from now.
+
+        Forward only, because the moments that set the floor interleave: an
+        op-response asking for its shorter hold must not pull a read forward
+        into a window the acknowledgement before it already claimed.
+        """
+        self._earliest_update_time = max(
+            self._earliest_update_time, time.monotonic() + seconds
+        )
 
     def _cancel_future_update(self) -> None:
         """Cancel an update."""
@@ -1444,7 +2034,16 @@ class PushLock:
         self._schedule_future_update(future_update_time)
 
     def _schedule_future_update(self, future_update_time: float) -> None:
-        """Schedule an update in future seconds."""
+        """Schedule an update in future seconds, never before the floor.
+
+        Held here rather than at the callers because every arming path passes
+        through, including the ones that shorten a request. The floor is kept
+        as a moment and the booking as a delay, so it is converted here and
+        never carried across the two.
+        """
+        future_update_time = max(
+            future_update_time, self._earliest_update_time - time.monotonic()
+        )
         _LOGGER.debug(
             "%s: Scheduling update to happen in %s seconds",
             self.name,
@@ -1465,11 +2064,27 @@ class PushLock:
             )
             self._schedule_future_update_with_debounce(UPDATE_IN_PROGRESS_DEFER_SECONDS)
             return
-        if (
-            seconds_time_lock_op := (now - self._last_lock_operation_complete_time)
-        ) < LOCK_STALE_STATE_DEBOUNCE_DELAY:
+        if now < self._earliest_update_time:
+            # A booking armed before the floor moved, so it is re-armed for the
+            # remainder. Unconditionally: the timer that brought us here has
+            # already been cancelled, so there is nothing to coalesce with, and
+            # this booking is the one the floor is for.
             _LOGGER.debug("%s: Rescheduling update to avoid stale state", self.name)
-            self._schedule_future_update_with_debounce(seconds_time_lock_op)
+            self._schedule_future_update(self._earliest_update_time - now)
+            return
+        if self._operation_lock.locked():
+            # The floor is read now, but a cycle created here would not reach
+            # the lock until the operation released it, and the settle moves the
+            # floor forward as the operation ends. The cycle would then run the
+            # instant the operation ends, inside the settle window it just
+            # opened, because a cycle already created never reads the floor
+            # again. Check again shortly instead: the retry finds the operation
+            # finished, the floor moved out, or the moment still passed.
+            _LOGGER.debug(
+                "%s: Rescheduling update until the operation lock is released",
+                self.name,
+            )
+            self._schedule_future_update_with_debounce(DEADLINE_WAKEUP_RETRY_DELAY)
             return
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 
