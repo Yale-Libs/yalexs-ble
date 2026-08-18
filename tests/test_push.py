@@ -223,10 +223,9 @@ async def test_background_task_logs_exception(caplog):
 
     with caplog.at_level("ERROR", logger="yalexs_ble.push"):
         push_lock.background_task(boom())
-        for _ in range(5):
-            await asyncio.sleep(0)
-            if not push_lock._background_tasks:
-                break
+        (task,) = push_lock._background_tasks
+        await asyncio.wait([task])
+        await asyncio.sleep(0)  # let the done-callback run
 
     assert not push_lock._background_tasks
     assert any(
@@ -253,13 +252,10 @@ async def test_background_task_cancellation_not_logged(caplog):
 
     with caplog.at_level("ERROR", logger="yalexs_ble.push"):
         push_lock.background_task(long_running())
-        await asyncio.sleep(0)
-        task = next(iter(push_lock._background_tasks))
+        (task,) = push_lock._background_tasks
         task.cancel()
-        for _ in range(5):
-            await asyncio.sleep(0)
-            if not push_lock._background_tasks:
-                break
+        await asyncio.wait([task])
+        await asyncio.sleep(0)  # let the done-callback run
 
     assert not push_lock._background_tasks
     assert not any(
@@ -283,10 +279,9 @@ async def test_background_task_success_not_logged(caplog):
 
     with caplog.at_level("ERROR", logger="yalexs_ble.push"):
         push_lock.background_task(ok())
-        for _ in range(5):
-            await asyncio.sleep(0)
-            if not push_lock._background_tasks:
-                break
+        (task,) = push_lock._background_tasks
+        await asyncio.wait([task])
+        await asyncio.sleep(0)  # let the done-callback run
 
     assert not push_lock._background_tasks
     assert not any(
@@ -309,11 +304,9 @@ async def test_background_task_done_callback_is_idempotent():
         return None
 
     push_lock.background_task(ok())
-    await asyncio.sleep(0)
-    task = next(iter(push_lock._background_tasks), None)
-    if task is None:
-        task = asyncio.create_task(ok())
-        await task
+    (task,) = push_lock._background_tasks
+    await asyncio.wait([task])
+    assert task.done()  # exception() below requires a finished task
 
     push_lock._on_background_task_done(task)
     push_lock._on_background_task_done(task)
