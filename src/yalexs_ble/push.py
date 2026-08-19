@@ -71,6 +71,24 @@ RESYNC_DELAY = 0.01
 
 KEEP_ALIVE_TIME = 25.0  # Lock will disconnect after 30 seconds of inactivity
 
+# Backoff applied to reconnects while updates keep failing. A lock that cannot
+# complete an update disconnects, and the disconnect asks for another attempt
+# straight away, so without this the retry rate is bounded only by how quickly
+# the connection fails. A state-changing advertisement still schedules its own
+# update, so a lock whose advertised state moves is picked up without waiting
+# out the remaining backoff. A lock that recovers without its advertised state
+# changing has no such escape and waits at most MAX_RECONNECT_BACKOFF_TIME,
+# which is the bound this cap is chosen against.
+RECONNECT_BACKOFF_TIME = 2.0
+MAX_RECONNECT_BACKOFF_TIME = 60.0
+
+# Cap on the doubling, not just on the resulting delay. The doubling is
+# evaluated before min() can clamp it, and multiplying a float by a large
+# enough int raises OverflowError, so an unbounded exponent would fault inside
+# a disconnect callback after a long enough run of failures. Any value that
+# reaches MAX_RECONNECT_BACKOFF_TIME is equivalent here.
+MAX_RECONNECT_BACKOFF_DOUBLINGS = 16
+
 # Number of seconds to wait after the first connection
 # to disconnect to free up the bluetooth adapter.
 FIRST_CONNECTION_DISCONNECT_TIME = 2.1
@@ -352,6 +370,7 @@ class PushLock:
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._last_lock_operation_complete_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
+        self._consecutive_update_failures = 0
         self._always_connected = always_connected
         self._slow_params_set = False
         # Earliest next battery poll attempt (cooldown)
@@ -522,8 +541,24 @@ class PushLock:
         if not self._always_connected:
             return
         _LOGGER.debug("%s: Executing keep alive", self.name)
-        self._schedule_future_update(0)
+        # Debounced, not unconditional: this runs again every KEEP_ALIVE_TIME,
+        # and _schedule_future_update cancels whatever is pending. Re-arming
+        # outright would push any backoff longer than KEEP_ALIVE_TIME further
+        # out every cycle, so it could never fire and the lock would stop
+        # reconnecting instead of slowing down. Debouncing keeps the pending
+        # update whenever it lands sooner than a fresh backoff would.
+        self._schedule_future_update_with_debounce(self._reconnect_backoff_time())
         self._schedule_next_keep_alive(KEEP_ALIVE_TIME)
+
+    def _reconnect_backoff_time(self) -> float:
+        """Return how long to wait before the next reconnect attempt."""
+        if not (failures := self._consecutive_update_failures):
+            return 0.0
+        doublings = min(failures - 1, MAX_RECONNECT_BACKOFF_DOUBLINGS)
+        return min(
+            MAX_RECONNECT_BACKOFF_TIME,
+            RECONNECT_BACKOFF_TIME * 2**doublings,
+        )
 
     def _time_since_last_operation(self) -> float:
         """Return the time since the last operation."""
@@ -845,6 +880,9 @@ class PushLock:
     def _complete_operation(self, now: float) -> None:
         """Mark an operation as complete and reset timers."""
         self._last_operation_complete_time = now
+        # Completing an operation proves the connection works, so the
+        # reconnect backoff must not outlive it.
+        self._consecutive_update_failures = 0
         self._reset_disconnect_timer()
         self._reschedule_next_keep_alive()
 
@@ -957,6 +995,11 @@ class PushLock:
         """Validate lock credentials."""
         _LOGGER.debug("%s: Starting validate", self.name)
         await self._update()
+        # A completed update proves the connection works, the same reasoning
+        # as _complete_operation: do not leave a stale backoff behind it. Only
+        # the reset belongs here; a failed validate is reported to the caller
+        # rather than pacing the always-connected reconnect loop.
+        self._consecutive_update_failures = 0
         _LOGGER.debug("%s: Finished validate", self.name)
 
     async def _poll_battery(self, lock: Lock) -> bool:
@@ -1401,6 +1444,12 @@ class PushLock:
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
+        # A stop is this library standing down, not the lock failing, the same
+        # reasoning that keeps CancelledError out of the count. _cancel only
+        # flips _running, so this instance can be started again; carrying the
+        # count over would resume it at the capped spacing instead of ramping
+        # from RECONNECT_BACKOFF_TIME.
+        self._consecutive_update_failures = 0
         self.background_task(self._execute_forced_disconnect("stopping"))
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:
@@ -1514,8 +1563,14 @@ class PushLock:
             _LOGGER.debug("%s: Deferred updated ignored because not running", self.name)
             return
         _LOGGER.debug("%s: Starting deferred update", self.name)
+        # Counted before the attempt rather than in each handler: the lock's
+        # disconnect callback fires while _update() is still running and reads
+        # this count to size the reconnect delay, so counting afterwards would
+        # leave that delay a failure behind. Cleared on success below.
+        self._consecutive_update_failures += 1
         try:
             await self._update()
+            self._consecutive_update_failures = 0
             self._set_update_state(None)
         except AuthError as ex:
             self._set_update_state(ex)
@@ -1524,6 +1579,14 @@ class PushLock:
                 self.name,
             )
         except asyncio.CancelledError:
+            # A cancel is this library giving up on the update, not the lock
+            # failing to service it, so give the count back. Floored at zero:
+            # a completed operation can clear the count while the update is
+            # still in flight, and giving back a count that is no longer there
+            # would go negative and suppress the backoff until it climbed back.
+            self._consecutive_update_failures = max(
+                0, self._consecutive_update_failures - 1
+            )
             self._set_update_state(RuntimeError("Update was canceled"))
             _LOGGER.debug("%s: In-progress update canceled", self.name)
             raise
