@@ -49,6 +49,7 @@ from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
 _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
+LOCK_INFO_ATTEMPTS = 2
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -407,38 +408,54 @@ class Lock:
             FIRMWARE_REVISION_CHARACTERISTIC,
         )
         results: dict[str, str] = {}
-        try:
-            async with util.asyncio_timeout(LOCK_INFO_TIMEOUT):
-                for char_uuid in char_uuids:
-                    char = self.client.services.get_characteristic(char_uuid)
-                    if not char:
-                        _LOGGER.warning(
-                            "%s: Characteristic %s not found", self.name, char_uuid
-                        )
-                        continue
-                    try:
-                        results[char_uuid] = (
-                            (await self.client.read_gatt_char(char))
-                            .decode()
-                            .split("\0")[0]
-                        )
-                    # The read is radio input too: the BLE controller bug
-                    # noted above corrupts packets, so the bytes may not be
-                    # UTF-8. A bad read degrades to the fallback for that
-                    # characteristic, like a failed one.
-                    except (BleakError, UnicodeDecodeError) as err:
-                        _LOGGER.warning(
-                            "%s: Failed to read characteristic %s: %s",
-                            self.name,
-                            char_uuid,
-                            err,
-                        )
-        except TimeoutError:
-            _LOGGER.warning(
-                "%s: Timeout reading lock info, using %d partial results",
-                self.name,
-                len(results),
-            )
+        # A transient timeout here must not stand: an empty model reads as no
+        # door sense support, and the consumer caches the result. Retry once
+        # only; the probe runs inside the first update, which setup waits on,
+        # so the worst case has to stay bounded.
+        for attempt in range(LOCK_INFO_ATTEMPTS):
+            try:
+                async with util.asyncio_timeout(LOCK_INFO_TIMEOUT):
+                    for char_uuid in char_uuids:
+                        if char_uuid in results:
+                            continue
+                        char = self.client.services.get_characteristic(char_uuid)
+                        if not char:
+                            _LOGGER.warning(
+                                "%s: Characteristic %s not found", self.name, char_uuid
+                            )
+                            continue
+                        try:
+                            results[char_uuid] = (
+                                (await self.client.read_gatt_char(char))
+                                .decode()
+                                .split("\0")[0]
+                            )
+                        # The read is radio input too: the BLE controller bug
+                        # noted above corrupts packets, so the bytes may not be
+                        # UTF-8. A bad read degrades to the fallback for that
+                        # characteristic, like a failed one.
+                        except (BleakError, UnicodeDecodeError) as err:
+                            _LOGGER.warning(
+                                "%s: Failed to read characteristic %s: %s",
+                                self.name,
+                                char_uuid,
+                                err,
+                            )
+            except TimeoutError:
+                if attempt < LOCK_INFO_ATTEMPTS - 1:
+                    _LOGGER.debug(
+                        "%s: Timeout reading lock info with %d partial results, "
+                        "retrying",
+                        self.name,
+                        len(results),
+                    )
+                    continue
+                _LOGGER.warning(
+                    "%s: Timeout reading lock info, using %d partial results",
+                    self.name,
+                    len(results),
+                )
+            break
         # Use the BLE address as fallback serial to keep devices unique
         # in Home Assistant when the characteristic read fails.
         serial_fallback = self.ble_device_callback().address
