@@ -10,6 +10,7 @@ import pytest
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
+from bleak_retry_connector import BleakNotFoundError
 
 from yalexs_ble.const import (
     AuthState,
@@ -35,8 +36,11 @@ from yalexs_ble.push import (
     BATTERY_TIMEOUT_COOLDOWN,
     DEFAULT_ATTEMPTS,
     HAP_FIRST_BYTE,
+    KEEP_ALIVE_TIME,
+    MAX_RECONNECT_BACKOFF_TIME,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
+    RECONNECT_BACKOFF_TIME,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
     SLOW_MIN_INTERVAL,
@@ -46,7 +50,7 @@ from yalexs_ble.push import (
     operation_lock,
     retry_bluetooth_connection_error,
 )
-from yalexs_ble.session import DisconnectedError, ResponseError
+from yalexs_ble.session import AuthError, DisconnectedError, ResponseError
 
 # Shared battery-supporting lock used across tests. model is NOT in
 # NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
@@ -2728,3 +2732,287 @@ async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
 
     assert push_lock.auth == AuthState(successful=True)
     assert _AUTH_FAILURE_HISTORY.should_raise(address) is False
+
+
+def _backoff_lock(address: str) -> PushLock:
+    """Return a running always-connected lock for backoff tests."""
+    push_lock = PushLock(
+        address=address,
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=True,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+    return push_lock
+
+
+@pytest.mark.asyncio
+async def test_reconnect_backoff_time_zero_without_failures() -> None:
+    """A lock whose updates are succeeding reconnects immediately."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:40")
+    assert push_lock._reconnect_backoff_time() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_backoff_time_grows_and_caps() -> None:
+    """Consecutive failures back off exponentially up to the cap."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:41")
+    delays = []
+    for failures in range(1, 12):
+        push_lock._consecutive_update_failures = failures
+        delays.append(push_lock._reconnect_backoff_time())
+
+    assert delays[0] == RECONNECT_BACKOFF_TIME
+    assert delays[1] == RECONNECT_BACKOFF_TIME * 2
+    assert delays == sorted(delays)
+    assert max(delays) == MAX_RECONNECT_BACKOFF_TIME
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_uses_backoff_while_updates_fail() -> None:
+    """
+    Keep-alive spaces out the reconnect while updates keep failing.
+
+    A failing lock disconnects and the disconnect drives another attempt at
+    once, so without the backoff the retry rate is bounded only by how fast
+    the connection fails.
+    """
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:42")
+    push_lock._consecutive_update_failures = 3
+
+    with (
+        patch.object(push_lock, "_schedule_future_update") as mock_schedule_update,
+        patch.object(push_lock, "_schedule_next_keep_alive") as mock_next_keep_alive,
+    ):
+        push_lock._keep_alive()
+
+    mock_schedule_update.assert_called_once_with(RECONNECT_BACKOFF_TIME * 4)
+    mock_next_keep_alive.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_deferred_update_failure_counts_toward_backoff() -> None:
+    """Each failed update lengthens the wait before the next reconnect."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:43")
+
+    with patch.object(push_lock, "_update", side_effect=BleakError("boom")):
+        await push_lock._execute_deferred_update()
+        first = push_lock._reconnect_backoff_time()
+        await push_lock._execute_deferred_update()
+
+    assert push_lock._consecutive_update_failures == 2
+    assert push_lock._reconnect_backoff_time() > first > 0
+
+
+@pytest.mark.asyncio
+async def test_deferred_update_success_clears_backoff() -> None:
+    """A completed update drops the lock straight back to immediate retries."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:44")
+    push_lock._consecutive_update_failures = 4
+
+    with patch.object(push_lock, "_update", return_value=None):
+        await push_lock._execute_deferred_update()
+
+    assert push_lock._consecutive_update_failures == 0
+    assert push_lock._reconnect_backoff_time() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_deferred_update_cancel_is_not_a_failure() -> None:
+    """Cancelling an update is this library's doing, so it must not back off."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:45")
+    push_lock._consecutive_update_failures = 2
+
+    with (
+        patch.object(push_lock, "_update", side_effect=asyncio.CancelledError),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await push_lock._execute_deferred_update()
+
+    assert push_lock._consecutive_update_failures == 2
+
+
+@pytest.mark.asyncio
+async def test_complete_operation_clears_backoff() -> None:
+    """A completed operation proves the connection works."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:46")
+    push_lock._consecutive_update_failures = 5
+
+    with (
+        patch.object(push_lock, "_reset_disconnect_timer"),
+        patch.object(push_lock, "_reschedule_next_keep_alive"),
+    ):
+        push_lock._complete_operation(time.monotonic())
+
+    assert push_lock._consecutive_update_failures == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        AuthError("bad key"),
+        TimeoutError("timed out"),
+        BleakNotFoundError("not found"),
+        BleakError("bleak error"),
+        DisconnectedError("disconnected"),
+        ValueError("unexpected"),
+    ],
+)
+async def test_every_update_failure_counts_toward_backoff(exc: Exception) -> None:
+    """
+    Every way an update can fail must feed the backoff.
+
+    Each one leaves the lock disconnected, and the disconnect asks for another
+    attempt straight away, so a failure mode that did not count would keep the
+    reconnect at zero delay.
+    """
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:47")
+
+    with patch.object(push_lock, "_update", side_effect=exc):
+        await push_lock._execute_deferred_update()
+
+    assert push_lock._consecutive_update_failures == 1
+    assert push_lock._reconnect_backoff_time() == RECONNECT_BACKOFF_TIME
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_does_not_cancel_a_pending_backoff() -> None:
+    """
+    A backoff longer than KEEP_ALIVE_TIME must survive the keep-alive tick.
+
+    ``_keep_alive`` runs again every ``KEEP_ALIVE_TIME`` and
+    ``_schedule_future_update`` cancels whatever is pending, so re-arming
+    outright would push any longer backoff further out on every cycle. The
+    update would never fire and the lock would stop reconnecting altogether
+    rather than settling into a slow poll.
+    """
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:48")
+    push_lock._consecutive_update_failures = 5
+    assert push_lock._reconnect_backoff_time() > KEEP_ALIVE_TIME
+
+    push_lock._keep_alive()
+    pending = push_lock._cancel_deferred_update
+    assert pending is not None
+    scheduled_for = pending.when()
+
+    push_lock._keep_alive()
+
+    assert push_lock._cancel_deferred_update is pending
+    assert push_lock._cancel_deferred_update.when() == scheduled_for
+
+    push_lock._cancel_future_update()
+    push_lock._cancel_keepalive_timer()
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_still_updates_immediately_when_healthy() -> None:
+    """With no failures the keep-alive must still drive an immediate update."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:49")
+
+    push_lock._keep_alive()
+    pending = push_lock._cancel_deferred_update
+    assert pending is not None
+    assert pending.when() - push_lock.loop.time() < 1.0
+
+    push_lock._cancel_future_update()
+    push_lock._cancel_keepalive_timer()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_backoff_time_survives_a_long_failure_run() -> None:
+    """
+    The doubling must be clamped, not only its result.
+
+    ``2 ** (failures - 1)`` is evaluated before ``min()`` can cap it, and
+    multiplying a float by a large enough int raises ``OverflowError`` inside
+    a disconnect callback.
+    """
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:4a")
+
+    for failures in (1024, 1025, 100_000):
+        push_lock._consecutive_update_failures = failures
+        assert push_lock._reconnect_backoff_time() == MAX_RECONNECT_BACKOFF_TIME
+
+
+@pytest.mark.asyncio
+async def test_cancel_never_drives_the_failure_count_negative() -> None:
+    """
+    A cancel must not give back a count that was already cleared.
+
+    ``_complete_operation`` zeroes the count when an operation succeeds, and
+    that can land while an update is still in flight. A cancel arriving after
+    it would otherwise decrement past zero, leaving a nonsense fractional
+    backoff and no real backoff until the count climbed back.
+    """
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:4b")
+
+    async def _clear_then_cancel() -> None:
+        # Stands in for _complete_operation landing mid-update.
+        push_lock._consecutive_update_failures = 0
+        raise asyncio.CancelledError
+
+    with (
+        patch.object(push_lock, "_update", side_effect=_clear_then_cancel),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await push_lock._execute_deferred_update()
+
+    assert push_lock._consecutive_update_failures == 0
+    assert push_lock._reconnect_backoff_time() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_validate_clears_the_backoff() -> None:
+    """A completed validate proves the connection works, so it must reset."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:4c")
+    push_lock._consecutive_update_failures = 4
+
+    with patch.object(push_lock, "_update", return_value=None):
+        await push_lock.validate()
+
+    assert push_lock._consecutive_update_failures == 0
+    assert push_lock._reconnect_backoff_time() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_validate_failure_leaves_the_backoff_alone() -> None:
+    """
+    A failed validate must not disturb the count either way.
+
+    It cannot clear a backoff it did not earn, and it does not add to one:
+    the error is raised to the caller rather than pacing the reconnect loop.
+    """
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:4d")
+    push_lock._consecutive_update_failures = 4
+
+    with (
+        patch.object(push_lock, "_update", side_effect=BleakError("boom")),
+        pytest.raises(BleakError),
+    ):
+        await push_lock.validate()
+
+    assert push_lock._consecutive_update_failures == 4
+
+
+@pytest.mark.asyncio
+async def test_stopping_clears_the_backoff() -> None:
+    """
+    Stopping must not leave a backoff for a later start to inherit.
+
+    ``_cancel`` only flips ``_running``, so the same instance can be started
+    again. ``start`` schedules one immediate update, but if that also fails a
+    carried-over count would resume the keep-alive at the capped spacing
+    rather than ramping from ``RECONNECT_BACKOFF_TIME``.
+    """
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:4e")
+    push_lock._consecutive_update_failures = 6
+    assert push_lock._reconnect_backoff_time() == MAX_RECONNECT_BACKOFF_TIME
+
+    with patch.object(push_lock, "_execute_forced_disconnect", AsyncMock()):
+        push_lock._cancel()
+        await asyncio.sleep(0)
+
+    assert push_lock._consecutive_update_failures == 0
+    assert push_lock._reconnect_backoff_time() == 0.0
