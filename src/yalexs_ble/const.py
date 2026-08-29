@@ -118,12 +118,20 @@ class LockStatus(Enum):
     LOCKED = 0x05
     UNKNOWN_06 = 0x06  # PolDiscovery
     JAMMED = 0x07  # STATICPOSITION
-    # UNLATCHING = 0x09
-    # UNLATCHED = 0x0A
+    UNLATCHING = 0x09
+    UNLATCHED = 0x0A
     SECUREMODE = 0x0C
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
+
+# Statuses reported during calibration (0x01) and polarity discovery (0x06),
+# setup conditions that end at the lock by hand.
+SETUP_CONDITION_STATUSES = frozenset({LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06})
+
+# Statuses that need a person at the lock. Exported so consumers do not
+# keep their own copy.
+MANUAL_INTERVENTION_STATUSES = SETUP_CONDITION_STATUSES | {LockStatus.JAMMED}
 
 
 class DoorStatus(Enum):

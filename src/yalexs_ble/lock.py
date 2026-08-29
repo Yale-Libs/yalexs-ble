@@ -44,11 +44,21 @@ from .const import (
     StatusType,
 )
 from .secure_session import SecureSession
-from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
+from .session import (
+    OPERATION_RESPONSE_TIMEOUT,
+    AuthError,
+    DisconnectedError,
+    OperationProgress,
+    Session,
+    YaleXSBLEError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
+
+# byte[4] of a Lock command: 0x04 turns the plain lock into securemode.
+SECUREMODE_OPERATION_BYTE = 0x04
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -167,6 +177,43 @@ def _poll_response_matcher(
         )
 
     return matches
+
+
+def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
+    """Match the acknowledgment of the written command.
+
+    The acknowledgment carries the operation byte the command was sent
+    with, which is what tells a securemode acknowledgment from a plain
+    lock's on the shared Lock opcode. An op-response carries 0x00 there
+    whatever the operation, which is why _operation_response_matcher
+    matches the opcode alone.
+    """
+
+    def _matches(data: bytes) -> bool:
+        return (
+            # The floor covers the highest byte the match reads, the
+            # operation byte at 0x04.
+            len(data) > 0x04
+            and data[0x00] == 0xAA
+            and data[0x01] == opcode
+            and data[0x04] == operation_byte
+        )
+
+    return _matches
+
+
+def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match the op-response (0xBB + the sent opcode), emitted when the
+    motor stops.
+    """
+
+    def _matches(data: bytes) -> bool:
+        # The match reads only the identity bytes, but the wait it completes
+        # reads the result at byte 0x0F, so the floor admits only a frame
+        # that carries it.
+        return len(data) > 0x0F and data[0x00] == 0xBB and data[0x01] == opcode
+
+    return _matches
 
 
 class Lock:
@@ -322,10 +369,10 @@ class Lock:
                 if state[4] == SettingType.AUTOLOCK.value:
                     return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                return [LockStatus.UNLOCKED]
-            if state[1] == Commands.LOCK.value:
-                return [LockStatus.LOCKED]
+            if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
+                # Operation acknowledgment: byte[1] matches the command and
+                # the frame carries no result and no state.
+                return ()
             if state[1] in (
                 Commands.READSETTING.value,
                 Commands.WRITESETTING.value,
@@ -450,34 +497,76 @@ class Lock:
         )
         return self._lock_info
 
+    async def _execute_operation_command(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_timeout: float,
+        write_success_callback: Callable[[], None] | None = None,
+    ) -> None:
+        """Run a mechanical operation, returning when the lock reports it done.
+
+        The acknowledgment and op-response matchers take their expected
+        bytes from the command here, before the session encrypts the buffer
+        in place.
+        """
+        assert self.session is not None  # nosec
+        opcode = command[0x01]
+        operation_byte = command[0x04]
+        await self.session.execute_operation(
+            command,
+            command_name,
+            ack_matcher=_ack_matcher(opcode, operation_byte),
+            response_matcher=_operation_response_matcher(opcode),
+            response_timeout=response_timeout,
+            progress=OperationProgress(),
+            write_success_callback=write_success_callback,
+        )
+
     @raise_if_not_connected
-    async def force_securemode(self) -> None:
+    async def force_securemode(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
         """Force the lock into securemode."""
         _LOGGER.debug("%s: Securing", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_operation_command(Commands.LOCK, 0x04),
+        await self._execute_operation_command(
+            self.session.build_operation_command(
+                Commands.LOCK, SECUREMODE_OPERATION_BYTE
+            ),
             "force_securemode",
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished securemode", self.name)
 
     @raise_if_not_connected
-    async def force_lock(self) -> None:
+    async def force_lock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
         """Force the lock to lock."""
         _LOGGER.debug("%s: Locking", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.LOCK), "force_lock"
+        await self._execute_operation_command(
+            self.session.build_command(Commands.LOCK),
+            "force_lock",
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished locking", self.name)
 
     @raise_if_not_connected
-    async def force_unlock(self) -> None:
+    async def force_unlock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
         """Force the lock to unlock."""
         _LOGGER.debug("%s: Unlocking", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.UNLOCK), "force_unlock"
+        await self._execute_operation_command(
+            self.session.build_command(Commands.UNLOCK),
+            "force_unlock",
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
 
