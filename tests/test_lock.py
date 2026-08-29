@@ -756,6 +756,105 @@ async def test_lock_info_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lock_info_timeout_retries_once_then_succeeds() -> None:
+    """A transient timeout on the first pass is retried and recovers.
+
+    An empty model reads as no door sense support and the consumer caches
+    the result, so a single slow read must not stand.
+    """
+    lock, mock_client = _make_lock_with_mock_client()
+    original_read = mock_client.read_gatt_char
+    calls = 0
+
+    async def hang_first_call(char: MagicMock) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(999)
+        return await original_read(char)
+
+    mock_client.read_gatt_char = hang_first_call
+
+    with patch("yalexs_ble.lock.LOCK_INFO_TIMEOUT", 0.05):
+        info = await lock.lock_info()
+
+    assert info == LockInfo(
+        manufacturer="Yale/August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_info_retry_keeps_partial_results() -> None:
+    """The retry pass only reads the characteristics still missing."""
+    lock, mock_client = _make_lock_with_mock_client()
+    original_read = mock_client.read_gatt_char
+    mock_to_uuid = mock_client._mock_to_uuid
+    call_counts: dict[str, int] = {}
+
+    async def hang_first_serial_read(char: MagicMock) -> bytes:
+        uuid = mock_to_uuid[id(char)]
+        call_counts[uuid] = call_counts.get(uuid, 0) + 1
+        if uuid == SERIAL_NUMBER_CHARACTERISTIC and call_counts[uuid] == 1:
+            await asyncio.sleep(999)
+        return await original_read(char)
+
+    mock_client.read_gatt_char = hang_first_serial_read
+
+    with patch("yalexs_ble.lock.LOCK_INFO_TIMEOUT", 0.05):
+        info = await lock.lock_info()
+
+    assert info == LockInfo(
+        manufacturer="Yale/August",
+        model="ASL-03",
+        serial="12345",
+        firmware="2.0.0",
+    )
+    # The model landed on the first pass and is not read again.
+    assert call_counts[MODEL_NUMBER_CHARACTERISTIC] == 1
+    assert call_counts[SERIAL_NUMBER_CHARACTERISTIC] == 2
+
+
+@pytest.mark.asyncio
+async def test_lock_info_timeout_on_both_attempts_falls_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both passes timing out degrades to the fallback with one warning."""
+    lock, mock_client = _make_lock_with_mock_client()
+    mock_to_uuid = mock_client._mock_to_uuid
+    read_uuids: list[str] = []
+
+    async def hang_forever(char: MagicMock) -> bytes:
+        read_uuids.append(mock_to_uuid[id(char)])
+        await asyncio.sleep(999)
+        return b""  # unreachable
+
+    mock_client.read_gatt_char = hang_forever
+
+    with patch("yalexs_ble.lock.LOCK_INFO_TIMEOUT", 0.05):
+        info = await lock.lock_info()
+
+    assert info == LockInfo(
+        manufacturer="Yale/August",
+        model="",
+        serial="aa:bb:cc:dd:ee:ff",
+        firmware="Unknown",
+    )
+    # One read per pass proves the retry ran; the warning fires only once,
+    # on the final pass.
+    assert read_uuids == [MODEL_NUMBER_CHARACTERISTIC, MODEL_NUMBER_CHARACTERISTIC]
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelname == "WARNING"
+        and "Timeout reading lock info" in record.message
+    ]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
 async def test_lock_info_missing_characteristic() -> None:
     """Test lock_info skips missing characteristics instead of aborting."""
     lock, mock_client = _make_lock_with_mock_client()
