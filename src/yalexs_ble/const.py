@@ -118,12 +118,25 @@ class LockStatus(Enum):
     LOCKED = 0x05
     UNKNOWN_06 = 0x06  # PolDiscovery
     JAMMED = 0x07  # STATICPOSITION
-    # UNLATCHING = 0x09
-    # UNLATCHED = 0x0A
+    UNLATCHING = 0x09
+    UNLATCHED = 0x0A
     SECUREMODE = 0x0C
+    # Library-synthesized securing transitional. securemode() stamps it as
+    # the operation's pending state and _project_lock_status consumes it,
+    # so it never reaches a published LockState. The value is wider than a
+    # byte, so no frame can decode to it either.
+    SECURING = 0x100
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
+
+# Statuses reported during calibration (0x01) and polarity discovery (0x06),
+# setup conditions that end at the lock by hand.
+SETUP_CONDITION_STATUSES = frozenset({LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06})
+
+# Statuses that need a person at the lock. Exported so consumers do not
+# keep their own copy.
+MANUAL_INTERVENTION_STATUSES = SETUP_CONDITION_STATUSES | {LockStatus.JAMMED}
 
 
 class DoorStatus(Enum):
@@ -175,6 +188,10 @@ class LockState:
     # Hold the previous auto lock state so that it can be restored if auto lock
     # is enabled
     auto_lock_prev: AutoLockState | None
+    # The secure lock, whose locked position is Secured alone. It is projected
+    # from the same reported status as lock (see _project_lock_status), so it
+    # carries its own transitionals and never takes the value SECUREMODE.
+    secure: LockStatus = LockStatus.UNKNOWN
 
 
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
