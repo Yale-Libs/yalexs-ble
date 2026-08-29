@@ -20,6 +20,7 @@ from yalexs_ble.const import (
     LockInfo,
     LockState,
     LockStatus,
+    OperationError,
 )
 from yalexs_ble.lock import Lock
 from yalexs_ble.push import (
@@ -33,8 +34,10 @@ from yalexs_ble.push import (
     AUTO_LOCK_WRITE_ATTEMPTS,
     BATTERY_REFRESH_INTERVAL,
     BATTERY_TIMEOUT_COOLDOWN,
+    DEADLINE_WAKEUP_RETRY_DELAY,
     DEFAULT_ATTEMPTS,
     HAP_FIRST_BYTE,
+    LOCK_STALE_STATE_DEBOUNCE_DELAY,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
     SLOW_LATENCY,
@@ -46,7 +49,11 @@ from yalexs_ble.push import (
     operation_lock,
     retry_bluetooth_connection_error,
 )
-from yalexs_ble.session import DisconnectedError, ResponseError
+from yalexs_ble.session import (
+    DisconnectedError,
+    OperationIncompleteError,
+    ResponseError,
+)
 
 # Shared battery-supporting lock used across tests. model is NOT in
 # NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
@@ -2728,3 +2735,129 @@ async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
 
     assert push_lock.auth == AuthState(successful=True)
     assert _AUTH_FAILURE_HISTORY.should_raise(address) is False
+
+
+# ---------------------------------------------------------------------------
+# Lock operations completed by their own op-response
+# ---------------------------------------------------------------------------
+
+
+def _operational_push_lock(address: str = "aa:bb:cc:dd:ee:50") -> PushLock:
+    """A running lock with lock_info and advertisement data, ready to operate."""
+    push_lock = _named_push_lock(address, always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    return push_lock
+
+
+@pytest.mark.asyncio
+async def test_execute_lock_operation_success_stamps_complete_state() -> None:
+    """A completed force_* advances the state to the completed status.
+
+    Drives lock() to completion: the transitional LOCKING is stamped, the
+    operation returns, and the completed LOCKED status is applied.
+    """
+    push_lock = _operational_push_lock()
+    mock_lock = MagicMock()
+    mock_lock.force_lock = AsyncMock()
+    # The result byte a successful op-response leaves behind; the stamp
+    # reads it before applying the completed state.
+    mock_lock._last_op_error = OperationError.COMM_SUCCESS
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+
+    mock_lock.force_lock.assert_awaited_once()
+    assert push_lock.lock_status == LockStatus.LOCKED
+
+
+@pytest.mark.asyncio
+async def test_a_reported_operation_failure_leaves_jammed_on_display() -> None:
+    """A failure op-response's JAMMED is not overwritten by the commanded state.
+
+    The parser publishes JAMMED from the op-response before force_* returns,
+    so the completed-state stamp applies only when the lock reported success.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:37")
+    mock_lock = MagicMock()
+
+    async def _force_lock_jams() -> None:
+        # What a failure op-response does inside the notify callback: the
+        # parser records the result byte and publishes JAMMED, then the wait
+        # resolves and force_lock returns normally.
+        mock_lock._last_op_error = OperationError.MECH_POSITION
+        push_lock._state_callback([LockStatus.JAMMED])
+
+    mock_lock.force_lock = AsyncMock(side_effect=_force_lock_jams)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+
+    assert push_lock.lock_status == LockStatus.JAMMED
+
+
+@pytest.mark.asyncio
+async def test_failed_operation_anchors_the_stale_state_debounce() -> None:
+    """A failed force_* holds the next cycle off as a completed one does.
+
+    The command reached the lock, so the motor may have run and the position
+    is unknown rather than unchanged. The failed attempt stamps the anchor a
+    completed one stamps, and a cycle falling due inside the debounce that
+    follows is rescheduled rather than run.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
+    mock_lock = MagicMock()
+    mock_lock.force_lock = AsyncMock(
+        side_effect=OperationIncompleteError("no op-response")
+    )
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationIncompleteError),
+    ):
+        await push_lock.lock()
+
+    assert push_lock.lock_status == LockStatus.UNKNOWN
+
+    with patch.object(
+        push_lock, "_schedule_future_update_with_debounce"
+    ) as mock_reschedule:
+        push_lock._deferred_update()
+
+    assert push_lock._update_task is None
+    (delay,) = mock_reschedule.call_args.args
+    assert delay < LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+@pytest.mark.asyncio
+async def test_deferred_update_backs_off_while_an_operation_holds_the_lock() -> None:
+    """A cycle falling due mid-operation backs off rather than queueing.
+
+    The stale-state debounce is measured from the last operation to have
+    finished, so an operation still running passes it. Creating the cycle
+    there would put it behind the operation lock, and it would read the lock
+    the moment the operation released it, inside the window the debounce
+    exists to keep it out of.
+    """
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:38")
+    # The previous operation's anchor is old enough that the debounce passes.
+    push_lock._last_lock_operation_complete_time = (
+        time.monotonic() - LOCK_STALE_STATE_DEBOUNCE_DELAY - 1
+    )
+
+    await push_lock._operation_lock.acquire()
+    try:
+        with patch.object(
+            push_lock, "_schedule_future_update_with_debounce"
+        ) as mock_reschedule:
+            push_lock._deferred_update()
+    finally:
+        push_lock._operation_lock.release()
+
+    assert push_lock._update_task is None
+    mock_reschedule.assert_called_once_with(DEADLINE_WAKEUP_RETRY_DELAY)
