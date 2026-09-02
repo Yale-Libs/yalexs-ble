@@ -25,6 +25,8 @@ from .const import (
     APPLE_MFR_ID,
     HAP_ENCRYPTED_FIRST_BYTE,
     HAP_FIRST_BYTE,
+    MANUAL_INTERVENTION_STATUSES,
+    SETUP_CONDITION_STATUSES,
     YALE_MFR_ID,
     AuthState,
     AutoLockMode,
@@ -43,7 +45,10 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    OperationFailedError,
+    OperationIncompleteError,
     ResponseError,
+    UnlatchError,
     YaleXSBLEError,
 )
 from .util import asyncio_timeout, is_disconnected_error, local_name_is_unique
@@ -112,8 +117,40 @@ SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
 
+# How long a jam or setup condition stays on display, the hold armed once,
+# when one arrives over a display showing none of them. Polls after a jam
+# may return a plain position and nothing announces the condition's end, so
+# without the hold a user may never see it. 30 s is a reasonable minimum
+# time for a user interface to hold the status on display.
+JAMMED_HOLD_TIME = 30.0
+
+# How long to wait and check again while an operation is in flight: an
+# update cycle created then would run the instant the operation ends, while
+# the lock still reports a stale state.
+DEADLINE_WAKEUP_RETRY_DELAY = 1.0
+
 # How long to wait if we get an update storm from the lock
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
+
+# Statuses that report a position the lock is holding; the setup conditions
+# qualify because they end only by hand, and UNLATCHED qualifies because it
+# is the end state of an unlatch, held until the dwell runs out, as UNLOCKED
+# may be ended by auto-lock. Any other status needs the follow-up
+# lock_status() poll to replace it, so it must not enter
+# _seen_this_session, which would suppress that poll. An unlisted status
+# therefore costs a poll, not a stuck display. _finalize_operation reads the
+# set a second time to pick the delay for that poll.
+POSITION_READINGS = frozenset(
+    {
+        LockStatus.LOCKED,
+        LockStatus.UNLOCKED,
+        LockStatus.UNLATCHED,
+        LockStatus.SECUREMODE,
+        LockStatus.JAMMED,
+        LockStatus.UNKNOWN_01,
+        LockStatus.UNKNOWN_06,
+    }
+)
 
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
 
@@ -173,10 +210,6 @@ NO_BATTERY_SUPPORT_MODELS = {
 }
 
 AUTO_LOCK_DEFAULT_DURATION = 90
-
-# Statuses reported during calibration (0x01) and polarity discovery (0x06),
-# setup conditions that end at the lock by hand.
-SETUP_CONDITION_STATUSES = {LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06}
 
 
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
@@ -295,8 +328,59 @@ def retry_bluetooth_connection_error(
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
 
+def _project_lock_status(
+    reported: LockStatus,
+    main: LockStatus,
+    secure: LockStatus,
+) -> tuple[LockStatus, LockStatus]:
+    """Project the physical lock's status onto the logical main and secure
+    lock statuses.
+
+    The physical lock maintains a single status, but to include the
+    transitional states for both logical locks we need an additional lock
+    status channel for the secure lock. To maintain backward compatibility
+    the main lock keeps SECUREMODE as its settled secured position. The
+    internal state SECURING is the equivalent of the main lock's LOCKING
+    state. The model has no Secured to Locked transition, so a reported
+    LOCKING never animates the secure lock: only a reported SECUREMODE
+    proves the lock is secured, and the settled SECUREMODE that follows a
+    securing motion re-secures the display.
+    """
+    if reported is LockStatus.SECURING:
+        # SECURING: if the main lock is already locked it stays locked.
+        # Any other state shows LOCKING on both channels.
+        if main in (LockStatus.LOCKED, LockStatus.SECUREMODE):
+            return main, LockStatus.LOCKING
+        return LockStatus.LOCKING, LockStatus.LOCKING
+    if reported is LockStatus.SECUREMODE:
+        return LockStatus.SECUREMODE, LockStatus.LOCKED
+    if reported is LockStatus.LOCKING:
+        # A plain lock(): the main lock is moving, the secure lock is not.
+        return reported, LockStatus.UNLOCKED
+    if reported in (LockStatus.UNLOCKING, LockStatus.UNLATCHING):
+        # The secure lock is moving only if it was secured, or was already
+        # unlocking.
+        if secure in (LockStatus.LOCKED, LockStatus.UNLOCKING):
+            return reported, LockStatus.UNLOCKING
+        return reported, LockStatus.UNLOCKED
+    if reported in (LockStatus.LOCKED, LockStatus.UNLOCKED, LockStatus.UNLATCHED):
+        # The lock may be locked, but it is not Secured.
+        return reported, LockStatus.UNLOCKED
+    # JAMMED, UNKNOWN, and the setup conditions are faults of the whole lock,
+    # so both channels carry them.
+    return reported, reported
+
+
 class PushLock:
     """A lock with push updates."""
+
+    # mypy takes the type of an attribute from its assignment, and
+    # _init_operation_state and _init_jam_state assign these fields nothing
+    # but None, so without these declarations the inferred type would be
+    # None.
+    _pending_op_state: LockStatus | None
+    _operation_outcome: LockStatus | None
+    _seen_intervention_status: LockStatus | None
 
     def __init__(
         self,
@@ -350,7 +434,18 @@ class PushLock:
         self._next_disconnect_delay = idle_disconnect_delay
         self._first_update_future: asyncio.Future[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
-        self._last_lock_operation_complete_time = NEVER_TIME
+        self._init_operation_state()
+        # When set, one lock_status() call is owed that _seen_this_session
+        # may not suppress, since that set may hold the very reading the
+        # poll must replace. It survives reconnect: an obligation, not
+        # session state.
+        self._force_lock_status_poll = False
+        self._init_jam_state()
+        # The earliest moment an update cycle may poll the lock; every
+        # scheduled cycle is held to it, however it was scheduled. It
+        # survives reconnect: the mechanism does not care which link
+        # watches it.
+        self._earliest_update_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
         self._always_connected = always_connected
         self._slow_params_set = False
@@ -409,6 +504,11 @@ class PushLock:
     def lock_status(self) -> LockStatus:
         """Return the current lock status."""
         return self._lock_state.lock if self._lock_state else LockStatus.UNKNOWN
+
+    @property
+    def secure_status(self) -> LockStatus:
+        """Return the current status of the secure lock."""
+        return self._lock_state.secure if self._lock_state else LockStatus.UNKNOWN
 
     @property
     def battery(self) -> BatteryState | None:
@@ -687,30 +787,276 @@ class PushLock:
             return self._client
 
     async def securemode(self) -> None:
-        """Set the lock into securemode."""
-        self._update_any_state([LockStatus.LOCKING])
-        self._cancel_future_update()
-        await self._execute_lock_operation(
-            "force_securemode", LockStatus.LOCKING, LockStatus.SECUREMODE
+        """Set the lock into securemode.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
+        await self._run_lock_operation(
+            "force_securemode", LockStatus.SECURING, LockStatus.SECUREMODE
         )
 
     async def lock(self) -> None:
-        """Lock the lock."""
-        self._update_any_state([LockStatus.LOCKING])
-        self._cancel_future_update()
-        await self._execute_lock_operation(
+        """Lock the lock.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
+        await self._run_lock_operation(
             "force_lock", LockStatus.LOCKING, LockStatus.LOCKED
         )
 
     async def unlock(self) -> None:
-        """Unlock the lock."""
-        self._update_any_state([LockStatus.UNLOCKING])
-        self._cancel_future_update()
-        await self._execute_lock_operation(
+        """Unlock the lock.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
+        await self._run_lock_operation(
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
 
+    async def unlatch(self) -> None:
+        """Unlatch (momentarily open) the lock.
+
+        The op-response answers the latch pull, so the completed state is
+        UNLATCHED: the latch is retracted and the door lock is open. The
+        dwell and the latch's return run after it, and the state the lock
+        settles to arrives as a later status update.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
+        await self._run_lock_operation(
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLATCHED
+        )
+
+    def _init_operation_state(self) -> None:
+        """Initialize the per-operation fields.
+
+        The operation lock allows one operation at a time; these three
+        describe it. Each is set again as an operation reaches the point it
+        describes, so this only makes them readable before the first one.
+        """
+        self._pending_op_state = None
+        self._operation_outcome = None
+        self._operation_window_open = False
+
     @operation_lock
+    async def _run_lock_operation(
+        self, op_attr: str, pending_state: LockStatus, complete_state: LockStatus
+    ) -> None:
+        """Run a lock operation; _finalize_operation runs on every exit.
+
+        The common body of lock(), unlock(), securemode() and unlatch(); it
+        drives the operation and leaves the display with the result, and
+        failures raise to the caller.
+        """
+        self._cancel_future_update()
+        self._operation_outcome = None
+        try:
+            await self._execute_lock_operation(op_attr, pending_state, complete_state)
+        except Exception:
+            if self._operation_outcome is None:
+                self._operation_outcome = LockStatus.UNKNOWN
+            raise
+        finally:
+            self._finalize_operation()
+
+    def _operation_write_success(self) -> None:
+        """Stamp the operation's transitional state and open the operation window.
+
+        Runs when the command write reaches the lock. Order matters:
+        release the display hold first (a new operation supersedes it),
+        then stamp the transitional while the window is still closed, so
+        the stamp passes the window filter in _admit_lock_status. The
+        window then opens in a finally, because the session contains an
+        exception from this hook and runs the staged wait to its end: a
+        stamp that raised must not leave the whole operation running with
+        the window closed. Clearing _seen_intervention_status is a backstop.
+        """
+        if time.monotonic() < self._jammed_hold_deadline:
+            _LOGGER.debug(
+                "%s: New operation write succeeded; releasing the display hold",
+                self.name,
+            )
+        self._release_jam_hold()
+        self._seen_intervention_status = None
+        try:
+            if self._pending_op_state is not None:
+                # The None check only narrows the type; every caller is inside
+                # an operation that set it.
+                self._update_any_state([self._pending_op_state], arm_resync=False)
+        finally:
+            self._operation_window_open = True
+
+    def _close_operation_window(self) -> None:
+        """Close the operation window and drop everything it recorded.
+
+        Clearing _seen_intervention_status here means the record cannot
+        outlive the window; _finalize_operation reads it first, and the retry
+        path only gets here with it already clear.
+        """
+        self._operation_window_open = False
+        self._pending_op_state = None
+        self._seen_intervention_status = None
+
+    def _finalize_operation(self) -> None:
+        """Close the operation window, display the outcome, schedule the next poll.
+
+        Runs on every exit of _run_lock_operation, cancellation included: a
+        window left open would freeze the display on the operation's
+        transitional state.
+        """
+        outcome = self._operation_outcome
+        # A jam or setup condition recorded while the window was open is the
+        # lock's own reading and may never be sent again, so it replaces the
+        # outcome.
+        if (recorded := self._seen_intervention_status) is not None:
+            outcome = recorded
+            _LOGGER.debug(
+                "%s: the lock reported %s while the operation was in flight",
+                self.name,
+                recorded,
+            )
+        self._close_operation_window()
+        # Both describe the mechanism rather than the watcher, so both
+        # outlive a stop. Stamped before the stop check, so a watcher
+        # started again on this instance inherits them.
+        self._force_lock_status_poll = True
+        self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
+        if not self._running:
+            # Stopped mid-operation: the window is closed, but the actions
+            # below would arm timers on a lock nothing is watching.
+            return
+        if outcome is not None:
+            self._update_any_state([outcome], arm_resync=False)
+        # A live hold schedules nothing here; its timer polls the lock at
+        # the deadline.
+        if time.monotonic() >= self._jammed_hold_deadline:
+            # A settled pair waits the keep-alive; an unsettled one polls at
+            # the stale-state debounce. The two motion values are the only
+            # transitional readings the projection publishes on the secure
+            # channel.
+            if self.lock_status in POSITION_READINGS and self.secure_status not in (
+                LockStatus.LOCKING,
+                LockStatus.UNLOCKING,
+            ):
+                delay = KEEP_ALIVE_TIME
+            else:
+                delay = LOCK_STALE_STATE_DEBOUNCE_DELAY
+            self._schedule_future_update_with_debounce(delay)
+
+    def _init_jam_state(self) -> None:
+        """Initialize the fields behind the display hold.
+
+        The hold deadline and its timer survive reconnects (the mechanism
+        outlives the link that reported it) but not a stop (see _cancel).
+        _seen_intervention_status holds the status the operation window
+        filtered out, until the operation applies it at its exit.
+        """
+        self._jammed_hold_deadline = NEVER_TIME
+        self._jam_hold_timer: asyncio.TimerHandle | None = None
+        self._seen_intervention_status = None
+
+    def _arm_jam_hold(self, now: float) -> None:
+        """Set the hold deadline and arm the timer that ends the hold.
+
+        The deadline and the timer are written as a pair, so a live
+        deadline always has a timer coming to end it.
+        """
+        self._jammed_hold_deadline = now + JAMMED_HOLD_TIME
+        self._schedule_jam_hold_timer(JAMMED_HOLD_TIME)
+
+    def _schedule_jam_hold_timer(self, delay: float) -> None:
+        """Arm the hold-ending timer, replacing any armed one."""
+        self._cancel_jam_hold_timer()
+        self._jam_hold_timer = self.loop.call_later(delay, self._jam_hold_ended)
+
+    def _cancel_jam_hold_timer(self) -> None:
+        """Cancel the hold-ending timer if one is armed."""
+        if self._jam_hold_timer:
+            self._jam_hold_timer.cancel()
+            self._jam_hold_timer = None
+
+    def _release_jam_hold(self) -> None:
+        """Clear the hold deadline and cancel its timer."""
+        self._jammed_hold_deadline = NEVER_TIME
+        self._cancel_jam_hold_timer()
+
+    def _jam_hold_ended(self) -> None:
+        """The display hold has ended: the held status is now a guess, so
+        poll the lock.
+        """
+        # The handle that ran this callback is spent.
+        self._jam_hold_timer = None
+        if self._operation_lock.locked():
+            # A cycle armed here would sit in the deferred-update slot, and
+            # the debounce would displace the delay the operation's exit
+            # chooses. The timer retries instead.
+            self._schedule_jam_hold_timer(DEADLINE_WAKEUP_RETRY_DELAY)
+            return
+        # Remove LockStatus so the cycle asks the lock instead of trusting
+        # the held value.
+        self._seen_this_session.discard(LockStatus)
+        self._schedule_future_update_with_debounce(0)
+
+    def _admit_lock_status(
+        self, incoming: LockStatus, current: LockStatus
+    ) -> LockStatus | None:
+        """Decide the displayed lock status for an incoming value.
+
+        Every incoming lock status, polled or pushed, must pass through
+        here. None refuses the value outright: the caller applies nothing
+        from it, so a refused status cannot reach _project_lock_status
+        either and the secure lock keeps its display. The status on display
+        is what the hold below is holding, so it is read here too.
+        """
+        if self._operation_window_open:
+            # No received lock status is accepted between write-success and
+            # op-response; the operation applies its own outcome. Door and
+            # battery values in the same frame are unaffected.
+            if incoming in MANUAL_INTERVENTION_STATUSES:
+                # Recorded because it may never be sent again; the
+                # operation applies it at its exit. The last one recorded
+                # wins, and the follow-up status poll asks the lock again.
+                self._seen_intervention_status = incoming
+            _LOGGER.debug(
+                "%s: Operation in flight, not accepting lock status %s",
+                self.name,
+                incoming,
+            )
+            return None
+        now = time.monotonic()
+        if incoming in MANUAL_INTERVENTION_STATUSES:
+            if current not in MANUAL_INTERVENTION_STATUSES:
+                # The hold is armed once, when the status arrives over a
+                # display showing no status needing attention; a further
+                # report while one is displayed arms no new hold. Re-arming
+                # would make the deadline poll permanent, one fresh
+                # connection per hold on a lock that is not always
+                # connected; past the one hold the status is refreshed the
+                # way any other state is.
+                _LOGGER.debug(
+                    "%s: Holding %s on display for %s seconds",
+                    self.name,
+                    incoming,
+                    JAMMED_HOLD_TIME,
+                )
+                self._arm_jam_hold(now)
+            return incoming
+        if current in MANUAL_INTERVENTION_STATUSES and now < self._jammed_hold_deadline:
+            # Refused on purpose, a requested refresh included: the polls
+            # that follow a jam report a plain position the mechanism is
+            # not in.
+            _LOGGER.debug(
+                "%s: Holding %s, not accepting lock status %s",
+                self.name,
+                current,
+                incoming,
+            )
+            return None
+        return incoming
+
+    # The decorator retries only AuthError and RETRYABLE_EXCEPTIONS; the
+    # operation errors below leave on their first raise. The operation lock
+    # is already held by _run_lock_operation, the only caller.
     @retry_bluetooth_connection_error
     async def _execute_lock_operation(
         self, op_attr: str, pending_state: LockStatus, complete_state: LockStatus
@@ -721,29 +1067,58 @@ class PushLock:
                 f"{self.name}: Lock operation not possible because not running"
             )
         _LOGGER.debug("%s: Starting %s", self.name, pending_state)
-        self._update_any_state([pending_state])
-        self._cancel_future_update()
+        # Re-set on every attempt: the transitional this attempt stamps at
+        # its write-success.
+        self._pending_op_state = pending_state
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
-            await getattr(lock, op_attr)()
+            # The write-success hook is what stamps the transitional and
+            # opens the window, so only this operation can open one.
+            await getattr(lock, op_attr)(
+                write_success_callback=self._operation_write_success
+            )
+        except OperationFailedError:
+            # The parser's JAMMED landed inside our own window and stands
+            # recorded there for _finalize_operation; the outcome is its
+            # backstop, and the raise tells the caller.
+            self._operation_outcome = LockStatus.JAMMED
+            _LOGGER.debug(
+                "%s: %s reported failure; recording JAMMED", self.name, op_attr
+            )
+            # The exchange completed, so the link is proven alive: move the
+            # timers as a successful operation does. The arms below cannot
+            # prove the exchange completed, so they do not.
+            self._complete_operation(time.monotonic())
+            raise
+        except (OperationIncompleteError, UnlatchError):
+            # Listed so both types reach the caller as themselves: the arm
+            # below would convert them while a status stands recorded.
+            _LOGGER.debug("%s: %s ended without a result", self.name, op_attr)
+            raise
         except Exception as ex:
-            self._update_any_state([LockStatus.UNKNOWN])
-            # The retry_bluetooth_connection_error wrapper calls
-            # _async_handle_disconnected for RETRY_EXCEPTIONS /
-            # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
-            # any other exception propagate without disconnecting.
+            if (recorded := self._seen_intervention_status) is not None:
+                # A retry would drive the motor into a mechanism that needs
+                # attention, so end the attempts with a type outside the
+                # retry set; the result truly never arrived.
+                raise OperationIncompleteError(
+                    f"{self.name}: the lock reported {recorded} while "
+                    f"{op_attr} was in flight; the command was not re-sent "
+                    f"and the result is unknown"
+                ) from ex
+            # Close the window so the next attempt re-stamps at its
+            # write-success; _finalize_operation applies the outcome if none
+            # follows.
+            self._close_operation_window()
             _LOGGER.debug(
                 "%s: Failed to execute lock operation due to %s",
                 self.name,
                 ex,
             )
             raise
-        self._update_any_state([complete_state])
+        self._operation_outcome = complete_state
         _LOGGER.debug("%s: Finished %s", self.name, complete_state)
-        now = time.monotonic()
-        self._last_lock_operation_complete_time = now
-        self._complete_operation(now)
+        self._complete_operation(time.monotonic())
 
     @property
     def auto_lock_durations(self) -> list[int]:
@@ -862,9 +1237,23 @@ class PushLock:
             self.auth,
             self.auto_lock,
             self.auto_lock_prev,
+            self.secure_status,
         )
 
-    def _update_any_state(self, states: Iterable[LockStateValue | AuthState]) -> None:
+    def _update_any_state(
+        self,
+        states: Iterable[LockStateValue | AuthState],
+        arm_resync: bool = True,
+    ) -> None:
+        """Apply states to the display.
+
+        arm_resync is False for the states an operation applies itself. A
+        status change coming from the lock arms a resync cycle to read the
+        settled value back; a status the operation stamped needs no such read,
+        and arming one from inside an operation displaces the delay
+        _finalize_operation chooses when the operation ends. Those states are
+        read by the operation's own follow-up status poll instead.
+        """
         _LOGGER.debug("%s: State changed: %s", self.name, states)
         lock_state = self._get_current_state()
         original_lock_status = lock_state.lock
@@ -890,15 +1279,35 @@ class PushLock:
                 if lock_state.auth != state:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
-                if lock_state.lock != state:
-                    if state in SETUP_CONDITION_STATUSES:
+                # Admission runs before the equality check, so a repeated
+                # reading still reaches the discard below.
+                admitted = self._admit_lock_status(state, lock_state.lock)
+                if admitted not in POSITION_READINGS:
+                    # A display left on anything but a settled position must
+                    # not suppress the follow-up poll, so LockStatus is
+                    # removed from _seen_this_session.
+                    self._seen_this_session.discard(type(state))
+                if admitted is None:
+                    continue
+                # The projection runs on every admitted status, not only on
+                # one that moves the main lock: a securemode command given
+                # to an already-locked lock leaves lock at LOCKED, so gating
+                # the secure value on a changed lock would publish no
+                # securing transitional at all.
+                main, secure = _project_lock_status(
+                    admitted, lock_state.lock, lock_state.secure
+                )
+                if lock_state.lock != main:
+                    if main in SETUP_CONDITION_STATUSES:
                         _LOGGER.warning(
                             "%s: Lock reports %s, a setup condition that ends "
                             "at the lock by hand",
                             self.name,
-                            state,
+                            main,
                         )
-                    changes["lock"] = state
+                    changes["lock"] = main
+                if lock_state.secure != secure:
+                    changes["secure"] = secure
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
@@ -928,7 +1337,8 @@ class PushLock:
 
         lock_state = replace(lock_state, **changes)
         if (
-            original_lock_status != lock_state.lock
+            arm_resync
+            and original_lock_status != lock_state.lock
             and (not lock_state.auth or lock_state.auth.successful)
             and original_lock_status != LockStatus.UNKNOWN
         ):
@@ -1188,11 +1598,19 @@ class PushLock:
         #
         # However, we always want to poll lock
         # state to keep the connection alive if we are always connected.
-        if LockStatus not in self._seen_this_session or (
-            not made_request and self._always_connected
+        #
+        # A poll scheduled after an operation asks regardless:
+        # _seen_this_session may hold the very reading it must replace.
+        if (
+            self._force_lock_status_poll
+            or LockStatus not in self._seen_this_session
+            or (not made_request and self._always_connected)
         ):
             made_request = True
             await lock.lock_status()
+            # Cleared only by a poll that answered; an earlier failure
+            # leaves the obligation to the retry.
+            self._force_lock_status_poll = False
             self._record_auth_success()
 
         _LOGGER.debug("%s: Finished update", self.name)
@@ -1401,6 +1819,13 @@ class PushLock:
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
+        # Release the hold with its timer: a stopped watcher has no
+        # display, and a leftover deadline would mask the status on a
+        # restarted watcher with no timer to end it. A status frame
+        # arriving between here and the disconnect may arm the hold again,
+        # and the update cycle that timer schedules is dropped by
+        # _execute_deferred_update, which returns while _running is False.
+        self._release_jam_hold()
         self.background_task(self._execute_forced_disconnect("stopping"))
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:
@@ -1469,7 +1894,14 @@ class PushLock:
         self._schedule_future_update(future_update_time)
 
     def _schedule_future_update(self, future_update_time: float) -> None:
-        """Schedule an update in future seconds."""
+        """Schedule an update in future seconds, never before _earliest_update_time.
+
+        Every arming path passes through here, including the ones that
+        shorten a request.
+        """
+        future_update_time = max(
+            future_update_time, self._earliest_update_time - time.monotonic()
+        )
         _LOGGER.debug(
             "%s: Scheduling update to happen in %s seconds",
             self.name,
@@ -1490,11 +1922,20 @@ class PushLock:
             )
             self._schedule_future_update_with_debounce(UPDATE_IN_PROGRESS_DEFER_SECONDS)
             return
-        if (
-            seconds_time_lock_op := (now - self._last_lock_operation_complete_time)
-        ) < LOCK_STALE_STATE_DEBOUNCE_DELAY:
+        if now < self._earliest_update_time:
+            # The floor moved after this cycle was armed; re-arm for the
+            # remainder. The fired timer is spent, so nothing coalesces.
             _LOGGER.debug("%s: Rescheduling update to avoid stale state", self.name)
-            self._schedule_future_update_with_debounce(seconds_time_lock_op)
+            self._schedule_future_update(self._earliest_update_time - now)
+            return
+        if self._operation_lock.locked():
+            # The cycle is re-armed rather than created, so it does not sit
+            # on the operation lock and poll the instant the motor stops.
+            _LOGGER.debug(
+                "%s: Rescheduling update until the operation lock is released",
+                self.name,
+            )
+            self._schedule_future_update_with_debounce(DEADLINE_WAKEUP_RETRY_DELAY)
             return
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 

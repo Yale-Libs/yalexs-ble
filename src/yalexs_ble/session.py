@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from time import monotonic
 
 from async_interrupt import interrupt
 from bleak import BleakClient
@@ -22,6 +23,27 @@ from .const import READ_CHARACTERISTIC, RESPONSE_FRAME_LEN, WRITE_CHARACTERISTIC
 _LOGGER = logging.getLogger(__name__)
 
 COOLDOWN_TIME = 0.25
+
+# How long execute() waits for the frame answering a command.
+RESPONSE_TIMEOUT = 10.0
+
+# How long stage 1 of a mechanical operation may take: the GATT write and
+# the acknowledgment that follows it. Sized off the link, not the
+# operation: above the ~6 s link supervision timeout, which counts from
+# the last reception, so a link already dead at the write presents as a
+# disconnect, not an expired stage.
+ACK_TIMEOUT = 8.0
+
+# How long the whole operation, command write to op-response, may take. The
+# motor runs from the command write, and the acknowledgment is transport
+# acceptance, so it is expected before the motor stops.
+OPERATION_RESPONSE_TIMEOUT = 12.0
+
+# How long the unlatch operation may take, command write to op-response.
+# Its end state is UNLATCHED, and the dwell after it is not part of the
+# operation. A separate constant to allow independent tuning of the unlatch
+# operation.
+UNLATCH_OPERATION_RESPONSE_TIMEOUT = 12.0
 
 
 class YaleXSBLEError(Exception):
@@ -46,6 +68,63 @@ class NoAdvertisementError(YaleXSBLEError):
 
 class BluetoothError(YaleXSBLEError):
     """Bluetooth error."""
+
+
+class OperationIncompleteError(YaleXSBLEError):
+    """The operation's result never arrived.
+
+    The command reached the lock, so the motor may have run, but the
+    op-response was lost. Deliberately not a retryable type: it ends the
+    retry attempts with the result unknown.
+    """
+
+
+class OperationFailedError(YaleXSBLEError):
+    """The lock reported that an operation failed.
+
+    The op-response arrived with a non-zero result: the exchange completed,
+    the operation did not. Deliberately not a retryable type: re-driving a
+    failed mechanism is not a recovery.
+    """
+
+    def __init__(self, message: str, result: int) -> None:
+        super().__init__(message)
+        self.result = result
+
+    def __reduce__(self) -> tuple[type[OperationFailedError], tuple[str, int]]:
+        # BaseException copies and pickles by calling the class with
+        # self.args, which holds the message alone and would leave __init__
+        # an argument short.
+        return (self.__class__, (str(self), self.result))
+
+
+class UnlatchError(YaleXSBLEError):
+    """An unlatch failed after its command write was attempted.
+
+    The command may have reached the lock, and a repeated unlatch opens the
+    door again, so nothing may re-send it. Deliberately not a retryable
+    type, so it passes through the retry decorator to the caller unchanged.
+    """
+
+
+@dataclass
+class OperationProgress:
+    """How far a mechanical operation got; error handling keys on the stage
+    reached.
+
+    write_attempted is set before the write call, because an errored write
+    can still have delivered the command. acknowledged and result are
+    recorded where the frames arrive, because a disconnect can cancel the
+    operation's wait before it resumes.
+
+    The caller owns the instance and execute_operation never resets it, so
+    recorded values outlive the call and a logically new operation needs a
+    fresh instance.
+    """
+
+    write_attempted: bool = False
+    acknowledged: bool = False
+    result: bytes | None = None
 
 
 class Session:
@@ -74,7 +153,17 @@ class Session:
         )
         self._notifications_started = False
         self._notify_future: asyncio.Future[bytes] | None = None
+        # When set, only a matching frame resolves the pending future; other
+        # valid frames still reach the state callback and the wait continues.
         self._notify_matcher: Callable[[bytes], bool] | None = None
+        # The acknowledgment wait of a staged operation. Armed together
+        # with the response future, before the write, so no frame falls
+        # between the two wait stages.
+        self._ack_future: asyncio.Future[bytes] | None = None
+        self._ack_matcher: Callable[[bytes], bool] | None = None
+        # Set for the whole staged wait, so _notify can tell a staged wait
+        # from a plain one after the acknowledgment stage has passed.
+        self._operation_progress: OperationProgress | None = None
         self._state_callback = state_callback
         self._disconnected_futures = disconnected_futures
         self._first_request = True
@@ -168,10 +257,7 @@ class Session:
     ) -> None:
         """Dispose of a frame that failed admission.
 
-        The frame is withheld from the state callback. A solicited wait still
-        receives the error, so _locked_write re-sends its command until its
-        attempts run out and it raises; an unsolicited frame has no waiter and
-        is dropped.
+        The frame is withheld from the state callback.
         """
         # The drop line carries the frame hex: these frames should not occur at
         # all, so a drop and its evidence are visible without turning debug on,
@@ -179,11 +265,19 @@ class Session:
         _LOGGER.log(
             level, "%s: dropping invalid frame %s: %s", self.name, frame.hex(), ex
         )
+        if self._operation_progress is not None:
+            # Failing a staged wait would re-send a mechanical command whose
+            # result is unknown, so the wait continues; the stage timeout is
+            # the backstop.
+            _LOGGER.debug(
+                "%s: Invalid frame during an operation wait, still waiting", self.name
+            )
+            return
         if (future := self._disarm_wait()) is not None and not future.done():
             future.set_exception(ex)
 
     def _notify(self, char: int, data: bytearray) -> None:
-        self._last_callback_time = time.monotonic()
+        self._last_callback_time = monotonic()
         _LOGGER.debug(
             "%s: Receiving response via notify: %s (waiting=%s)",
             self.name,
@@ -245,6 +339,21 @@ class Session:
         # why the call is guarded.
         if self._state_callback:
             self._state_callback(decrypted_data)
+        if (
+            (progress := self._operation_progress) is not None
+            and self._ack_future is not None
+            and self._ack_matcher is not None
+            and self._ack_matcher(decrypted_data)
+        ):
+            self._ack_future.set_result(decrypted_data)
+            self._ack_future = None
+            self._ack_matcher = None
+            # Recorded on arrival, not when the wait resumes: a disconnect
+            # can cancel the wait in the same event-loop turn, and an
+            # acknowledgment recorded nowhere reads as a delivery failure,
+            # whose retry re-sends a command the lock has taken.
+            progress.acknowledged = True
+            return
         if self._notify_future is None:
             return
         if self._notify_matcher is not None and not self._notify_matcher(
@@ -259,21 +368,18 @@ class Session:
                 self.name,
             )
             return
+        if progress is not None:
+            # Recorded on arrival for the same reason as the acknowledgment
+            # above.
+            progress.result = decrypted_data
         if (future := self._disarm_wait()) is not None and not future.done():
             future.set_result(decrypted_data)
 
-    async def _locked_write(
-        self,
-        command: bytearray,
-        command_name: str,
-        response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
+    def _encrypt_command(self, command: bytearray, command_name: str) -> None:
         # NOTE: The last two bytes are not encrypted
         # General idea seems to be that if the last byte
         # of the command indicates an offline key offset (is non-zero),
         # the command is "secure" and encrypted with the offline key
-        if not self.client.is_connected:
-            raise BleakError("disconnected")
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
         plainText = command[0x00:0x10]
         cipherText = self.cipher_encrypt.update(plainText)
@@ -281,6 +387,16 @@ class Session:
         _LOGGER.debug(
             "%s: Encrypted command %s: %s", self.name, command_name, command.hex()
         )
+
+    async def _locked_write(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        if not self.client.is_connected:
+            raise BleakError("disconnected")
+        self._encrypt_command(command, command_name)
 
         future: asyncio.Future[bytes] | None = None
         try:
@@ -297,7 +413,7 @@ class Session:
                     command.hex(),
                 )
                 _LOGGER.debug("%s: Waiting for response", self.name)
-                async with util.asyncio_timeout(10):
+                async with util.asyncio_timeout(RESPONSE_TIMEOUT):
                     try:
                         await self.client.write_gatt_char(
                             self.write_characteristic, command, True
@@ -331,6 +447,154 @@ class Session:
                 ):
                     future.exception()
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
+        return result
+
+    async def _locked_write_operation(
+        self,
+        command: bytearray,
+        command_name: str,
+        ack_matcher: Callable[[bytes], bool],
+        response_matcher: Callable[[bytes], bool],
+        response_timeout: float,
+        progress: OperationProgress,
+        write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
+    ) -> bytes:
+        """Write a mechanical command and run the staged wait.
+
+        Both stage deadlines run from the attempt start: the acknowledgment
+        budget ACK_TIMEOUT covers the write and the acknowledgment, and
+        response_timeout covers the op-response. Only an op-response, or an
+        error, ends the wait.
+
+        With wait_for_ack False the acknowledgment stage is skipped; the GATT
+        write keeps the same bound either way.
+        """
+        if not self.client.is_connected:
+            raise BleakError("disconnected")
+        self._encrypt_command(command, command_name)
+
+        attempt_start = monotonic()
+        ack_future: asyncio.Future[bytes] = self.loop.create_future()
+        result_future: asyncio.Future[bytes] = self.loop.create_future()
+        # Armed before the write: re-arming between stages would race an
+        # op-response that follows the acknowledgment within milliseconds.
+        self._ack_future = ack_future
+        self._ack_matcher = ack_matcher
+        self._notify_future = result_future
+        self._notify_matcher = response_matcher
+        self._operation_progress = progress
+        try:
+            _LOGGER.debug(
+                "%s: Writing command to %s: %s",
+                self.name,
+                self.write_characteristic,
+                command.hex(),
+            )
+            # Set before the call: an errored write can still have delivered
+            # the command (the request leaves the radio, only the ATT
+            # response is lost).
+            progress.write_attempted = True
+            async with util.asyncio_timeout(ACK_TIMEOUT):
+                await self.client.write_gatt_char(
+                    self.write_characteristic, command, True
+                )
+            if write_success_callback is not None:
+                # Contained: an exception escaping here would be retried
+                # upstream and re-send a mechanical command. A raising hook
+                # is a bug in the caller.
+                try:
+                    write_success_callback()
+                except Exception:
+                    _LOGGER.exception(
+                        "%s: write success callback for %s raised, "
+                        "continuing the staged wait",
+                        self.name,
+                        command_name,
+                    )
+            if wait_for_ack:
+                _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
+                ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
+                done, _ = await asyncio.wait(
+                    (ack_future, result_future),
+                    timeout=max(ack_remaining, 0),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if result_future in done:
+                    # The op-response supersedes the acknowledgment stage: it
+                    # either beat the acknowledgment entirely, or both
+                    # resolved in the same event-loop turn. Either way the
+                    # op-response is the answer, and whether an acknowledgment
+                    # also arrived was already recorded where it was received.
+                    # The matcher keys on the opcode alone, so the frame taken
+                    # here can also be a previous same-opcode command's late
+                    # op-response. That residual is accepted: requiring the
+                    # acknowledgment first would instead drop a genuine
+                    # op-response whose acknowledgment was lost.
+                    return self._completed(
+                        result_future.result(), progress, command_name
+                    )
+                if ack_future not in done:
+                    raise TimeoutError(
+                        f"{self.name}: No acknowledgment to {command_name} "
+                        f"within {ACK_TIMEOUT}s of the command being issued"
+                    )
+            _LOGGER.debug("%s: Waiting for the op-response", self.name)
+            result_remaining = response_timeout - (monotonic() - attempt_start)
+            try:
+                async with util.asyncio_timeout(max(result_remaining, 0)):
+                    result = await result_future
+            except TimeoutError as err:
+                if (recorded := progress.result) is None:
+                    never_acknowledged = (
+                        ""
+                        if progress.acknowledged
+                        else "; the command was never acknowledged"
+                    )
+                    raise OperationIncompleteError(
+                        f"{self.name}: No op-response to {command_name} arrived "
+                        f"within {response_timeout}s of the command being issued"
+                        f"{never_acknowledged}"
+                    ) from err
+                # The op-response arrived in the same event-loop turn as the
+                # timeout; report the recorded result, not the timeout.
+                _LOGGER.debug(
+                    "%s: op-response to %s arrived in the same turn as "
+                    "the stage-2 timeout; returning the recorded result",
+                    self.name,
+                    command_name,
+                )
+                result = recorded
+        finally:
+            # Unconditional: the session lock serializes operations, so the
+            # record armed above is still this operation's own.
+            self._operation_progress = None
+            if self._ack_future is ack_future:
+                self._ack_future = None
+                self._ack_matcher = None
+            if self._notify_future is result_future:
+                self._notify_future = None
+                self._notify_matcher = None
+        return self._completed(result, progress, command_name)
+
+    def _completed(
+        self, result: bytes, progress: OperationProgress, command_name: str
+    ) -> bytes:
+        """Return the op-response, logging a completion the lock never acknowledged.
+
+        The op-response is matched on the opcode alone, so a completion with
+        no acknowledgment recorded means either the acknowledgment was
+        dropped or a previous same-opcode command's late op-response
+        completed this wait. This line is the only trace of either in a
+        field log, so every completion path returns through here, the
+        unlatch's included, which skips the acknowledgment wait.
+        """
+        if not progress.acknowledged:
+            _LOGGER.info(
+                "%s: %s completed on its op-response; no acknowledgment was received",
+                self.name,
+                command_name,
+            )
         return result
 
     async def start_notify(self) -> None:
@@ -371,6 +635,20 @@ class Session:
         except BleakError as err:
             _LOGGER.debug("%s: Bleak error stopping notify: %s", self.name, err)
 
+    async def _wait_for_cooldown(self) -> None:
+        while (
+            self._enable_cooldown
+            and (cooldown_remain := monotonic() - self._last_callback_time)
+            < COOLDOWN_TIME
+        ):
+            _LOGGER.debug(
+                "%s: Waiting %s for lock to settle", self.name, cooldown_remain
+            )
+            # If we send commands to fast the lock may crash and stop
+            # advertising. This is a workaround to avoid that since
+            # it means a battery pull is required to recover.
+            await asyncio.sleep(COOLDOWN_TIME - cooldown_remain)
+
     async def execute(
         self,
         command: bytearray,
@@ -385,18 +663,7 @@ class Session:
         write times out). Without a matcher the first valid frame answers, as
         before.
         """
-        while (
-            self._enable_cooldown
-            and (cooldown_remain := time.monotonic() - self._last_callback_time)
-            < COOLDOWN_TIME
-        ):
-            _LOGGER.debug(
-                "%s: Waiting %s for lock to settle", self.name, cooldown_remain
-            )
-            # If we send commands to fast the lock may crash and stop
-            # advertising. This is a workaround to avoid that since
-            # it means a battery pull is required to recover.
-            await asyncio.sleep(COOLDOWN_TIME - cooldown_remain)
+        await self._wait_for_cooldown()
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
         self._write_checksum(command)
         disconnected_future = asyncio.get_running_loop().create_future()
@@ -413,6 +680,113 @@ class Session:
                     f"Authentication error: key or slot (key index) is incorrect: {err}"
                 ) from err
             if util.is_disconnected_error(err):
+                raise DisconnectedError(f"{self.name}: {err}") from err
+            raise
+        finally:
+            disconnected_futures.discard(disconnected_future)
+            self._first_request = False
+
+    def _outcome_after_disconnect(
+        self, progress: OperationProgress, command_name: str, err: Exception
+    ) -> bytes | None:
+        """Classify a lost link by how far the operation got.
+
+        Returns the op-response when the frame was recorded before the wait
+        was lost, raises OperationIncompleteError once the command was
+        acknowledged and the result is therefore unknown, and returns None
+        while nothing was acknowledged, which leaves the caller to raise the
+        retryable error the drop came in as.
+        """
+        if (result := progress.result) is not None:
+            # The op-response arrived in the same event-loop turn as the
+            # disconnect; report the recorded result.
+            _LOGGER.debug(
+                "%s: Disconnected in the same turn as the op-response to "
+                "%s; returning the recorded result",
+                self.name,
+                command_name,
+            )
+            return self._completed(result, progress, command_name)
+        if progress.acknowledged:
+            raise OperationIncompleteError(
+                f"{self.name}: Disconnected while awaiting the op-response "
+                f"to {command_name}; the result is unknown"
+            ) from err
+        return None
+
+    async def execute_operation(
+        self,
+        command: bytearray,
+        command_name: str,
+        ack_matcher: Callable[[bytes], bool],
+        response_matcher: Callable[[bytes], bool],
+        response_timeout: float,
+        progress: OperationProgress,
+        write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
+    ) -> bytes:
+        """Execute a mechanical operation command with the staged wait.
+
+        Failures up to the acknowledgment stay retryable, so the caller's
+        retry decorator re-sends early. The acknowledgment has no mechanical
+        delay, so its absence means the command was not delivered or the
+        acknowledgment was dropped; an op-response that arrives anyway shows
+        it was dropped. Later failures raise OperationIncompleteError, which
+        ends the retry attempts with the result unknown.
+
+        response_timeout bounds the whole operation, command write to
+        op-response, measured from the moment the command is issued. On
+        success the lock sends the op-response at the command's end state,
+        and what ends that state later is not part of the operation: the
+        dwell ends UNLATCHED after an unlatch, as auto-lock may end UNLOCKED
+        after an unlock. Sized above ACK_TIMEOUT.
+
+        wait_for_ack=False skips the acknowledgment wait, for a caller
+        whose failure handling must never re-send: a dropped acknowledgment
+        would otherwise end an operation whose result could still arrive.
+        The acknowledgment is still matched and recorded when it lands;
+        only the wait on it is dropped. It does not by itself stop a re-send:
+        a post-write disconnect with nothing acknowledged is still retryable.
+        """
+        await self._wait_for_cooldown()
+        assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
+        self._write_checksum(command)
+        disconnected_future = asyncio.get_running_loop().create_future()
+        disconnected_futures = self._disconnected_futures
+        disconnected_futures.add(disconnected_future)
+        try:
+            async with (
+                interrupt(
+                    disconnected_future,
+                    DisconnectedError,
+                    f"{self.name}: Disconnected",
+                ),
+                self._lock,
+            ):
+                return await self._locked_write_operation(
+                    command,
+                    command_name,
+                    ack_matcher,
+                    response_matcher,
+                    response_timeout,
+                    progress,
+                    write_success_callback,
+                    wait_for_ack,
+                )
+        except DisconnectedError as err:
+            result = self._outcome_after_disconnect(progress, command_name, err)
+            if result is not None:
+                return result
+            raise
+        except BleakError as err:
+            if self._first_request and util.is_key_error(err):
+                raise AuthError(
+                    f"Authentication error: key or slot (key index) is incorrect: {err}"
+                ) from err
+            if util.is_disconnected_error(err):
+                result = self._outcome_after_disconnect(progress, command_name, err)
+                if result is not None:
+                    return result
                 raise DisconnectedError(f"{self.name}: {err}") from err
             raise
         finally:

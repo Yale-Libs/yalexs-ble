@@ -19,6 +19,7 @@ from bleak_retry_connector import (
 from . import util
 from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
+    MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_DOOR_STATUS,
@@ -44,11 +45,27 @@ from .const import (
     StatusType,
 )
 from .secure_session import SecureSession
-from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
+from .session import (
+    OPERATION_RESPONSE_TIMEOUT,
+    UNLATCH_OPERATION_RESPONSE_TIMEOUT,
+    AuthError,
+    DisconnectedError,
+    OperationFailedError,
+    OperationIncompleteError,
+    OperationProgress,
+    Session,
+    UnlatchError,
+    YaleXSBLEError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
+
+# byte[4] of an operation command selects the variant: 0x0A on Unlock is an
+# unlatch (retract the latch), 0x04 on Lock is securemode.
+UNLATCH_OPERATION_BYTE = 0x0A
+SECUREMODE_OPERATION_BYTE = 0x04
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -169,6 +186,49 @@ def _poll_response_matcher(
     return matches
 
 
+def _describe_operation_error(result: int) -> str:
+    """Decode an op-response result byte to a name for logs and errors."""
+    error = VALUE_TO_OPERATION_ERROR.get(result)
+    return error.name if error is not None else "unknown"
+
+
+def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
+    """Match the acknowledgment of the written command.
+
+    The acknowledgment carries the operation byte the command was sent
+    with, which is what tells a securemode acknowledgment from a plain
+    lock's on the shared Lock opcode. An op-response carries 0x00 there
+    whatever the operation, which is why _operation_response_matcher
+    matches the opcode alone.
+    """
+
+    def _matches(data: bytes) -> bool:
+        return (
+            # The floor covers the highest byte the match reads, the
+            # operation byte at 0x04.
+            len(data) > 0x04
+            and data[0x00] == 0xAA
+            and data[0x01] == opcode
+            and data[0x04] == operation_byte
+        )
+
+    return _matches
+
+
+def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match the op-response (0xBB + the sent opcode), emitted when the
+    motor stops.
+    """
+
+    def _matches(data: bytes) -> bool:
+        # The match reads only the identity bytes, but the wait it completes
+        # reads the result at byte 0x0F, so the floor admits only a frame
+        # that carries it.
+        return len(data) > 0x0F and data[0x00] == 0xBB and data[0x01] == opcode
+
+    return _matches
+
+
 class Lock:
     def __init__(
         self,
@@ -196,6 +256,9 @@ class Lock:
         # Retained so a follow-up can expose the failure reason as a
         # diagnostic.
         self._last_op_error: int | None = None
+        # Set while one of our operations awaits its op-response; an
+        # op-response that does not match is unsolicited.
+        self._awaited_operation_opcode: int | None = None
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
@@ -295,13 +358,27 @@ class Lock:
                 result = state[0x0F]
                 self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
-                    error = VALUE_TO_OPERATION_ERROR.get(result)
-                    _LOGGER.warning(
-                        "%s: Operation failed with result 0x%02X (%s)",
-                        self.name,
-                        result,
-                        error.name if error else "unknown",
-                    )
+                    solicited = state[1] == self._awaited_operation_opcode
+                    if solicited and result in MECHANICAL_OPERATION_ERRORS:
+                        # The caller learns of this failure from
+                        # OperationFailedError; debug is enough here.
+                        _LOGGER.debug(
+                            "%s: Operation failed with result 0x%02X (%s)",
+                            self.name,
+                            result,
+                            _describe_operation_error(result),
+                        )
+                    else:
+                        # An unexpected code, or a failure nothing of ours
+                        # awaits.
+                        _LOGGER.warning(
+                            "%s: Operation failed with result 0x%02X (%s)",
+                            self.name,
+                            result,
+                            _describe_operation_error(result),
+                        )
+                    # Every failure needs a person at the lock, so all
+                    # display as JAMMED.
                     return [LockStatus.JAMMED]
                 return ()  # success: recognized, no state update
             if state[1] == Commands.LOCK_ACTIVITY.value:
@@ -322,10 +399,10 @@ class Lock:
                 if state[4] == SettingType.AUTOLOCK.value:
                     return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                return [LockStatus.UNLOCKED]
-            if state[1] == Commands.LOCK.value:
-                return [LockStatus.LOCKED]
+            if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
+                # Operation acknowledgment: byte[1] matches the command and
+                # the frame carries no result and no state.
+                return ()
             if state[1] in (
                 Commands.READSETTING.value,
                 Commands.WRITESETTING.value,
@@ -450,36 +527,173 @@ class Lock:
         )
         return self._lock_info
 
+    async def _execute_operation_command(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_timeout: float,
+        progress: OperationProgress | None = None,
+        write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
+    ) -> None:
+        """Run a mechanical operation; returns only on a reported success.
+
+        The acknowledgment and op-response matchers take their expected
+        bytes from the command here, before the session encrypts the buffer
+        in place. Raises OperationFailedError when the op-response reports a
+        failure.
+        """
+        assert self.session is not None  # nosec
+        opcode = command[0x01]
+        operation_byte = command[0x04]
+        if progress is None:
+            # Only the unlatch reads the record: write_attempted gates its
+            # never-re-send conversion. Lock, unlock and securemode convert
+            # nothing on it, so they let the callee own a throwaway rather
+            # than push the construction into three call sites.
+            progress = OperationProgress()
+
+        def _arm_awaited_opcode() -> None:
+            # Armed at write-success. A frame arriving before then cannot
+            # be told from an external one, so it reads as unsolicited.
+            self._awaited_operation_opcode = opcode
+            if write_success_callback is not None:
+                write_success_callback()
+
+        try:
+            response = await self.session.execute_operation(
+                command,
+                command_name,
+                ack_matcher=_ack_matcher(opcode, operation_byte),
+                response_matcher=_operation_response_matcher(opcode),
+                response_timeout=response_timeout,
+                progress=progress,
+                write_success_callback=_arm_awaited_opcode,
+                wait_for_ack=wait_for_ack,
+            )
+        finally:
+            # Clearing unconditionally assumes one operation at a time,
+            # which PushLock's operation lock provides; two at once on a
+            # bare Lock would only cost a failure record logged at warning
+            # instead of debug.
+            self._awaited_operation_opcode = None
+        result = response[0x0F]
+        if result != OperationError.COMM_SUCCESS:
+            raise OperationFailedError(
+                f"{self.name}: {command_name} reported failure 0x{result:02X} "
+                f"({_describe_operation_error(result)})",
+                result,
+            )
+
     @raise_if_not_connected
-    async def force_securemode(self) -> None:
-        """Force the lock into securemode."""
+    async def force_securemode(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
+        """Force the lock into securemode.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
         _LOGGER.debug("%s: Securing", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_operation_command(Commands.LOCK, 0x04),
+        await self._execute_operation_command(
+            self.session.build_operation_command(
+                Commands.LOCK, SECUREMODE_OPERATION_BYTE
+            ),
             "force_securemode",
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished securemode", self.name)
 
     @raise_if_not_connected
-    async def force_lock(self) -> None:
-        """Force the lock to lock."""
+    async def force_lock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
+        """Force the lock to lock.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
         _LOGGER.debug("%s: Locking", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.LOCK), "force_lock"
+        await self._execute_operation_command(
+            self.session.build_command(Commands.LOCK),
+            "force_lock",
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished locking", self.name)
 
     @raise_if_not_connected
-    async def force_unlock(self) -> None:
-        """Force the lock to unlock."""
+    async def force_unlock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
+        """Force the lock to unlock.
+
+        Raises OperationFailedError on a reported operation failure.
+        """
         _LOGGER.debug("%s: Unlocking", self.name)
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.UNLOCK), "force_unlock"
+        await self._execute_operation_command(
+            self.session.build_command(Commands.UNLOCK),
+            "force_unlock",
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            write_success_callback=write_success_callback,
         )
         _LOGGER.debug("%s: Finished unlocking", self.name)
+
+    @raise_if_not_connected
+    async def force_unlatch(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> None:
+        """Force the lock to unlatch (momentarily retract the latch).
+
+        There is no unlatch opcode: this is Unlock with operation byte
+        0x0A, answered by a normal Unlock op-response.
+
+        The op-response answers the latch pull: the dwell and the latch's
+        return run after it, so returning here does not mean the cycle has
+        finished.
+
+        A repeated unlatch opens the door again, so once the write has been
+        attempted no failure may re-send the command, and every such
+        failure converts to UnlatchError, which is not retryable. The two
+        operation-result types are the exception: OperationIncompleteError
+        and OperationFailedError are already non-retryable, so each reaches
+        the caller as itself. There is no acknowledgment wait: a delivery
+        signal only serves a caller that may re-send.
+        """
+        _LOGGER.debug("%s: Unlatching", self.name)
+        assert self.session is not None  # nosec
+        progress = OperationProgress()
+        try:
+            await self._execute_operation_command(
+                self.session.build_operation_command(
+                    Commands.UNLOCK, UNLATCH_OPERATION_BYTE
+                ),
+                "force_unlatch",
+                response_timeout=UNLATCH_OPERATION_RESPONSE_TIMEOUT,
+                progress=progress,
+                write_success_callback=write_success_callback,
+                wait_for_ack=False,
+            )
+        except (OperationIncompleteError, OperationFailedError):
+            # Already non-retryable; listed ahead of the broad clause so
+            # they reach the caller unwrapped.
+            raise
+        except Exception as err:
+            # Broad on purpose: no failure of any kind may reach the retry
+            # wrapper once the write was attempted. Every path re-raises;
+            # cancellation is a BaseException and passes through. AuthError
+            # is converted too, so auth failure handling waits for the next
+            # update cycle.
+            if progress.write_attempted:
+                raise UnlatchError(
+                    f"{self.name}: Unlatch failed after the command write was "
+                    f"attempted, and a repeated unlatch opens the door again, "
+                    f"so it was not retried: {err}"
+                ) from err
+            raise
+        _LOGGER.debug("%s: Finished unlatching", self.name)
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
@@ -522,16 +736,36 @@ class Lock:
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
 
     async def securemode(self) -> None:
+        """Set securemode unless a status read reports it already set.
+
+        Raises OperationFailedError on a reported failure.
+        """
         if (await self.lock_status()) != LockStatus.SECUREMODE:
             await self.force_securemode()
 
     async def lock(self) -> None:
+        """Lock unless a status read reports the lock already locked.
+
+        Raises OperationFailedError on a reported failure.
+        """
         if (await self.lock_status()) != LockStatus.LOCKED:
             await self.force_lock()
 
     async def unlock(self) -> None:
+        """Unlock unless a status read reports the lock already unlocked.
+
+        Raises OperationFailedError on a reported failure.
+        """
         if (await self.lock_status()) != LockStatus.UNLOCKED:
             await self.force_unlock()
+
+    async def unlatch(self) -> None:
+        """Unlatch; this always runs the operation, since there is no
+        resting state to compare against.
+
+        Raises OperationFailedError on a reported failure.
+        """
+        await self.force_unlatch()
 
     async def _execute_command(
         self,
