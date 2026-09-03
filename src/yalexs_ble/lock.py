@@ -21,11 +21,11 @@ from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
-    VALUE_TO_AUTO_LOCK_MODE,
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_OPERATION_REMOTE_TYPE,
     VALUE_TO_LOCK_OPERATION_SOURCE,
     VALUE_TO_LOCK_STATUS,
+    VALUE_TO_OPERATION_ERROR,
     AutoLockMode,
     AutoLockState,
     BatteryState,
@@ -40,6 +40,7 @@ from .const import (
     LockOperationSource,
     LockStateValue,
     LockStatus,
+    OperationError,
     SettingType,
     StatusType,
 )
@@ -107,6 +108,68 @@ def convert_voltage_to_percentage(voltage: float) -> int:
     return AA_BATTERY_VOLTAGE_MAP[AA_BATTERY_VOLTAGE_LIST[pos]]
 
 
+def _settings_response_matcher(
+    command_value: int, setting_value: int
+) -> Callable[[bytes], bool]:
+    """Match the 0xBB settings frame answering one command/setting pair.
+
+    A settings command (READSETTING/WRITESETTING) is answered by two frames:
+    an 0xAA acknowledgment echoing the request, then the 0xBB frame carrying
+    the stored value. The acknowledgment's value field is zero, so completing
+    the solicited wait on it misreads every setting; the wait must hold out
+    for the 0xBB frame that echoes the command opcode and the setting id.
+    """
+
+    def matches(data: bytes) -> bool:
+        return (
+            len(data) >= 0x0C
+            and data[0x00] == 0xBB
+            and data[0x01] == command_value
+            and data[0x04] == setting_value
+        )
+
+    return matches
+
+
+def _poll_response_matcher(
+    opcode: int, subtype: int | None = None
+) -> Callable[[bytes], bool]:
+    """Match the 0xBB frame answering one status poll.
+
+    An answer carries the polled opcode in byte[1] and declares its own status
+    type in byte[4], which the poll compares against the one it asked for.
+
+    The plain wait accepts the first valid frame, so an unsolicited push
+    arriving mid-wait was taken as the poll answer and read at the offsets the
+    poll expected: a door-status push answering a battery poll had its door
+    byte read as a voltage, which is the recurring near-zero battery reading
+    seen in the field. Typing every status-poll wait keeps a foreign frame on
+    the state callback path where it belongs, and the response timeout is the
+    backstop for a poll the lock never answers. LOCK_ACTIVITY declares a record
+    type in byte[4] rather than a status type, so it matches on the opcode
+    alone; an acknowledgment carries back the request's own byte[4], which is
+    zero for that command and reads as a lock operation record, so requiring
+    the 0xBB frame keeps an acknowledgment out of that parser too.
+    auto_lock_status is a poll too, but it completes on its acknowledgment by
+    design (see its docstring), so it is not typed here.
+    """
+
+    def matches(data: bytes) -> bool:
+        return (
+            # The session gates every payload to a full frame ahead of decrypt,
+            # so this length check is unreachable through it. It is the
+            # matcher's own floor, for a caller with no session behind it, and
+            # it covers the highest byte the match reads, the subtype at 0x04.
+            # _settings_response_matcher above carries a floor of its own.
+            len(data) > 0x04
+            and data[0x00] == 0xBB
+            and data[0x01] == opcode
+            and (subtype is None or data[0x04] == subtype)
+        )
+
+    return matches
+
+
 class Lock:
     def __init__(
         self,
@@ -130,6 +193,11 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
+        # byte[15] of the most recent op-response: 0x00 success, non-zero =
+        # OperationError enum value (MECH_* = jam). None until the first op.
+        # Retained so a follow-up can expose the failure reason as a
+        # diagnostic.
+        self._last_op_error: int | None = None
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
@@ -240,31 +308,42 @@ class Lock:
         """Parse 0xBB prefixed responses."""
         command = state[1]
 
-        # Check for LOCK/UNLOCK command responses (0xBB + 0x0A/0x0B)
-        # These can contain actual status in byte[3] when operation fails/jams
-        if state[1] in (Commands.LOCK.value, Commands.UNLOCK.value) and len(state) > 3:
-            lock_status_byte = state[0x03]
-            if lock_status_byte in VALUE_TO_LOCK_STATUS:
-                return [VALUE_TO_LOCK_STATUS[lock_status_byte]], None
-
-        # Handle lock activity
+        # Op-response for LOCK/UNLOCK (0xBB + 0x0A/0x0B), emitted when the
+        # motor stops. The operation result is byte[15]: 0x00 = success,
+        # any non-zero = failure (0x1E-0x23 = MECH_* motor stall / jam).
+        if (
+            command in (Commands.LOCK.value, Commands.UNLOCK.value)
+            and len(state) > 0x0F
+        ):
+            result = state[0x0F]
+            self._last_op_error = result
+            if result != OperationError.COMM_SUCCESS:
+                error = VALUE_TO_OPERATION_ERROR.get(result)
+                _LOGGER.warning(
+                    "%s: Operation failed with result 0x%02X (%s)",
+                    self.name,
+                    result,
+                    error.name if error else "unknown",
+                )
+                return [LockStatus.JAMMED], None
+            return (), None  # success: recognized, no state update
         if command == Commands.LOCK_ACTIVITY.value:
             if parsed_activity := self._parse_lock_activity(state):
-                return None, [parsed_activity]
+                return (), [parsed_activity]
             return None, None
-
-        # Handle status commands
         if command == Commands.GETSTATUS.value:
             parsed_state = self._parse_status_response(state)
             return parsed_state, None
 
-        # Handle settings commands
         if (
-            command in (Commands.WRITESETTING.value, Commands.READSETTING.value)
+            command
+            in (
+                Commands.READSETTING.value,
+                Commands.WRITESETTING.value,
+            )
             and state[4] == SettingType.AUTOLOCK.value
         ):
             return [self._parse_auto_lock_state(state)], None
-
         return None, None
 
     def _parse_status_response(self, state: bytes) -> Iterable[LockStateValue] | None:
@@ -272,19 +351,13 @@ class Lock:
         status_type = state[4]
 
         if status_type == StatusType.LOCK_ONLY.value:
-            lock_status = state[0x08]
-            return [VALUE_TO_LOCK_STATUS.get(lock_status, LockStatus.UNKNOWN)]
-
+            return [self._parse_lock_status(state[0x08])]
         if status_type == StatusType.DOOR_ONLY.value:
-            door_status = state[0x08]
-            return [VALUE_TO_DOOR_STATUS.get(door_status, DoorStatus.UNKNOWN)]
-
+            return [self._parse_door_status(state[0x08])]
         if status_type == StatusType.DOOR_AND_LOCK.value:
             return self._parse_lock_and_door_state(state)
-
         if status_type == StatusType.BATTERY.value:
             return [self._parse_battery_state(state)]
-
         return None
 
     def _parse_aa_response(
@@ -302,19 +375,39 @@ class Lock:
         if command == Commands.LOCK.value:
             return [LockStatus.LOCKED], None
 
+        if command == Commands.UNLOCK.value:
+            return [LockStatus.UNLOCKED], None
+        if command == Commands.LOCK.value:
+            return [LockStatus.LOCKED], None
+        if command in (
+            Commands.READSETTING.value,
+            Commands.WRITESETTING.value,
+        ):
+            # ACK for a settings command (for example auto-lock, setting
+            # 0x28). It carries no state -- the value arrives in the 0xBB
+            # settings response -- so
+            # recognize and ignore it rather than logging "Unknown state".
+            # Kept specific to the settings opcodes so a new ACK type on
+            # another model still surfaces as an unknown frame.
+            return (), None
+
         return None, None
 
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
         _LOGGER.debug("%s: State changed: %s", self.name, state.hex())
         parsed_state, parsed_activity = self._parse_state(state)
+        if parsed_state is None and parsed_activity is None:
+            # Unrecognized frame - surface it for diagnosis.
+            _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
+
         if parsed_state is not None:
+            # Non-empty iterable - emit the state(s) to the consumer.
             self._state_callback(parsed_state)
+        # else: empty () - a recognized frame that carries no state update; ignore.
+
         if parsed_activity is not None and self._activity_callback is not None:
             self._activity_callback(parsed_activity)
-
-        if not parsed_state and not parsed_activity:
-            _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
 
     async def _setup_session(self) -> None:
         """Setup the session."""
@@ -387,7 +480,11 @@ class Lock:
                             .decode()
                             .split("\0")[0]
                         )
-                    except BleakError as err:
+                    # The read is radio input too: the BLE controller bug
+                    # noted above corrupts packets, so the bytes may not be
+                    # UTF-8. A bad read degrades to the fallback for that
+                    # characteristic, like a failed one.
+                    except (BleakError, UnicodeDecodeError) as err:
                         _LOGGER.warning(
                             "%s: Failed to read characteristic %s: %s",
                             self.name,
@@ -444,21 +541,42 @@ class Lock:
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
-        """Change the auto lock setting."""
+        """Change the auto lock setting (0x28).
+
+        The value is two little-endian uint16 timers laid consecutively at
+        [8:12]: the never-opened timer at [8:10] and the door-close timer at
+        [10:12]. Both zero = off; ``n`` in the never-opened timer alone =
+        instant with an ``n`` second delay; a timed relock sets both timers to
+        the same ``n`` seconds. There is no mode byte -- the mode is implied by
+        which timers are set, and the read side reports the never-opened timer
+        (see ``_parse_auto_lock_state``).
+        """
         _LOGGER.debug(
             "%s: Setting auto lock to mode=%d, dur=%d", self.name, mode, duration
         )
         assert self.session is not None  # nosec
-        if mode == AutoLockMode.OFF:
-            mode = AutoLockMode.INSTANT
-            duration = 0
+        if mode == AutoLockMode.OFF or duration == 0:
+            value = 0
+        elif not 1 <= duration <= 0xFFFE:
+            # Each timer is a uint16; cap conservatively below the field
+            # maximum.
+            raise ValueError(f"Auto lock duration out of range (1-65534): {duration}")
+        elif mode == AutoLockMode.TIMER:
+            value = duration | (duration << 16)
+        else:  # INSTANT
+            value = duration
 
         cmd = self.session.build_operation_command(
             Commands.WRITESETTING, SettingType.AUTOLOCK
         )
-        util._copy(cmd, util._int_to_bytes(duration, 2), destLocation=0x08)
-        cmd[0x0A] = mode
-        await self.session.execute(cmd, "set_auto_lock")
+        util._copy(cmd, util._int_to_bytes(value, 4), destLocation=0x08)
+        await self.session.execute(
+            cmd,
+            "set_auto_lock",
+            _settings_response_matcher(
+                Commands.WRITESETTING.value, SettingType.AUTOLOCK.value
+            ),
+        )
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
 
     async def securemode(self) -> None:
@@ -474,12 +592,22 @@ class Lock:
             await self.force_unlock()
 
     async def _execute_command(
-        self, opcode: int, cmd_byte: int, command_name: str
+        self,
+        opcode: int,
+        cmd_byte: int,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
     ) -> bytes:
+        # The matcher is passed in rather than built here from opcode and
+        # cmd_byte, because auto_lock_status uses this method too and has to
+        # stay untyped: it completes on its acknowledgment so that a lock with
+        # no auto lock support does not hold the wait open for the full
+        # response timeout. Building a matcher here would type that read as
+        # well.
         assert self.session is not None  # nosec
         command = self.session.build_operation_command(opcode, cmd_byte)
         _LOGGER.debug("%s: send: [%s] [%s]", self.name, command.hex(), hex(cmd_byte))
-        response = await self.session.execute(command, command_name)
+        response = await self.session.execute(command, command_name, response_matcher)
         _LOGGER.debug(
             "%s: response: [%s] [%s]", self.name, response.hex(), hex(cmd_byte)
         )
@@ -512,38 +640,66 @@ class Lock:
         return door_status_enum
 
     def _parse_auto_lock_state(self, response: bytes) -> AutoLockState:
-        """Parse the auto lock state from the response."""
-        duration = util._bytes_to_int(response[0x08:0x0A])
-        raw_mode = response[0x0A]
-        mode = VALUE_TO_AUTO_LOCK_MODE.get(raw_mode, AutoLockMode.OFF)
-        if raw_mode not in VALUE_TO_AUTO_LOCK_MODE:
-            _LOGGER.info(
-                "%s: Unrecognized auto lock mode code: %s", self.name, hex(raw_mode)
-            )
-        if mode == 0 and duration == 0:
-            # If both values are 0, auto lock is disabled
-            mode = AutoLockMode.OFF
-        return AutoLockState(mode, duration)
+        """Parse the auto lock state from a READSETTING (setting 0x28) response.
+
+        The auto-lock time is two little-endian uint16 timers laid
+        consecutively at ``response[8:12]``; there is no mode byte. The
+        never-opened timer is at [8:10] and the door-close timer at [10:12]. A
+        Timed relock sets both timers to the same seconds, so a non-zero
+        door-close timer signals Timed. A value with only the never-opened
+        timer set is Instant; both zero is off. The mode is derived from which
+        timers are set, never read from a wire byte.
+
+        The Timed decode reports the never-opened timer: it is the field the
+        app displays, and releases before the two-timer encoding stored the
+        user's seconds there, so those values read back as set. A zero
+        never-opened timer falls back to the door-close timer. A write derived
+        from this state sets both timers to the same value.
+        """
+        value = util._bytes_to_int(response[0x08:0x0C])
+        if value == 0:
+            return AutoLockState(AutoLockMode.OFF, 0)
+        never_opened = value & 0xFFFF
+        door_close = (value >> 16) & 0xFFFF
+        if door_close:
+            return AutoLockState(AutoLockMode.TIMER, never_opened or door_close)
+        return AutoLockState(AutoLockMode.INSTANT, never_opened)
 
     @raise_if_not_connected
     async def lock_status(self) -> LockStatus:
         _LOGGER.debug("%s: Executing lock_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
         response = await self._execute_command(
-            Commands.GETSTATUS, StatusType.LOCK_ONLY, "lock_status"
+            Commands.GETSTATUS,
+            StatusType.LOCK_ONLY,
+            "lock_status",
+            _poll_response_matcher(
+                Commands.GETSTATUS.value, StatusType.LOCK_ONLY.value
+            ),
         )
         _LOGGER.debug("%s: Finished executing lock_status", self.name)
-        return self._parse_lock_status(response[0x08])
+        # The answering frame was already decoded and logged on the notify
+        # path, so the bare lookup here keeps the unrecognized-code
+        # diagnostic to one line per frame.
+        return VALUE_TO_LOCK_STATUS.get(response[0x08], LockStatus.UNKNOWN)
 
     @raise_if_not_connected
     async def door_status(self) -> DoorStatus:
         _LOGGER.debug("%s: Executing door_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
         response = await self._execute_command(
-            Commands.GETSTATUS, StatusType.DOOR_ONLY, "door_status"
+            Commands.GETSTATUS,
+            StatusType.DOOR_ONLY,
+            "door_status",
+            _poll_response_matcher(
+                Commands.GETSTATUS.value, StatusType.DOOR_ONLY.value
+            ),
         )
         _LOGGER.debug("%s: Finished executing door_status", self.name)
-        return self._parse_door_status(response[0x08])
+        # The answering frame was already decoded and logged on the notify
+        # path, so the bare lookup here keeps the unrecognized-code
+        # diagnostic to one line per frame.
+        return VALUE_TO_DOOR_STATUS.get(response[0x08], DoorStatus.UNKNOWN)
 
     def _parse_battery_state(self, response: bytes) -> BatteryState:
         """Parse the battery state from the response."""
@@ -560,19 +716,32 @@ class Lock:
     async def battery(self) -> BatteryState:
         _LOGGER.debug("%s: Executing battery", self.name)
         response = await self._execute_command(
-            Commands.GETSTATUS, StatusType.BATTERY, "battery"
+            Commands.GETSTATUS,
+            StatusType.BATTERY,
+            "battery",
+            _poll_response_matcher(Commands.GETSTATUS.value, StatusType.BATTERY.value),
         )
         _LOGGER.debug("%s: Finished executing battery", self.name)
         return self._parse_battery_state(response)
 
     @raise_if_not_connected
-    async def auto_lock_status(self) -> AutoLockState:
+    async def auto_lock_status(self) -> None:
+        """Request the auto-lock setting.
+
+        The wait completes on the READSETTING acknowledgment, whose value field
+        is zero, so it carries no setting; there is nothing to return. The
+        stored setting arrives moments later as a 0xBB settings response on the
+        notify path, which the push layer decodes and applies. Waiting for that
+        settings response instead would stall the poll for the full write
+        timeout on a lock that never answers READSETTING (no auto-lock support).
+        """
         _LOGGER.debug("%s: Executing auto_lock_status", self.name)
-        response = await self._execute_command(
-            Commands.READSETTING, SettingType.AUTOLOCK, "auto_lock_status"
+        await self._execute_command(
+            Commands.READSETTING,
+            SettingType.AUTOLOCK,
+            "auto_lock_status",
         )
         _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
-        return self._parse_auto_lock_state(response)
 
     def _parse_unix_timestamp(self, timestamp_bytes: bytes) -> datetime:
         """Parse the unix timestamp to datetime from the bytes."""
@@ -673,7 +842,9 @@ class Lock:
         _LOGGER.debug("%s: Executing lock_activity", self.name)
         assert self.session is not None  # nosec
         response = await self.session.execute(
-            self.session.build_command(Commands.LOCK_ACTIVITY.value), "lock_activity"
+            self.session.build_command(Commands.LOCK_ACTIVITY.value),
+            "lock_activity",
+            _poll_response_matcher(Commands.LOCK_ACTIVITY.value),
         )
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
         return self._parse_lock_activity(response)

@@ -7,7 +7,11 @@ from bleak import BleakClient
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from . import util
-from .const import SECURE_READ_CHARACTERISTIC, SECURE_WRITE_CHARACTERISTIC
+from .const import (
+    RESPONSE_FRAME_LEN,
+    SECURE_READ_CHARACTERISTIC,
+    SECURE_WRITE_CHARACTERISTIC,
+)
 from .session import ResponseError, Session
 
 _LOGGER = logging.getLogger(__name__)
@@ -43,7 +47,7 @@ class SecureSession(Session):
         ).decryptor()
 
     def build_command(self, opcode: int) -> bytearray:
-        cmd = bytearray(0x12)
+        cmd = bytearray(RESPONSE_FRAME_LEN)
         cmd[0x00] = opcode
         cmd[0x10] = 0x0F
         cmd[0x11] = self.key_index

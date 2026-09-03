@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import struct
 import time
@@ -96,12 +97,22 @@ HK_UPDATE_COALESCE_SECONDS = 0.025
 MANUAL_UPDATE_COALESCE_SECONDS = 0.05
 
 # BLE connection parameters for always-connected mode (battery saving)
-# After the initial sync, we switch to slow intervals to conserve battery.
+# After the initial sync, we switch to a low duty cycle to conserve battery.
 # Values are in BLE units: intervals in 1.25ms, timeout in 10ms.
-SLOW_MIN_INTERVAL = 800  # 1000ms
-SLOW_MAX_INTERVAL = 800  # 1000ms
-SLOW_LATENCY = 0
-SLOW_TIMEOUT = 600  # 6000ms
+#
+# The idle duty cycle is set by peripheral latency, not by the interval: the
+# lock may skip up to SLOW_LATENCY connection events, so it wakes about every
+# (1 + SLOW_LATENCY) * interval = 510ms. Keeping the interval short means the
+# lock drops latency and drains its notifications at the base interval as soon
+# as it has something to send. Pinning min == max at a long interval instead
+# (1000ms) makes notification delivery, which is acknowledgement gated at one
+# frame per two connection events, take ~2s per frame; a lock operation's
+# three-frame reply then needs >6s to drain and the next command is issued
+# while the previous operation's frames are still arriving.
+SLOW_MIN_INTERVAL = 24  # 30ms
+SLOW_MAX_INTERVAL = 24  # 30ms
+SLOW_LATENCY = 16  # up to 16 skipped connection events (510ms)
+SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
@@ -112,6 +123,8 @@ UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
 
 RETRY_EXCEPTIONS = (ResponseError, *BLEAK_RETRY_EXCEPTIONS)
+
+RETRYABLE_EXCEPTIONS = (*RETRY_BACKOFF_EXCEPTIONS, *RETRY_EXCEPTIONS)
 
 # 255 seems to be broadcast randomly when
 # there is no update from the lock.
@@ -125,6 +138,37 @@ BATTERY_TIMEOUT_COOLDOWN = 300
 # How often to re-poll battery state in always_connected mode (10 minutes)
 BATTERY_REFRESH_INTERVAL = 600
 
+# How often to re-read the auto lock setting after a successful read (1 hour).
+# Auto lock is configuration state that changes rarely, so an hourly refresh
+# catches an out-of-band change while keeping the read off every keep-alive
+# cycle to save battery. Mirrors BATTERY_REFRESH_INTERVAL.
+AUTO_LOCK_READ_REFRESH_INTERVAL = 3600
+
+# How long to stop reading the auto lock setting after it goes unanswered
+# (24 hours). The state is in memory, so a large value means "until restart".
+# Longer than BATTERY_TIMEOUT_COOLDOWN because an unanswered read points to a
+# lock that does not support the setting, so a long quiet window is wanted.
+AUTO_LOCK_READ_FAILURE_BACKOFF = 86400
+
+# How many consecutive unanswered reads before backing off. Three in a row is
+# the signal the lock does not support the setting; a success resets the count.
+# Ack timeouts and response timeouts both count toward this one threshold.
+AUTO_LOCK_READ_FAILURE_THRESHOLD = 3
+
+# How long to wait for the 0xBB settings response after the READSETTING ack
+# before treating the read as unresolved. The ack completes the solicited wait;
+# the value follows moments later on the notify path. This must clear two bounds:
+# above SLOW_TIMEOUT (the 6s slow-connection supervision timeout, 600 in 10ms
+# units) so a slow but alive link is not struck before it could deliver, and
+# below KEEP_ALIVE_TIME so the next cycle sees it lapsed when the value never
+# comes. Mirrors the session command timeout.
+AUTO_LOCK_READ_RESPONSE_TIMEOUT = 10
+
+# Attempts for the on-demand auto lock write, fewer than DEFAULT_ATTEMPTS. The
+# write is user-initiated and confirmed by the lock's settings response, so a
+# lock that never confirms it should fail fast and report to the user.
+AUTO_LOCK_WRITE_ATTEMPTS = 2
+
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
 # exclusions
 NO_BATTERY_SUPPORT_MODELS = {
@@ -134,6 +178,10 @@ NO_BATTERY_SUPPORT_MODELS = {
 }
 
 AUTO_LOCK_DEFAULT_DURATION = 90
+
+# Statuses reported during calibration (0x01) and polarity discovery (0x06),
+# setup conditions that end at the lock by hand.
+SETUP_CONDITION_STATUSES = {LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06}
 
 
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
@@ -172,19 +220,24 @@ class AuthFailureHistory:
 _AUTH_FAILURE_HISTORY = AuthFailureHistory()
 
 
-def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
+def retry_bluetooth_connection_error(
+    func: WrapFuncType | None = None, *, attempts: int = DEFAULT_ATTEMPTS
+) -> Any:
     """
     Define a wrapper to retry on bleak error.
 
     The accessory is allowed to disconnect us any time so
-    we need to retry the operation.
+    we need to retry the operation. Use bare as
+    ``@retry_bluetooth_connection_error`` for the default attempt count, or
+    ``@retry_bluetooth_connection_error(attempts=N)`` to override it.
     """
+    if func is None:
+        return functools.partial(retry_bluetooth_connection_error, attempts=attempts)
 
     async def _async_wrap_retry_bluetooth_connection_error(
         self: PushLock, *args: Any, **kwargs: Any
     ) -> Any:
         _LOGGER.debug("%s: Starting retry loop", self.name)
-        attempts = DEFAULT_ATTEMPTS
         max_attempts = attempts - 1
 
         for attempt in range(attempts):
@@ -212,7 +265,7 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
                 # The lock cannot be found so there is no
                 # point in retrying.
                 raise
-            except RETRY_BACKOFF_EXCEPTIONS as err:
+            except RETRYABLE_EXCEPTIONS as err:
                 await self._async_handle_disconnected(err)
                 if attempt >= max_attempts:
                     _LOGGER.debug(
@@ -227,41 +280,21 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
                     if is_disconnected_error(err):
                         raise DisconnectedError(str(err)) from err
                     raise
+                # Backoff-class errors (BleakDBusError, DisconnectedError) get
+                # a brief pause so the BLE stack can settle before reconnecting.
+                backoff = 0.25 if isinstance(err, RETRY_BACKOFF_EXCEPTIONS) else 0
                 _LOGGER.debug(
-                    "%s: %s error calling %s, backing off %ss, retrying (%s/%s)...",
+                    "%s: %s error calling %s, retrying in %ss (%s/%s)...",
                     self.name,
                     type(err),
                     func,
-                    0.25,
+                    backoff,
                     attempt,
                     max_attempts,
                     exc_info=True,
                 )
-                await asyncio.sleep(0.25)
-            except RETRY_EXCEPTIONS as err:
-                await self._async_handle_disconnected(err)
-                if attempt >= max_attempts:
-                    _LOGGER.debug(
-                        "%s: %s error calling %s, reach max attempts (%s/%s)",
-                        self.name,
-                        type(err),
-                        func,
-                        attempt,
-                        max_attempts,
-                        exc_info=True,
-                    )
-                    if is_disconnected_error(err):
-                        raise DisconnectedError(str(err)) from err
-                    raise
-                _LOGGER.debug(
-                    "%s: %s error calling %s, retrying  (%s/%s)...",
-                    self.name,
-                    type(err),
-                    func,
-                    attempt,
-                    max_attempts,
-                    exc_info=True,
-                )
+                if backoff:
+                    await asyncio.sleep(backoff)
         return None
 
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
@@ -330,7 +363,7 @@ class PushLock:
             Callable[[LockState, LockInfo, ConnectionInfo], None]
         ] = []
         self._update_task: asyncio.Task[None] | None = None
-        self.loop = asyncio._get_running_loop()
+        self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
         self._client: Lock | None = None
         self._connect_lock = asyncio.Lock()
@@ -354,6 +387,25 @@ class PushLock:
         self._earliest_battery_attempt_time = NEVER_TIME
         # Scheduled battery refresh time (in always_connected mode)
         self._next_battery_refresh_time = NEVER_TIME
+        # Auto lock read backoff, mirroring the battery timers above. They
+        # persist across reconnects, so a lock that does not answer the read is
+        # left alone until its backoff lapses.
+        # Earliest next auto lock read after repeated unanswered reads.
+        self._earliest_auto_lock_read_time = NEVER_TIME
+        # Scheduled auto lock re-read time (in always_connected mode).
+        self._next_auto_lock_read_time = NEVER_TIME
+        # Consecutive auto lock reads whose READSETTING command timed out.
+        self._auto_lock_read_ack_failures = 0
+        # Consecutive auto lock reads that were acked but whose 0xBB value
+        # never arrived within the response window.
+        self._auto_lock_read_response_failures = 0
+        # Whether a read has been acked and is still waiting for its 0xBB value,
+        # and the deadline by which the value must arrive. Like the counts and
+        # timers above, these persist across reconnects so a lock that answers
+        # the ack but withholds the value still books its response timeout on the
+        # next connection rather than being re-asked forever.
+        self._awaiting_auto_lock_response = False
+        self._auto_lock_response_deadline = NEVER_TIME
         self._activity_manager = ActivityManager(PushLockBridge(self))
 
     @property
@@ -676,6 +728,9 @@ class PushLock:
             self._next_disconnect_delay = self._idle_disconnect_delay
             self._reset_disconnect_timer()
             self._seen_this_session.clear()
+            # None of the auto lock read state is reset here: the backoff timers,
+            # both failure counts, and the pending-response flag all persist
+            # across reconnects, so the hold outlives the connection.
             self._slow_params_set = False
             return self._client
 
@@ -722,8 +777,12 @@ class PushLock:
             await getattr(lock, op_attr)()
         except Exception as ex:
             self._update_any_state([LockStatus.UNKNOWN])
+            # The retry_bluetooth_connection_error wrapper calls
+            # _async_handle_disconnected for RETRY_EXCEPTIONS /
+            # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
+            # any other exception propagate without disconnecting.
             _LOGGER.debug(
-                "%s: Failed to execute lock operation due to %s, forcing disconnect",
+                "%s: Failed to execute lock operation due to %s",
                 self.name,
                 ex,
             )
@@ -748,7 +807,7 @@ class PushLock:
             if self.auto_lock and self.auto_lock.mode == AutoLockMode.OFF:
                 _LOGGER.debug("%s: Auto lock is already off", self.name)
                 return
-            await self._set_auto_lock(AutoLockMode.OFF, 0)
+            await self._set_auto_lock_or_warn(AutoLockMode.OFF, 0)
             return
 
         duration = AUTO_LOCK_DEFAULT_DURATION
@@ -757,7 +816,7 @@ class PushLock:
         elif self.auto_lock_prev and self.auto_lock_prev.mode != AutoLockMode.OFF:
             # If the auto lock is currently off, use the previous duration
             duration = self.auto_lock_prev.duration
-        await self._set_auto_lock(mode, duration)
+        await self._set_auto_lock_or_warn(mode, duration)
 
     async def set_auto_lock_duration(self, duration: int) -> None:
         """Set auto lock setting."""
@@ -765,7 +824,7 @@ class PushLock:
             if self.auto_lock and self.auto_lock.mode == AutoLockMode.OFF:
                 _LOGGER.debug("%s: Auto lock is already off", self.name)
                 return
-            await self._set_auto_lock(AutoLockMode.OFF, 0)
+            await self._set_auto_lock_or_warn(AutoLockMode.OFF, 0)
             return
 
         mode = AutoLockMode.TIMER
@@ -774,9 +833,24 @@ class PushLock:
         elif self.auto_lock_prev and self.auto_lock_prev.mode != AutoLockMode.OFF:
             # If the auto lock is currently off, use the previous mode
             mode = self.auto_lock_prev.mode
-        await self._set_auto_lock(mode, duration)
+        await self._set_auto_lock_or_warn(mode, duration)
 
-    @retry_bluetooth_connection_error
+    async def _set_auto_lock_or_warn(self, mode: AutoLockMode, duration: int) -> None:
+        """Set auto lock, surfacing a write the lock never confirmed."""
+        try:
+            await self._set_auto_lock(mode, duration)
+        except TimeoutError as err:
+            _LOGGER.warning(
+                "%s: Lock did not confirm the auto lock setting write "
+                "after %s attempts; the lock may not support auto lock",
+                self.name,
+                AUTO_LOCK_WRITE_ATTEMPTS,
+            )
+            raise TimeoutError(
+                f"{self.name}: Lock did not confirm the auto lock setting write"
+            ) from err
+
+    @retry_bluetooth_connection_error(attempts=AUTO_LOCK_WRITE_ATTEMPTS)
     async def _set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
         """Set auto lock setting."""
         if not self._running:
@@ -786,14 +860,30 @@ class PushLock:
         # Duration validation
         if duration not in self.auto_lock_durations:
             raise ValueError(f"Invalid auto lock duration: {duration}")
+        # Unlike lock/unlock/securemode, this path does not optimistically mutate
+        # _lock_state.auto_lock, so there is no prior value to restore on failure.
+        # Notify callbacks or the next poll surface the authoritative state.
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
             await lock.set_auto_lock(mode, duration)
+            # A confirmed write both proves the lock supports auto lock (clear
+            # any failure backoff) and changes the value: drop AutoLockState and
+            # both deadlines so the next update reads the new value straight
+            # back, confirming the write and refreshing the display.
+            self._auto_lock_read_ack_failures = 0
+            self._auto_lock_read_response_failures = 0
+            self._awaiting_auto_lock_response = False
+            self._earliest_auto_lock_read_time = NEVER_TIME
+            self._next_auto_lock_read_time = NEVER_TIME
+            self._seen_this_session.discard(AutoLockState)
         except Exception as ex:
+            # The retry_bluetooth_connection_error wrapper calls
+            # _async_handle_disconnected for RETRY_EXCEPTIONS /
+            # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
+            # any other exception propagate without disconnecting.
             _LOGGER.debug(
-                "%s: Failed to execute set auto lock operation due to %s, "
-                "forcing disconnect",
+                "%s: Failed to execute set auto lock operation due to %s",
                 self.name,
                 ex,
             )
@@ -833,28 +923,53 @@ class PushLock:
         original_lock_status = lock_state.lock
         changes: dict[str, Any] = {}
         for state in states:
-            state_type = type(state)
-            self._seen_this_session.add(state_type)
+            if isinstance(state, BatteryState) and state.voltage <= 3.0:
+                # A refused reading must not stand as seen, so _poll_battery
+                # can ask again; the cooldown paces that next ask.
+                self._seen_this_session.discard(BatteryState)
+                self._earliest_battery_attempt_time = (
+                    time.monotonic() + BATTERY_TIMEOUT_COOLDOWN
+                )
+                _LOGGER.warning(
+                    "%s: Battery voltage is impossible: %s; "
+                    "not asking again for %d seconds",
+                    self.name,
+                    state.voltage,
+                    BATTERY_TIMEOUT_COOLDOWN,
+                )
+                continue
+            self._seen_this_session.add(type(state))
             if isinstance(state, AuthState):
                 if lock_state.auth != state:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
                 if lock_state.lock != state:
+                    if state in SETUP_CONDITION_STATUSES:
+                        _LOGGER.warning(
+                            "%s: Lock reports %s, a setup condition that ends "
+                            "at the lock by hand",
+                            self.name,
+                            state,
+                        )
                     changes["lock"] = state
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
             elif isinstance(state, BatteryState):
-                if state.voltage <= 3.0:
-                    _LOGGER.debug(
-                        "%s: Battery voltage is impossible: %s",
-                        self.name,
-                        state.voltage,
-                    )
-                    continue
                 if lock_state.battery != state:
                     changes["battery"] = state
             elif isinstance(state, AutoLockState):
+                # The 0xBB settings response arriving here carries the stored
+                # value and is the success signal for the read backoff: clear
+                # both failure counts, disarm the pending-response deadline the
+                # ack armed, and arm the refresh timer where the value lands.
+                self._auto_lock_read_ack_failures = 0
+                self._auto_lock_read_response_failures = 0
+                self._awaiting_auto_lock_response = False
+                self._earliest_auto_lock_read_time = NEVER_TIME
+                self._next_auto_lock_read_time = (
+                    time.monotonic() + AUTO_LOCK_READ_REFRESH_INTERVAL
+                )
                 if lock_state.auto_lock != state:
                     changes["auto_lock"] = state
                     changes["auto_lock_prev"] = lock_state.auto_lock
@@ -874,6 +989,16 @@ class PushLock:
 
         self._callback_state(lock_state)
 
+    def _record_auth_success(self) -> None:
+        """Record a successful round trip with the lock.
+
+        Nothing else produces AuthState(successful=True); the latch in the
+        retry decorator is the only producer of the failure, so both reach the
+        consumer through _update_any_state, which drops a repeat.
+        """
+        _AUTH_FAILURE_HISTORY.auth_success(self.address)
+        self._update_any_state([AuthState(successful=True)])
+
     async def update(self) -> None:
         """Request that status be updated."""
         _LOGGER.debug("%s: Starting manual update", self.name)
@@ -887,16 +1012,14 @@ class PushLock:
         await self._update()
         _LOGGER.debug("%s: Finished validate", self.name)
 
-    async def _poll_battery(
-        self, lock: Lock, state: LockState
-    ) -> tuple[LockState, bool]:
-        """Poll battery if needed: periodic refresh, timeout cooldown, errors.
+    async def _poll_battery(self, lock: Lock) -> bool:
+        """Poll battery if needed: periodic refresh, cooldown, errors.
 
         Battery state requires a poll of the lock to update. In always_connected mode
         _seen_this_session never clears, so once the refresh deadline passes
         BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
 
-        Returns tuple of (updated_state, made_request).
+        Returns True if the lock was asked, whether or not it answered.
         """
         assert self._lock_info is not None  # nosec
         if self._lock_info.model in NO_BATTERY_SUPPORT_MODELS:
@@ -905,18 +1028,18 @@ class PushLock:
                 self.name,
                 self._lock_info.model,
             )
-            return state, False
+            return False
 
         now = time.monotonic()
-        # Skip while in cooldown after a prior battery timeout.
+        # Skip while in cooldown, after a read the lock did not answer or a
+        # reading that was thrown away.
         if now < self._earliest_battery_attempt_time:
             _LOGGER.debug(
-                "%s: Skipping battery request due to recent timeout "
-                "(cooldown until %.1fs)",
+                "%s: Skipping battery request; not asking again for %d seconds",
                 self.name,
                 self._earliest_battery_attempt_time - now,
             )
-            return state, False
+            return False
 
         # Periodic refresh: evict BatteryState once its deadline has passed.
         if (
@@ -926,16 +1049,11 @@ class PushLock:
         ):
             self._seen_this_session.discard(BatteryState)
         if BatteryState in self._seen_this_session:
-            return state, False
+            return False
 
         try:
-            battery_state = await lock.battery()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(
-                state, battery=battery_state, auth=AuthState(successful=True)
-            )
-            # Success: disable cooldown and schedule the next refresh.
-            self._earliest_battery_attempt_time = NEVER_TIME
+            await lock.battery()
+            self._record_auth_success()
             self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
         except TimeoutError as err:
             _LOGGER.info(
@@ -947,14 +1065,14 @@ class PushLock:
             )
             # Set cooldown to prevent repeated timeouts.
             self._earliest_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
-        except (BleakError, BleakDBusError) as err:
+        except BleakError as err:
             _LOGGER.debug(
                 "%s: Battery request failed (%s), continuing with other updates.",
                 self.name,
                 err,
             )
 
-        return state, True
+        return True
 
     async def _probe_lock_info(self, lock: Lock) -> LockInfo:
         """Probe the lock for info, falling back to defaults on failure."""
@@ -975,10 +1093,119 @@ class PushLock:
         _LOGGER.debug("Obtained lock info: %s", lock_info)
         return lock_info
 
+    def _arm_auto_lock_read_backoff_if_exhausted(self, now: float) -> bool:
+        """Arm the read backoff once the failure count hits the limit.
+
+        A lock shows one shape at a time -- either silent to the command (ack
+        timeouts) or acking without the value (response timeouts) -- so only one
+        counter grows. Summing them lets whichever it is trip the one threshold
+        after AUTO_LOCK_READ_FAILURE_THRESHOLD failures in a row.
+        """
+        total = (
+            self._auto_lock_read_ack_failures + self._auto_lock_read_response_failures
+        )
+        if total < AUTO_LOCK_READ_FAILURE_THRESHOLD:
+            return False
+        self._earliest_auto_lock_read_time = now + AUTO_LOCK_READ_FAILURE_BACKOFF
+        _LOGGER.info(
+            "%s: Auto lock setting request unresolved after %s attempts "
+            "(%s ack timeouts, %s response timeouts); the lock may not support "
+            "auto lock; not asking again for %d seconds",
+            self.name,
+            total,
+            self._auto_lock_read_ack_failures,
+            self._auto_lock_read_response_failures,
+            AUTO_LOCK_READ_FAILURE_BACKOFF,
+        )
+        self._auto_lock_read_ack_failures = 0
+        self._auto_lock_read_response_failures = 0
+        return True
+
+    async def _read_auto_lock_setting(self, lock: Lock) -> bool:
+        """Request the auto lock setting; return whether a read was issued.
+
+        Mirrors _poll_battery's two-timer backoff. The solicited wait returns
+        the READSETTING acknowledgment, whose value field is a fixed zero; the
+        stored setting arrives afterwards on the notify path as the 0xBB
+        settings response. Issue the read only to trigger that response, which
+        the notify path decodes and applies; its arrival is the success signal
+        that arms the refresh timer (see _update_any_state).
+
+        A lock that never gives the value back is caught two ways, both counting
+        toward AUTO_LOCK_READ_FAILURE_THRESHOLD. A lock silent to the command
+        times out on the ack; a lock that acks but withholds the 0xBB leaves the
+        response deadline armed, and the next cycle sees it lapse with the value
+        still unseen. Either way, after THRESHOLD failures in a row the read
+        backs off for AUTO_LOCK_READ_FAILURE_BACKOFF seconds. All of this state
+        lives outside the reconnect reset so it survives disconnects.
+        """
+        now = time.monotonic()
+        # Skip while backed off after repeated unanswered reads.
+        if now < self._earliest_auto_lock_read_time:
+            return False
+        # Resolve a read that was acked last cycle but is still waiting for its
+        # 0xBB value. The 0xBB clears this flag on the notify path the moment it
+        # lands, so if it is still set the value has not arrived.
+        if self._awaiting_auto_lock_response:
+            if now <= self._auto_lock_response_deadline:
+                # The value may still be in flight; do not re-read or strike.
+                return False
+            # Acked but the value never came: a response timeout, counted like
+            # an ack timeout. Fall through to re-read unless it armed the backoff.
+            self._awaiting_auto_lock_response = False
+            self._auto_lock_read_response_failures += 1
+            if self._arm_auto_lock_read_backoff_if_exhausted(now):
+                return False
+        # Periodic refresh: evict AutoLockState once its deadline has passed so
+        # the next cycle re-reads (always_connected only, as battery does).
+        if (
+            self._always_connected
+            and AutoLockState in self._seen_this_session
+            and now > self._next_auto_lock_read_time
+        ):
+            self._seen_this_session.discard(AutoLockState)
+        if AutoLockState in self._seen_this_session:
+            return False
+        try:
+            await lock.auto_lock_status()
+        except TimeoutError:
+            # Handle the timeout here, as _poll_battery does. A timeout that
+            # reaches _update's retry decorator is read as a lost connection and
+            # forces a reconnect; catching it locally keeps the connection up
+            # and the read on its backoff.
+            self._auto_lock_read_ack_failures += 1
+            self._arm_auto_lock_read_backoff_if_exhausted(now)
+            return False
+        except BleakError as err:
+            # Mirror _poll_battery: a transport fault leaves the backoff alone
+            # (only a timeout arms it) and the update continues. A persistent
+            # fault surfaces on a later status poll or the disconnect callback.
+            _LOGGER.debug(
+                "%s: Auto lock setting request failed (%s), "
+                "continuing with other updates.",
+                self.name,
+                err,
+            )
+            return False
+        # The ack arrived; expect the 0xBB value within the response window --
+        # unless it already landed on the notify path during the await (same
+        # loop turn), in which case AutoLockState is already seen and there is
+        # nothing to wait for, so do not arm a deadline for a value in hand.
+        if AutoLockState not in self._seen_this_session:
+            self._awaiting_auto_lock_response = True
+            self._auto_lock_response_deadline = now + AUTO_LOCK_READ_RESPONSE_TIMEOUT
+        return True
+
     @operation_lock
     @retry_bluetooth_connection_error
-    async def _update(self) -> LockState:
-        """Update the lock state."""
+    async def _update(self) -> None:
+        """Update the lock state.
+
+        Returns nothing. Every value this cycle asks for is applied as the
+        lock's answering frame arrives, so a returned state would be a second
+        reading, taken later than the one the callback already delivered. A
+        caller takes the state from the callback or from the properties.
+        """
         has_lock_info = self._lock_info is not None
 
         _LOGGER.debug(
@@ -987,14 +1214,12 @@ class PushLock:
         lock = await self._ensure_connected()
         if not self._lock_info:
             self._lock_info = await self._probe_lock_info(lock)
-        state = self._get_current_state()
-        made_request = False
 
+        # The reads below are issued here, and _update_any_state processes each
+        # answer, so the returned values are not used.
         # Asking for battery first seems to reduce the chance of the lock
         # getting into a bad state.
-        state, battery_requested = await self._poll_battery(lock, state)
-        if battery_requested:
-            made_request = True
+        made_request = await self._poll_battery(lock)
 
         if (
             DoorStatus not in self._seen_this_session
@@ -1002,20 +1227,12 @@ class PushLock:
             and self._lock_info.door_sense
         ):
             made_request = True
-            door_status = await lock.door_status()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, door=door_status, auth=AuthState(successful=True))
+            await lock.door_status()
+            self._record_auth_success()
 
-        if AutoLockState not in self._seen_this_session:
+        if await self._read_auto_lock_setting(lock):
             made_request = True
-            auto_lock_state = await lock.auto_lock_status()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(
-                state,
-                auto_lock=auto_lock_state,
-                auto_lock_prev=state.auto_lock,
-                auth=AuthState(successful=True),
-            )
+            self._record_auth_success()
 
         # Only ask for the lock status if we haven't seen
         # it this session since notify callbacks will happen
@@ -1028,38 +1245,14 @@ class PushLock:
             not made_request and self._always_connected
         ):
             made_request = True
-            lock_status = await lock.lock_status()
-            _AUTH_FAILURE_HISTORY.auth_success(self.address)
-            state = replace(state, lock=lock_status, auth=AuthState(successful=True))
+            await lock.lock_status()
+            self._record_auth_success()
 
         _LOGGER.debug("%s: Finished update", self.name)
 
-        # Prevent regression to UNKNOWN when notify callbacks updated state
-        # during awaited operations in this update cycle.
-        # Only overwrite lock/door if this update actually fetched a value.
-        cached_state = self._get_current_state()
-        if state.lock == LockStatus.UNKNOWN and cached_state.lock != LockStatus.UNKNOWN:
-            state = replace(state, lock=cached_state.lock)
-        if state.door == DoorStatus.UNKNOWN and cached_state.door != DoorStatus.UNKNOWN:
-            state = replace(state, door=cached_state.door)
-
-        self._callback_state(state)
-
-        if state.battery and state.battery.voltage <= 3.0:
-            _LOGGER.debug(
-                "%s: Battery voltage is impossible: %s",
-                self.name,
-                state.battery.voltage,
-            )
-            # If the battery voltage is impossible, reconnect.
-            await self._execute_forced_disconnect("impossible battery voltage")
-
-        if state.lock in (LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06):
-            _LOGGER.debug("%s: Lock is in an unknown state: %s", self.name, state.lock)
-            # If the lock is in a bad state, reconnect.
-            await self._execute_forced_disconnect(
-                f"lock is in unknown state: {state.lock}"
-            )
+        current = self._get_current_state()
+        # Notify consumers that the update is complete, even if nothing changed.
+        self._callback_state(current)
 
         self._activity_manager.schedule_activity_poll(
             LOCK_ACTIVITY_POLL_INITIAL_DELAY_DURING_UPDATE,
@@ -1074,7 +1267,6 @@ class PushLock:
         if made_request:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
-        return state
 
     def _conditionally_reset_disconnect(self, initially_had_lock_info: bool) -> None:
         if not initially_had_lock_info:
@@ -1154,25 +1346,42 @@ class PushLock:
         self.set_advertisement_data(ad)
         next_update = 0.0
         mfr_data = ad.manufacturer_data
-        if APPLE_MFR_ID in mfr_data:
-            first_byte = mfr_data[APPLE_MFR_ID][0]
+        # An empty payload is skipped rather than indexed: the advertisement is
+        # radio input and its length is not ours to assume. Each refusal is
+        # logged at debug — not INFO like the notify gate — because
+        # advertisements repeat every few seconds, so a chronic condition
+        # would flood any stronger level; debug keeps it diagnosable.
+        if apple_data := mfr_data.get(APPLE_MFR_ID):
+            first_byte = apple_data[0]
             if first_byte == HAP_FIRST_BYTE:
-                hk_state = get_homekit_state_num(mfr_data[APPLE_MFR_ID])
-                # Sometimes the yale data is glued on to the end of the HomeKit data
-                # but in that case it seems wrong so we don't process it
-                #
-                # if len(mfr_data[APPLE_MFR_ID]) > 20 and YALE_MFR_ID not in mfr_data:
-                # mfr_data[YALE_MFR_ID] = mfr_data[APPLE_MFR_ID][20:]
-                if self._last_hk_state == -1:
-                    # We haven't seen a HomeKit state yet so we schedule an update
-                    next_update = FIRST_UPDATE_COALESCE_SECONDS
-                elif hk_state != self._last_hk_state:
-                    next_update = HK_UPDATE_COALESCE_SECONDS
-                self._last_hk_state = hk_state
+                if (hk_state := get_homekit_state_num(apple_data)) is None:
+                    _LOGGER.debug(
+                        "%s: %d-byte HomeKit advertisement ends before its"
+                        " state record; skipped",
+                        self.name,
+                        len(apple_data),
+                    )
+                else:
+                    # Sometimes the yale data is glued on to the end of the
+                    # HomeKit data but in that case it seems wrong so we
+                    # don't process it
+                    #
+                    # if len(mfr_data[APPLE_MFR_ID]) > 20
+                    #     and YALE_MFR_ID not in mfr_data:
+                    # mfr_data[YALE_MFR_ID] = mfr_data[APPLE_MFR_ID][20:]
+                    if self._last_hk_state == -1:
+                        # We haven't seen a HomeKit state yet so we schedule
+                        # an update
+                        next_update = FIRST_UPDATE_COALESCE_SECONDS
+                    elif hk_state != self._last_hk_state:
+                        next_update = HK_UPDATE_COALESCE_SECONDS
+                    self._last_hk_state = hk_state
             elif first_byte == HAP_ENCRYPTED_FIRST_BYTE:
                 # Encrypted data, we don't know how to decrypt it
                 # but we know its a state change so we schedule an update
                 next_update = HK_UPDATE_COALESCE_SECONDS
+        elif APPLE_MFR_ID in mfr_data:
+            _LOGGER.debug("%s: Empty HomeKit advertisement payload; skipped", self.name)
         # Yale YALE_MFR_ID advertisements come in two formats:
         # - 1-byte: lock state toggle (0/1), used for change detection
         # - 18-byte: 2 header bytes + the lock's 16-byte cloud ID (the
@@ -1183,10 +1392,11 @@ class PushLock:
         # static 0x00 header of the 18-byte format causes repeated
         # connections if it differs from the 1-byte value.
         is_first_advertisement = self._last_adv_value == -1
-        if YALE_MFR_ID in mfr_data and (
-            len(mfr_data[YALE_MFR_ID]) == 1 or is_first_advertisement
+        # As above, an empty payload is skipped rather than indexed.
+        if (yale_data := mfr_data.get(YALE_MFR_ID)) and (
+            len(yale_data) == 1 or is_first_advertisement
         ):
-            current_value = mfr_data[YALE_MFR_ID][0]
+            current_value = yale_data[0]
             if not next_update:
                 if is_first_advertisement:
                     # We haven't seen a valid value yet so we schedule an update
@@ -1197,6 +1407,8 @@ class PushLock:
                 ):
                     next_update = ADV_UPDATE_COALESCE_SECONDS
             self._last_adv_value = current_value
+        elif YALE_MFR_ID in mfr_data and not mfr_data[YALE_MFR_ID]:
+            _LOGGER.debug("%s: Empty Yale advertisement payload; skipped", self.name)
         if adv_debug_enabled:
             scheduled_update = None
             if self._cancel_deferred_update:
@@ -1256,7 +1468,15 @@ class PushLock:
         """Execute a background task."""
         task: asyncio.Task[Any] = asyncio.create_task(fut)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.remove)
+        task.add_done_callback(self._on_background_task_done)
+
+    def _on_background_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Remove finished task and log unexpected exceptions."""
+        self._background_tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            _LOGGER.error(
+                "%s: Background task failed: %s", self.name, exc, exc_info=exc
+            )
 
     async def wait_for_first_update(self, timeout: float) -> None:
         """Wait for the first update."""
@@ -1393,7 +1613,19 @@ class PushLock:
             _LOGGER.exception("%s: Unknown error updating", self.name)
 
 
-def get_homekit_state_num(data: bytes) -> int:
-    """Get the homekit state number from the manufacturer data."""
-    _acid, gsn, _cn, _cv = struct.unpack("<HHBB", data[9:15])
+# The HomeKit state record inside the advertisement payload: acid, the global
+# state number, cn, cv, starting at byte 9.
+_HAP_STATE_RECORD = struct.Struct("<HHBB")
+_HAP_STATE_RECORD_OFFSET = 9
+
+
+def get_homekit_state_num(data: bytes) -> int | None:
+    """Get the homekit state number from the manufacturer data.
+
+    Returns None when the payload ends before the record does: the
+    advertisement is radio input and its length is not ours to assume.
+    """
+    if len(data) < _HAP_STATE_RECORD_OFFSET + _HAP_STATE_RECORD.size:
+        return None
+    _acid, gsn, _cn, _cv = _HAP_STATE_RECORD.unpack_from(data, _HAP_STATE_RECORD_OFFSET)
     return gsn

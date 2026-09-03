@@ -102,6 +102,10 @@ We like to have the pull request open as soon as possible, that's a great place 
 2. Update the documentation for significant features.
 3. Ensure tests are passing on CI.
 
+## Licensing
+
+This project is licensed under the Apache 2.0 license. By opening a pull request you agree that your contribution, and all of your previous contributions to this project, are licensed under Apache 2.0.
+
 ## Tips
 
 To run a subset of tests:

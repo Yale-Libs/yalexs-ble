@@ -1,9 +1,9 @@
 [project]
 name = "yalexs-ble"
-version = "3.4.0"
+version = "4.0.5"
 description = "Bluetooth control of Yale and August locks"
 authors = [{ name = "J. Nick Koston", email = "nick@koston.org" }]
-license = "GPL-3.0-only"
+license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["classifiers", "dependencies"]
@@ -31,7 +31,7 @@ python = ">=3.11,<3.15"
 
 # Documentation Dependencies
 bleak = ">=3.0.2"
-bleak-retry-connector = ">=4.6.1"
+bleak-retry-connector = ">=4.6.3"
 async-timeout = {version = ">=3.0.0", python = "<3.11"}
 cryptography = ">=48.0.1"
 lru-dict = ">=1.1.4"
@@ -66,6 +66,9 @@ exclude_lines = [
 [tool.isort]
 profile = "black"
 known_first_party = ["yalexs_ble", "tests"]
+
+[tool.codespell]
+ignore-words-list = "yur"
 
 [tool.mypy]
 check_untyped_defs = true
@@ -105,6 +108,7 @@ ignore = [
     "PLR0912", # too many to fix right now
     "TID252", # skip
     "PLR0913", # too late to make changes here
+    "PLR0917", # too late to make changes here
     "PLR0911", # would be breaking change
     "TRY003", # too many to fix
     "SLF001", # design choice
