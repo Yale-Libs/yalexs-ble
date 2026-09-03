@@ -34,6 +34,7 @@ from .const import (
     DoorStatus,
     LockActivity,
     LockActivityType,
+    LockActivityValue,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
@@ -179,6 +180,7 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        activity_callback: Callable[[Iterable[LockActivityValue]], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -199,6 +201,7 @@ class Lock:
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
+        self._activity_callback = activity_callback
 
     def set_name(self, name: str) -> None:
         self.name = name
@@ -283,73 +286,128 @@ class Lock:
         await client.clear_cache()
         raise BleakError(f"Missing characteristic {char_uuid}")
 
-    def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
+    def _parse_state(
+        self, state: bytes
+    ) -> tuple[
+        Iterable[LockStateValue] | None,
+        Iterable[LockActivityValue] | None,
+    ]:
+        """Parse state data from lock response."""
         if state[0] == 0xBB:
-            # Op-response for LOCK/UNLOCK (0xBB + 0x0A/0x0B), emitted when the
-            # motor stops. The operation result is byte[15]: 0x00 = success,
-            # any non-zero = failure (0x1E-0x23 = MECH_* motor stall / jam).
-            if (
-                state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
-                and len(state) > 0x0F
-            ):
-                result = state[0x0F]
-                self._last_op_error = result
-                if result != OperationError.COMM_SUCCESS:
-                    error = VALUE_TO_OPERATION_ERROR.get(result)
-                    _LOGGER.warning(
-                        "%s: Operation failed with result 0x%02X (%s)",
-                        self.name,
-                        result,
-                        error.name if error else "unknown",
-                    )
-                    return [LockStatus.JAMMED]
-                return ()  # success: recognized, no state update
-            if state[1] == Commands.LOCK_ACTIVITY.value:
-                return ()  # Ignore lock activity as these are historical events
-            if state[1] == Commands.GETSTATUS.value:
-                if state[4] == StatusType.LOCK_ONLY.value:
-                    return [self._parse_lock_status(state[0x08])]
-                if state[4] == StatusType.DOOR_ONLY.value:
-                    return [self._parse_door_status(state[0x08])]
-                if state[4] == StatusType.DOOR_AND_LOCK.value:
-                    return self._parse_lock_and_door_state(state)
-                if state[4] == StatusType.BATTERY.value:
-                    return [self._parse_battery_state(state)]
-            elif (
-                state[1] == Commands.WRITESETTING.value
-                or state[1] == Commands.READSETTING.value
-            ):
-                if state[4] == SettingType.AUTOLOCK.value:
-                    return [self._parse_auto_lock_state(state)]
-        elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                return [LockStatus.UNLOCKED]
-            if state[1] == Commands.LOCK.value:
-                return [LockStatus.LOCKED]
-            if state[1] in (
+            return self._parse_bb_response(state)
+        if state[0] == 0xAA:
+            return self._parse_aa_response(state)
+        return None, None
+
+    def _parse_bb_response(
+        self, state: bytes
+    ) -> tuple[
+        Iterable[LockStateValue] | None,
+        Iterable[LockActivityValue] | None,
+    ]:
+        """Parse 0xBB prefixed responses."""
+        command = state[1]
+
+        # Op-response for LOCK/UNLOCK (0xBB + 0x0A/0x0B), emitted when the
+        # motor stops. The operation result is byte[15]: 0x00 = success,
+        # any non-zero = failure (0x1E-0x23 = MECH_* motor stall / jam).
+        if (
+            command in (Commands.LOCK.value, Commands.UNLOCK.value)
+            and len(state) > 0x0F
+        ):
+            result = state[0x0F]
+            self._last_op_error = result
+            if result != OperationError.COMM_SUCCESS:
+                error = VALUE_TO_OPERATION_ERROR.get(result)
+                _LOGGER.warning(
+                    "%s: Operation failed with result 0x%02X (%s)",
+                    self.name,
+                    result,
+                    error.name if error else "unknown",
+                )
+                return [LockStatus.JAMMED], None
+            return (), None  # success: recognized, no state update
+        if command == Commands.LOCK_ACTIVITY.value:
+            if parsed_activity := self._parse_lock_activity(state):
+                return (), [parsed_activity]
+            return None, None
+        if command == Commands.GETSTATUS.value:
+            parsed_state = self._parse_status_response(state)
+            return parsed_state, None
+
+        if (
+            command
+            in (
                 Commands.READSETTING.value,
                 Commands.WRITESETTING.value,
-            ):
-                # ACK for a settings command (for example auto-lock, setting
-                # 0x28). It carries no state -- the value arrives in the 0xBB
-                # settings response -- so
-                # recognize and ignore it rather than logging "Unknown state".
-                # Kept specific to the settings opcodes so a new ACK type on
-                # another model still surfaces as an unknown frame.
-                return ()
+            )
+            and state[4] == SettingType.AUTOLOCK.value
+        ):
+            return [self._parse_auto_lock_state(state)], None
+        return None, None
+
+    def _parse_status_response(self, state: bytes) -> Iterable[LockStateValue] | None:
+        """Parse GETSTATUS command responses."""
+        status_type = state[4]
+
+        if status_type == StatusType.LOCK_ONLY.value:
+            return [self._parse_lock_status(state[0x08])]
+        if status_type == StatusType.DOOR_ONLY.value:
+            return [self._parse_door_status(state[0x08])]
+        if status_type == StatusType.DOOR_AND_LOCK.value:
+            return self._parse_lock_and_door_state(state)
+        if status_type == StatusType.BATTERY.value:
+            return [self._parse_battery_state(state)]
         return None
+
+    def _parse_aa_response(
+        self, state: bytes
+    ) -> tuple[
+        Iterable[LockStateValue] | None,
+        Iterable[LockActivityValue] | None,
+    ]:
+        """Parse 0xAA prefixed responses (direct lock/unlock commands)."""
+        command = state[1]
+
+        if command == Commands.UNLOCK.value:
+            return [LockStatus.UNLOCKED], None
+
+        if command == Commands.LOCK.value:
+            return [LockStatus.LOCKED], None
+
+        if command == Commands.UNLOCK.value:
+            return [LockStatus.UNLOCKED], None
+        if command == Commands.LOCK.value:
+            return [LockStatus.LOCKED], None
+        if command in (
+            Commands.READSETTING.value,
+            Commands.WRITESETTING.value,
+        ):
+            # ACK for a settings command (for example auto-lock, setting
+            # 0x28). It carries no state -- the value arrives in the 0xBB
+            # settings response -- so
+            # recognize and ignore it rather than logging "Unknown state".
+            # Kept specific to the settings opcodes so a new ACK type on
+            # another model still surfaces as an unknown frame.
+            return (), None
+
+        return None, None
 
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
         _LOGGER.debug("%s: State changed: %s", self.name, state.hex())
-        parsed_state = self._parse_state(state)
-        if parsed_state is None:
+        parsed_state, parsed_activity = self._parse_state(state)
+        if parsed_state is None and parsed_activity is None:
             # Unrecognized frame - surface it for diagnosis.
             _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
-        elif parsed_state:
+
+        if parsed_state is not None:
             # Non-empty iterable - emit the state(s) to the consumer.
             self._state_callback(parsed_state)
         # else: empty () - a recognized frame that carries no state update; ignore.
+
+        if parsed_activity is not None and self._activity_callback is not None:
+            self._activity_callback(parsed_activity)
 
     async def _setup_session(self) -> None:
         """Setup the session."""
