@@ -1,6 +1,7 @@
 from bleak_retry_connector import close_stale_connections_by_address
 
 from .const import (
+    MANUAL_INTERVENTION_STATUSES,
     AutoLockMode,
     ConnectionInfo,
     DoorStatus,
@@ -11,7 +12,14 @@ from .const import (
 )
 from .lock import Lock
 from .push import PushLock
-from .session import AuthError, DisconnectedError, YaleXSBLEError
+from .session import (
+    AuthError,
+    DisconnectedError,
+    OperationFailedError,
+    OperationIncompleteError,
+    UnlatchError,
+    YaleXSBLEError,
+)
 from .util import (
     ValidatedLockConfig,
     local_name_is_unique,
@@ -24,6 +32,7 @@ from .util import (
 __version__ = "4.0.5"
 
 __all__ = [
+    "MANUAL_INTERVENTION_STATUSES",
     "AuthError",
     "AutoLockMode",
     "ConnectionInfo",
@@ -33,7 +42,10 @@ __all__ = [
     "LockInfo",
     "LockState",
     "LockStatus",
+    "OperationFailedError",
+    "OperationIncompleteError",
     "PushLock",
+    "UnlatchError",
     "ValidatedLockConfig",
     "YaleXSBLEDiscovery",
     "YaleXSBLEError",
