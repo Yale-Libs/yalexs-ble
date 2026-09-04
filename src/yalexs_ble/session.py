@@ -418,11 +418,16 @@ class Session:
         except Exception:
             _LOGGER.exception("%s: Disconnect after a failed write raised", self.name)
 
+    @property
+    def write_failed(self) -> bool:
+        """Return True once a write on this session has raised while the link was up."""
+        return self._disconnect_task is not None
+
     def _check_link_for_write(self) -> None:
         """Raise if the link is down or a write on this session has failed."""
         if not self.client.is_connected:
             raise DisconnectedError(f"{self.name}: disconnected")
-        if self._disconnect_task is not None:
+        if self.write_failed:
             raise DisconnectedError(f"{self.name}: a write on this session failed")
 
     async def _locked_write(

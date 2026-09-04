@@ -52,6 +52,8 @@ from yalexs_ble.push import (
     AUTO_LOCK_WRITE_ATTEMPTS,
     BATTERY_REFRESH_INTERVAL,
     BATTERY_TIMEOUT_COOLDOWN,
+    COMBINED_STATUS_POLL_FAILURE_BACKOFF,
+    COMBINED_STATUS_POLL_FAILURE_THRESHOLD,
     DEFAULT_ATTEMPTS,
     DISCONNECT_DELAY,
     HAP_FIRST_BYTE,
@@ -128,6 +130,20 @@ def publishing_read(push_lock: PushLock, *states: Any) -> AsyncMock:
         push_lock._state_callback(list(states))
 
     return AsyncMock(side_effect=_read)
+
+
+def _stub_status_polls(
+    mock_lock: MagicMock,
+    push_lock: PushLock,
+    lock: LockStatus = LockStatus.LOCKED,
+    door: DoorStatus = DoorStatus.CLOSED,
+) -> MagicMock:
+    """Answer lock_status(), door_status() and lock_and_door_status() as a lock does."""
+    mock_lock.lock_status = publishing_read(push_lock, lock)
+    mock_lock.door_status = publishing_read(push_lock, door)
+    mock_lock.lock_and_door_status = publishing_read(push_lock, lock, door)
+    mock_lock.session = MagicMock(write_failed=False)
+    return mock_lock
 
 
 @pytest.mark.asyncio
@@ -455,16 +471,7 @@ async def test_background_task_done_callback_is_idempotent():
 
 @pytest.mark.asyncio
 async def test_update_continues_after_battery_timeout():
-    """
-    Test that _update() continues and completes successfully
-    even when battery() times out.
-
-    Requirements:
-    - battery() timeout does not fail entire update
-    - lock_status/door_status/auto_lock_status still get called
-    - the display has valid lock/door values (not UNKNOWN)
-    - no forced disconnect due to battery timeout
-    """
+    """A battery request timeout does not end the update or its other requests."""
 
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
@@ -482,9 +489,8 @@ async def test_update_continues_after_battery_timeout():
     mock_lock.battery = AsyncMock(side_effect=TimeoutError("Battery timeout"))
 
     # But other calls succeed
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    _stub_status_polls(mock_lock, push_lock)
     mock_lock.auto_lock_status = AsyncMock()
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
 
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
@@ -508,9 +514,8 @@ async def test_update_continues_after_battery_timeout():
         mock_lock.battery.assert_called_once()
 
         # Other status calls still happened
-        mock_lock.door_status.assert_called_once()
         mock_lock.auto_lock_status.assert_called_once()
-        mock_lock.lock_status.assert_called_once()
+        mock_lock.lock_and_door_status.assert_called_once()
 
         # The display has valid lock/door (from the successful calls)
         assert push_lock.lock_status == LockStatus.LOCKED
@@ -1004,8 +1009,7 @@ async def test_update_sets_slow_connection_params_when_always_connected():
     mock_lock.battery = publishing_read(
         push_lock, BatteryState(voltage=5.5, percentage=95)
     )
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    _stub_status_polls(mock_lock, push_lock)
     mock_lock.auto_lock_status = AsyncMock()
 
     push_lock._lock_info = TEST_LOCK_INFO
@@ -1064,8 +1068,7 @@ async def test_update_does_not_set_connection_params_when_not_always_connected()
     mock_lock.battery = publishing_read(
         push_lock, BatteryState(voltage=5.5, percentage=95)
     )
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    _stub_status_polls(mock_lock, push_lock)
     mock_lock.auto_lock_status = AsyncMock()
 
     push_lock._lock_info = TEST_LOCK_INFO
@@ -1107,8 +1110,7 @@ async def test_update_handles_connection_params_failure():
     mock_lock.battery = publishing_read(
         push_lock, BatteryState(voltage=5.5, percentage=95)
     )
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    _stub_status_polls(mock_lock, push_lock)
     mock_lock.auto_lock_status = AsyncMock()
 
     push_lock._lock_info = TEST_LOCK_INFO
@@ -1146,8 +1148,7 @@ async def test_battery_refresh_clears_seen_and_repoll_when_due():
     battery_state = BatteryState(voltage=4.0, percentage=90)
     mock_lock = MagicMock()
     mock_lock.battery = publishing_read(push_lock, battery_state)
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    _stub_status_polls(mock_lock, push_lock)
     mock_lock.auto_lock_status = AsyncMock()
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
@@ -1197,8 +1198,7 @@ async def test_battery_refresh_not_due_skips_repoll():
 
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock()
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    _stub_status_polls(mock_lock, push_lock)
     mock_lock.auto_lock_status = AsyncMock()
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
@@ -1243,8 +1243,7 @@ async def test_battery_refresh_does_not_fire_when_not_always_connected():
 
     mock_lock = MagicMock()
     mock_lock.battery = AsyncMock()
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    _stub_status_polls(mock_lock, push_lock)
     mock_lock.auto_lock_status = AsyncMock()
     mock_lock.client = MagicMock()
     mock_lock.client.set_connection_params = AsyncMock()
@@ -2225,9 +2224,8 @@ async def test_auto_lock_read_timeout_does_not_propagate_out_of_update() -> None
     mock_lock.battery = publishing_read(
         push_lock, BatteryState(voltage=6.0, percentage=80)
     )
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    _stub_status_polls(mock_lock, push_lock)
     mock_lock.auto_lock_status = AsyncMock(side_effect=TimeoutError)
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
 
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
@@ -2874,11 +2872,10 @@ async def test_a_lock_state_outside_the_status_sets_shows_on_both_locks_and_is_p
     )
 
     push_lock._seen_this_session.update({DoorStatus, BatteryState, AutoLockState})
-    mock_lock = MagicMock()
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    mock_lock = _stub_status_polls(MagicMock(), push_lock)
     await _run_update(push_lock, mock_lock)
 
-    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_awaited_once()
 
 
 def test_lock_status_names_every_vendor_lock_state() -> None:
@@ -2912,7 +2909,7 @@ async def test_update_does_not_reconnect_on_a_setup_condition(
     push_lock._running = True
 
     mock_lock = _auto_lock_update_lock(push_lock, AsyncMock(return_value=None))
-    mock_lock.lock_status = publishing_read(push_lock, reported)
+    _stub_status_polls(mock_lock, push_lock, lock=reported)
 
     with (
         caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
@@ -3199,9 +3196,7 @@ async def test_a_cycle_that_changed_nothing_still_reports() -> None:
     published: list[LockState] = []
     push_lock.register_callback(lambda state, info, conn: published.append(state))
 
-    mock_lock = MagicMock()
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    mock_lock = _stub_status_polls(MagicMock(), push_lock)
     mock_lock.auto_lock_status = AsyncMock(return_value=None)
     mock_lock.battery = AsyncMock()
 
@@ -3214,8 +3209,8 @@ async def test_a_cycle_that_changed_nothing_still_reports() -> None:
     push_lock._running = False
     push_lock._cancel_disconnect_timer()
 
-    # The lock status was re-read and matched, so no field changed.
-    mock_lock.lock_status.assert_awaited_once()
+    # The combined poll answered with the lock status already held, so no field changed.
+    mock_lock.lock_and_door_status.assert_awaited_once()
     assert push_lock.lock_status is LockStatus.LOCKED
     # The cycle still reported exactly once.
     assert len(published) == 1
@@ -3223,16 +3218,24 @@ async def test_a_cycle_that_changed_nothing_still_reports() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("address", "unseen", "read_name", "answer"),
+    ("address", "unseen", "read_name", "answer", "combined_backed_off"),
     [
-        ("aa:bb:cc:dd:ee:31", DoorStatus, "door_status", DoorStatus.OPENED),
+        ("aa:bb:cc:dd:ee:31", DoorStatus, "door_status", DoorStatus.OPENED, True),
         (
             "aa:bb:cc:dd:ee:32",
             AutoLockState,
             "auto_lock_status",
             AutoLockState(mode=AutoLockMode.TIMER, duration=30),
+            False,
         ),
-        ("aa:bb:cc:dd:ee:33", LockStatus, "lock_status", LockStatus.LOCKED),
+        ("aa:bb:cc:dd:ee:33", LockStatus, "lock_status", LockStatus.LOCKED, True),
+        (
+            "aa:bb:cc:dd:ee:d0",
+            LockStatus,
+            "lock_and_door_status",
+            LockStatus.LOCKED,
+            False,
+        ),
     ],
 )
 async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
@@ -3240,6 +3243,7 @@ async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
     unseen: type,
     read_name: str,
     answer: Any,
+    combined_backed_off: bool,
 ) -> None:
     """A read that answers is a successful round trip, at each site that issues one.
 
@@ -3247,18 +3251,25 @@ async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
     exactly the read that fetches it and no other. An answer applies
     AuthState(successful=True) and clears the consecutive-failure count that
     arms the reauth latch, whichever read it was.
+
+    The door_status and lock_status rows back the combined poll off, because on
+    this running lock with a door sensor it would otherwise read both.
     """
     push_lock = _named_push_lock(address, always_connected=False)
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
     push_lock._advertisement_data = _advertisement({})
+    if combined_backed_off:
+        push_lock._earliest_combined_status_poll_time = (
+            time.monotonic() + COMBINED_STATUS_POLL_FAILURE_BACKOFF
+        )
 
     # At the reauth latch, so a reset is observable.
     for _ in range(AUTH_FAILURE_TO_START_REAUTH):
         _AUTH_FAILURE_HISTORY.auth_failed(address)
     assert _AUTH_FAILURE_HISTORY.should_raise(address) is True
 
-    reads = {"door_status", "auto_lock_status", "lock_status"}
+    reads = {"door_status", "auto_lock_status", "lock_status", "lock_and_door_status"}
     for seen in {LockStatus, DoorStatus, BatteryState, AutoLockState} - {unseen}:
         push_lock._seen_this_session.add(seen)
 
@@ -4431,11 +4442,11 @@ async def test_activity_drain_replaces_the_keep_alive_status_poll() -> None:
     push_lock._always_connected = True
     push_lock._next_battery_refresh_time = time.monotonic() + 1000
     push_lock._next_auto_lock_read_time = time.monotonic() + 1000
-    mock_lock.lock_status = AsyncMock()
+    mock_lock.lock_and_door_status = AsyncMock()
     await _run_update(push_lock, mock_lock)
-    mock_lock.lock_status.assert_not_awaited()
+    mock_lock.lock_and_door_status.assert_not_awaited()
     await _run_update(push_lock, mock_lock)
-    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -6202,7 +6213,7 @@ async def test_a_failed_battery_write_leaves_the_next_command_a_fresh_connection
 
     assert client.write_gatt_char.await_count == 1
     fresh.connect.assert_awaited_once()
-    fresh.lock_status.assert_awaited_once()
+    fresh.lock_and_door_status.assert_awaited_once()
 
 
 def _write_delivering(
@@ -7387,7 +7398,7 @@ async def test_a_cancel_leaves_a_reported_jam_on_display() -> None:
     ):
         await _run_update(push_lock, mock_lock)
 
-    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_awaited_once()
     assert push_lock.lock_status == LockStatus.JAMMED
 
 
@@ -7454,9 +7465,7 @@ async def test_execute_lock_operation_hands_the_hooks_to_the_operation():
 
 def _answering_lock(push_lock: PushLock) -> MagicMock:
     """A mock Lock whose reads publish through the state callback before returning."""
-    mock_lock = MagicMock()
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
-    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    mock_lock = _stub_status_polls(MagicMock(), push_lock)
     mock_lock.battery = publishing_read(
         push_lock, BatteryState(voltage=6.0, percentage=80)
     )
@@ -7500,7 +7509,7 @@ async def test_failed_operation_leaves_the_status_poll_armed() -> None:
     ):
         await push_lock._update()
 
-    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_awaited_once()
     # Read _lock_state: mypy narrowed lock_status from the earlier assert.
     final_state = push_lock._lock_state
     assert final_state is not None
@@ -7546,7 +7555,7 @@ async def test_cancelled_operation_leaves_the_status_poll_armed() -> None:
 
         await push_lock._update()
 
-    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_awaited_once()
     # Read _lock_state: mypy narrowed lock_status from the earlier assert.
     final_state = push_lock._lock_state
     assert final_state is not None
@@ -8005,19 +8014,22 @@ async def test_force_lock_status_poll_reads_past_seen_this_session() -> None:
     ):
         await push_lock._update()
 
-    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_awaited_once()
     assert push_lock.lock_status == LockStatus.LOCKED
     assert push_lock._force_lock_status_poll is False
 
 
 @pytest.mark.asyncio
 async def test_a_failed_status_read_leaves_the_poll_obligation_armed() -> None:
-    """A lock_status read that raises leaves the forced poll flag set."""
+    """A status poll that raises leaves the forced poll flag set."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:66")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     push_lock._seen_this_session.add(LockStatus)
     push_lock._force_lock_status_poll = True
     mock_lock = _answering_lock(push_lock)
+    mock_lock.lock_and_door_status = AsyncMock(
+        side_effect=DisconnectedError("dropped mid-read")
+    )
     mock_lock.lock_status = AsyncMock(side_effect=DisconnectedError("dropped mid-read"))
 
     with (
@@ -8031,8 +8043,16 @@ async def test_a_failed_status_read_leaves_the_poll_obligation_armed() -> None:
     ):
         await push_lock._update()
 
-    # Only the flag can be asking, so each attempt proves it was still set.
-    assert mock_lock.lock_status.await_count == DEFAULT_ATTEMPTS
+    # After the third drop stands the combined poll down, the flag is the only reason
+    # left to poll, so each lock-only poll after it shows the flag was still set.
+    assert (
+        mock_lock.lock_and_door_status.await_count
+        == COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    )
+    assert (
+        mock_lock.lock_status.await_count
+        == DEFAULT_ATTEMPTS - COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    )
     assert push_lock._force_lock_status_poll is True
 
 
@@ -8121,13 +8141,13 @@ async def test_an_admitted_jam_arms_the_timer_and_the_holds_end_polls_the_lock()
     # The poll reads the lock, and the hold has lapsed so the answer is admitted.
     push_lock._seen_this_session.update({BatteryState, DoorStatus, AutoLockState})
     mock_lock = MagicMock()
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    mock_lock.lock_and_door_status = publishing_read(push_lock, LockStatus.LOCKED)
 
     with _patched_clock() as clock:
         clock[0] = 1031.1
         await _run_update(push_lock, mock_lock)
 
-    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_awaited_once()
     final_state = push_lock._lock_state
     assert final_state is not None
     assert final_state.lock is LockStatus.LOCKED
@@ -8152,12 +8172,12 @@ async def test_a_position_admitted_after_the_holds_end_does_not_skip_the_poll() 
 
     push_lock._seen_this_session.update({BatteryState, DoorStatus, AutoLockState})
     mock_lock = MagicMock()
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    mock_lock.lock_and_door_status = publishing_read(push_lock, LockStatus.LOCKED)
     with _patched_clock() as clock:
         clock[0] = 1031.1
         await _run_update(push_lock, mock_lock)
 
-    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_awaited_once()
     assert push_lock._force_lock_status_poll is False
 
 
@@ -8365,13 +8385,13 @@ async def test_a_polled_unknown_mid_hold_does_not_extend_the_jam_hold():
     push_lock._seen_this_session.clear()
     push_lock._seen_this_session.update({BatteryState, DoorStatus, AutoLockState})
     mock_lock = MagicMock()
-    mock_lock.lock_status = publishing_read(push_lock, LockStatus.UNKNOWN)
+    mock_lock.lock_and_door_status = publishing_read(push_lock, LockStatus.UNKNOWN)
 
     with _patched_clock() as clock:
         clock[0] = 1015.0
         await _run_update(push_lock, mock_lock)
 
-    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_awaited_once()
     final_state = push_lock._lock_state
     assert final_state is not None
     assert final_state.lock is LockStatus.JAMMED
@@ -8520,3 +8540,1060 @@ async def test_an_op_response_the_lock_parses_holds_the_next_read_off():
     lock._parse_state(bytes(_with_checksum(_OP_RESPONSE_OK)))
 
     assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+# A model on the door sense deny list, so the library never asks it for the door.
+NO_DOOR_SENSE_LOCK_INFO = LockInfo(
+    manufacturer="August",
+    model="ASL-02",
+    serial="12347",
+    firmware="2.0.0",
+)
+
+
+def _auto_lock_setting_current(push_lock: PushLock) -> None:
+    """Mark the auto lock setting as read and not yet due, so a cycle skips it."""
+    push_lock._seen_this_session.add(AutoLockState)
+    push_lock._next_auto_lock_read_time = (
+        time.monotonic() + AUTO_LOCK_READ_REFRESH_INTERVAL
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_door_request_counts_as_the_keep_alive_request() -> None:
+    """An answered door request is the cycle's request, so no status poll follows."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:72", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    _auto_lock_setting_current(push_lock)
+    push_lock._earliest_combined_status_poll_time = (
+        time.monotonic() + COMBINED_STATUS_POLL_FAILURE_BACKOFF
+    )
+    push_lock._unanswered_combined_status_polls = COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    push_lock._seen_this_session.update({LockStatus, BatteryState})
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
+
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock()
+    mock_lock.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    mock_lock.lock_status = AsyncMock()
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+        push_lock._cancel_future_update()
+
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
+
+    mock_lock.door_status.assert_awaited_once()
+    mock_lock.lock_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_door_request_leaves_the_keep_alive_to_lock_status() -> None:
+    """A door request that is not sent leaves the keep-alive to the lock status poll."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:73", always_connected=True)
+    push_lock._lock_info = NO_DOOR_SENSE_LOCK_INFO
+    push_lock._running = True
+    _auto_lock_setting_current(push_lock)
+    push_lock._seen_this_session.update({LockStatus, BatteryState})
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
+
+    mock_lock = MagicMock()
+    mock_lock.battery = AsyncMock()
+    mock_lock.door_status = AsyncMock()
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+        push_lock._cancel_future_update()
+
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
+
+    mock_lock.door_status.assert_not_awaited()
+    mock_lock.lock_status.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_battery_request_counts_when_the_door_is_skipped() -> None:
+    """An answered battery request counts when the door request is skipped."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:79", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    _auto_lock_setting_current(push_lock)
+    push_lock._seen_this_session.update({LockStatus, DoorStatus})
+
+    mock_lock = MagicMock()
+    mock_lock.battery = publishing_read(push_lock, BatteryState(4.0, 100))
+    mock_lock.door_status = AsyncMock()
+    mock_lock.lock_status = AsyncMock()
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+        push_lock._cancel_future_update()
+
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
+
+    mock_lock.battery.assert_awaited_once()
+    mock_lock.door_status.assert_not_awaited()
+    mock_lock.lock_status.assert_not_awaited()
+
+
+# The status poll's state machine, one row per case. Each row names what the
+# cycle sends and the state it leaves behind. The test whose docstring names a
+# row is in this module, except U's, which is in tests/test_lock.py and covers
+# the decode only. Every row that sends 0x2F is a running watcher whose lock has
+# a door sensor. The sends column leaves out the auto lock setting read. L, D and B
+# are the lock status, door status and battery in _seen_this_session; cnt is
+# _unanswered_combined_status_polls; set means _earliest_combined_status_poll_time
+# is in the future.
+#
+#     #   entry condition                        sends              L D B  cnt/set
+#     A   new connection, demand                 batt, 0x2F         L D B  0 / no
+#     B   new connection, always-connected       batt, 0x2F         L D B  0 / no
+#     C   model on the deny list                 batt, 0x02         L - B  0 / no
+#     C2  deny list, lock status and batt seen   nothing            L - B  0 / no
+#     E   validate(), never started              batt, 0x2E, 0x02   L D B  0 / no
+#     F   cycle after an operation, batt unseen  batt, 0x2F         L D B  0 / no
+#     G   all three seen, demand                 nothing            L D B  0 / no
+#     H   all three seen, always-connected       0x2F               L D B  0 / no
+#     H2  as H, it sets the last operation time  0x2F               L D B  0 / no
+#     I   door seen from a push, L unseen        batt, 0x2F         L D B  0 / no
+#     I2  L and batt seen from a push, D unseen  0x2F               L D B  0 / no
+#     J   set, door wanted, L seen, demand       0x2E               L D B  n / yes
+#     J2  as J, always-connected                 0x2E               L D B  n / yes
+#     K   first 0x2F times out, 0x02 answers     0x2F, 0x02         L - B  1 / no
+#     K2  the second and third in a row          0x2F, 0x02         L - B  3 / yes
+#     K3  three 0x2F waits end in a link drop    0x2F x3; 0x2E 0x02 L D B  3 / yes
+#     L   0x2F and 0x02 both time out (raises)   0x2F, 0x02         - - B  kept / no
+#     M   the link drops during 0x2F (raises)    0x2F               - - B  +1 / no
+#     M2  0x2F fails, link kept (raises)         0x2F               - - B  kept / no
+#     M3  the link is down at the poll (raises)  nothing            - - B  kept / no
+#     N   a door status applied in the fallback  0x2F, 0x02         L D B  +1 / no
+#     Q   one timeout, then an answer            0x2F, 0x02; 0x2F   L D B  1 then 0 / no
+#     Q2  a drop, an answer, two drops           0x2F x4            - - B  2 / no
+#     R   the threshold cycle, then the next     0x2E on the last   L D B  3 / yes
+#     R3  as R, the 0x2E answer is unknown       0x2E on the last 2 L - B  3 / yes
+#     S   reconnect while set, then a cycle      batt, 0x2E, 0x02   L D B  3 / yes
+#     T   set lapsed, the probe times out        0x2F, 0x02         L - B  4 / yes
+#     T2  set lapsed, the probe answers          batt, 0x2F         L D B  0 / no
+#     U   door byte 0x00 on a 0x2F answer        0x2F               L - B  0 / no
+#     V   a 0x2F frame through the real decoder  -                  -      -
+#
+# Row N covers a late answer and a pushed status alike: once the combined poll's
+# wait has timed out, a door status applied while the lock-only poll runs may be
+# either, and nothing distinguishes them. Row Q is the case the count exists
+# for: one lost notification, then an answer, stands nothing down. In rows L and
+# M2 the count is left where it stood: in L neither poll answers, and in M2 the
+# 0x2F poll fails with an error that is not a disconnect. In rows M, K3 and Q2 a
+# link that was up as the 0x2F poll started and drops during it counts, so a
+# lock that drops the link on the subtype is stood down too; in row M3 the link
+# is down at the poll, so nothing counts.
+
+
+@pytest.mark.asyncio
+async def test_a_lock_and_door_frame_reaches_the_display_through_the_real_decoder() -> (
+    None
+):
+    """Row V: pin the only route from a combined status frame to the display.
+
+    Lock._parse_state's DOOR_AND_LOCK branch is the one route between a
+    combined answer and the published state, so this drives a frame through
+    the real decoder rather than stubbing either side. The frame is built to
+    the DOOR_AND_LOCK answer layout: subtype at byte[4], lock status at
+    byte[8], door status at byte[9].
+    """
+    push_lock, lock = _real_decoder_pair("aa:bb:cc:dd:ee:62")
+
+    lock._internal_state_callback(bytes.fromhex("bb02000c2f00000005030000000000000000"))
+
+    assert push_lock.lock_status is LockStatus.LOCKED
+    assert push_lock.door_status is DoorStatus.OPENED
+
+
+def _status_poll_lock(
+    push_lock: PushLock, door: DoorStatus = DoorStatus.CLOSED
+) -> MagicMock:
+    """A mock Lock answering a cycle's battery, auto lock, and status requests."""
+    mock_lock = _stub_status_polls(MagicMock(), push_lock, door=door)
+    mock_lock.connect = AsyncMock()
+    # The battery poll applies its reading, so _seen_this_session holds
+    # BatteryState as the table's rows have it.
+    mock_lock.battery = publishing_read(push_lock, BatteryState(4.0, 90))
+    mock_lock.auto_lock_status = publishing_read(
+        push_lock, AutoLockState(AutoLockMode.OFF, 0)
+    )
+    mock_lock.client = MagicMock(set_connection_params=AsyncMock())
+    return mock_lock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("always_connected", [False, True])
+async def test_update_polls_lock_and_door_together_on_a_door_sense_lock(
+    always_connected: bool,
+) -> None:
+    """Rows A and B: a running lock with a door sensor gets one combined request.
+
+    Neither single-reading request is sent, and both readings reach the
+    display from the one answer, on a demand connection and a held one alike.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:0e", always_connected=always_connected)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    mock_lock = _status_poll_lock(push_lock, door=DoorStatus.OPENED)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+
+    mock_lock.lock_and_door_status.assert_awaited_once()
+    mock_lock.lock_status.assert_not_awaited()
+    mock_lock.door_status.assert_not_awaited()
+    assert push_lock.lock_status is LockStatus.LOCKED
+    assert push_lock.door_status is DoorStatus.OPENED
+
+
+# Built GETSTATUS answers keyed by the subtype at byte[4]: the battery at
+# 0x1479 mV, the lock Locked, and the lock Locked at byte[8] with the door
+# Closed at byte[9].
+_STATUS_ANSWERS = {
+    StatusType.BATTERY.value: _with_checksum("bb0200000f00000079140000000000000000"),
+    StatusType.LOCK_ONLY.value: _with_checksum("bb0200000200000005000000000000000000"),
+    StatusType.DOOR_AND_LOCK.value: _with_checksum(
+        "bb0200002f00000005010000000000000000"
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "subtype"),
+    [
+        pytest.param("ASL-03", StatusType.DOOR_AND_LOCK, id="door-sensor"),
+        pytest.param("ASL-02", StatusType.LOCK_ONLY, id="ASL-02"),
+        pytest.param("ASL-01", StatusType.LOCK_ONLY, id="ASL-01"),
+        pytest.param("", StatusType.LOCK_ONLY, id="empty-model"),
+    ],
+)
+async def test_the_status_poll_asks_for_the_door_on_a_lock_with_a_door_sensor(
+    model: str, subtype: StatusType
+) -> None:
+    """Rows A and C: DOOR_AND_LOCK on a lock with a door sensor, else LOCK_ONLY."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:56", always_connected=False)
+    push_lock._lock_info = _lock_info(model)
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    _auto_lock_setting_current(push_lock)
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    session.cipher_encrypt = MagicMock(update=bytes)
+    written: list[bytes] = []
+
+    async def answer(_char: object, command: bytearray, _response: bool) -> None:
+        written.append(bytes(command))
+        session._notify(0, bytearray(_STATUS_ANSWERS[command[0x04]]))
+
+    client.write_gatt_char = AsyncMock(side_effect=answer)
+
+    await _run_update(push_lock, lock)
+
+    push_lock._running = False
+    assert [(command[0x01], command[0x04]) for command in written] == [
+        (Commands.GETSTATUS.value, StatusType.BATTERY.value),
+        (Commands.GETSTATUS.value, subtype.value),
+    ]
+    sensed = subtype is StatusType.DOOR_AND_LOCK
+    assert push_lock.lock_status is LockStatus.LOCKED
+    assert push_lock.door_status is (
+        DoorStatus.CLOSED if sensed else DoorStatus.UNKNOWN
+    )
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_poll_reads_the_door_state() -> None:
+    """Rows H and H2: a door change reaches the display from a keep-alive poll.
+
+    The cycle has nothing left to read, so the poll it sends is the keep-alive
+    one, and the door state it answers with is published. That answer is the
+    cycle's only round trip, so it is what moves _last_operation_complete_time.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:0c", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    _auto_lock_setting_current(push_lock)
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._lock_state = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=AuthState(successful=True),
+        auto_lock=None,
+        auto_lock_prev=None,
+    )
+    for seen in (LockStatus, DoorStatus, BatteryState):
+        push_lock._seen_this_session.add(seen)
+    # The battery refresh is not due, so the cycle has nothing else to ask for.
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
+    published: list[LockState] = []
+    push_lock.register_callback(lambda state, info, conn: published.append(state))
+    mock_lock = _status_poll_lock(push_lock, door=DoorStatus.OPENED)
+    before = time.monotonic()
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+
+    mock_lock.lock_and_door_status.assert_awaited_once()
+    assert published[-1].door is DoorStatus.OPENED
+    assert push_lock._last_operation_complete_time >= before
+
+
+@pytest.mark.asyncio
+async def test_the_resync_cycle_after_an_operation_refreshes_the_door() -> None:
+    """Row F: the cycle an operation schedules reads the door with the lock.
+
+    The operation sets the forced poll, so the cycle polls whatever
+    _seen_this_session holds, and on a running lock with a door sensor that poll
+    is the combined one.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:0d", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    mock_lock = _status_poll_lock(push_lock, door=DoorStatus.OPENED)
+    mock_lock.force_lock = AsyncMock()
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+        # The operation's exit schedules the next cycle.
+        assert push_lock._cancel_deferred_update is not None
+        # The floor that keeps the cycle off a stale state is moved to now, so the
+        # cycle runs at once.
+        push_lock._earliest_update_time = time.monotonic()
+        push_lock._deferred_update()
+        assert push_lock._update_task is not None
+        await push_lock._update_task
+
+    mock_lock.force_lock.assert_awaited_once()
+    assert LockStatus in push_lock._seen_this_session
+    mock_lock.lock_and_door_status.assert_awaited_once()
+    assert push_lock.door_status is DoorStatus.OPENED
+
+
+@pytest.mark.asyncio
+async def test_a_lock_without_door_sense_is_not_polled_for_a_door_it_lacks() -> None:
+    """Row C2: a lock whose door is never seen sends no extra lock-only poll.
+
+    The door status is a reason to poll only while the combined subtype is in
+    use, and it never is on this generation, which has no sensor to mark the
+    door seen. Without that half of the condition the cycle would poll the
+    lock status for a door reading that can never arrive.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:61", always_connected=False)
+    push_lock._lock_info = NO_DOOR_SENSE_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._update_any_state([LockStatus.LOCKED, BatteryState(4.0, 90)])
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
+    assert DoorStatus not in push_lock._seen_this_session
+    mock_lock = _status_poll_lock(push_lock)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+
+    mock_lock.lock_status.assert_not_awaited()
+    mock_lock.lock_and_door_status.assert_not_awaited()
+    mock_lock.door_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_with_nothing_unread_sends_no_status_poll() -> None:
+    """Row G: a demand connection asks for nothing it already has.
+
+    The lock status, door, and battery were read earlier on this connection, so
+    the cycle has no reason to poll and no keep-alive to send.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:4a", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    _auto_lock_setting_current(push_lock)
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._update_any_state(
+        [LockStatus.LOCKED, DoorStatus.CLOSED, BatteryState(4.0, 90)]
+    )
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
+    mock_lock = _status_poll_lock(push_lock)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+
+    mock_lock.lock_and_door_status.assert_not_awaited()
+    mock_lock.lock_status.assert_not_awaited()
+    mock_lock.door_status.assert_not_awaited()
+    mock_lock.battery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pushed", "unseen", "door"),
+    [
+        pytest.param([DoorStatus.CLOSED], LockStatus, DoorStatus.OPENED, id="I"),
+        pytest.param(
+            [LockStatus.LOCKED, BatteryState(4.0, 90)],
+            DoorStatus,
+            DoorStatus.CLOSED,
+            id="I2",
+        ),
+    ],
+)
+async def test_the_combined_poll_is_sent_while_either_reading_is_unseen(
+    pushed: list[Any], unseen: type, door: DoorStatus
+) -> None:
+    """Rows I and I2: a reading the lock pushed leaves the other to the combined poll.
+
+    In row I the door state was pushed and the combined poll is sent for the
+    lock status; in row I2 the lock status and the battery were pushed on this
+    demand connection and the combined poll is sent for the door.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:4b", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._update_any_state(pushed)
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
+    assert unseen not in push_lock._seen_this_session
+    mock_lock = _status_poll_lock(push_lock, door=door)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+
+    mock_lock.lock_and_door_status.assert_awaited_once()
+    mock_lock.door_status.assert_not_awaited()
+    assert push_lock.door_status is door
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_times_out_sets_the_backoff_after_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Row T: after the backoff, one unanswered poll stands the combined poll down.
+
+    The count is kept at the threshold across the backoff, so the first poll that
+    times out after it stands the combined poll down again, without three more.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:4d", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._unanswered_combined_status_polls = COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    push_lock._earliest_combined_status_poll_time = time.monotonic() - 1.0
+    assert push_lock._combined_status_poll_in_use() is True
+    mock_lock = _status_poll_lock(push_lock)
+    mock_lock.lock_and_door_status = AsyncMock(side_effect=TimeoutError)
+    before = time.monotonic()
+
+    with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
+        await push_lock._poll_status(mock_lock)
+
+    mock_lock.lock_and_door_status.assert_awaited_once()
+    mock_lock.lock_status.assert_awaited_once()
+    assert (
+        push_lock._unanswered_combined_status_polls
+        == COMBINED_STATUS_POLL_FAILURE_THRESHOLD + 1
+    )
+    assert "poll 4 times" in caplog.text
+    assert (
+        push_lock._earliest_combined_status_poll_time
+        >= before + COMBINED_STATUS_POLL_FAILURE_BACKOFF
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("always_connected", [False, True])
+async def test_a_backed_off_lock_sends_door_status_on_its_own(
+    always_connected: bool,
+) -> None:
+    """Rows J and J2: the standalone request is the whole cycle.
+
+    The lock status has been read and the combined poll is standing down, so
+    the door request is the only one left. It counts as the cycle's request, so
+    on an always-connected lock no keep-alive status poll follows it.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:4e", always_connected=always_connected)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    _auto_lock_setting_current(push_lock)
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._earliest_combined_status_poll_time = (
+        time.monotonic() + COMBINED_STATUS_POLL_FAILURE_BACKOFF
+    )
+    push_lock._unanswered_combined_status_polls = COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    push_lock._update_any_state([LockStatus.LOCKED, BatteryState(4.0, 90)])
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
+    assert DoorStatus not in push_lock._seen_this_session
+    mock_lock = _status_poll_lock(push_lock, door=DoorStatus.OPENED)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+
+    mock_lock.door_status.assert_awaited_once()
+    mock_lock.lock_status.assert_not_awaited()
+    mock_lock.lock_and_door_status.assert_not_awaited()
+    mock_lock.battery.assert_not_awaited()
+    assert push_lock.door_status is DoorStatus.OPENED
+
+
+@pytest.mark.asyncio
+async def test_the_combined_poll_returns_when_the_backoff_lapses() -> None:
+    """Row T2: once the backoff lapses, the combined poll is sent and reads the door."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:4c", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._earliest_combined_status_poll_time = time.monotonic() - 1.0
+    push_lock._unanswered_combined_status_polls = COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    mock_lock = _status_poll_lock(push_lock, door=DoorStatus.OPENED)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+
+    mock_lock.lock_and_door_status.assert_awaited_once()
+    mock_lock.door_status.assert_not_awaited()
+    assert push_lock.door_status is DoorStatus.OPENED
+    # The answer resets the count, so a later stand-down needs three unanswered
+    # polls again.
+    assert push_lock._unanswered_combined_status_polls == 0
+
+
+@pytest.mark.asyncio
+async def test_validate_keeps_the_lock_only_poll() -> None:
+    """Row E: validate() sends the door request and the lock-only poll.
+
+    validate() runs a cycle on a watcher that has not been started, and the lock
+    has a door sensor, so being unstarted is what holds the combined poll off.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:3a", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._advertisement_data = _advertisement({})
+    mock_lock = _status_poll_lock(push_lock)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.validate()
+
+    mock_lock.door_status.assert_awaited_once()
+    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_combined_poll_falls_back_and_backs_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Rows K and K2: a lock that answers the lock-only poll, not the combined one.
+
+    The lock-only poll follows in the same cycle and its answer reaches the
+    display, the combined poll is backed off, and the next cycle asks for the
+    door status on its own.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:3b", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    mock_lock = _status_poll_lock(push_lock, door=DoorStatus.OPENED)
+    mock_lock.lock_and_door_status = AsyncMock(side_effect=TimeoutError)
+    before = time.monotonic()
+
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+    ):
+        for expected in range(1, COMBINED_STATUS_POLL_FAILURE_THRESHOLD):
+            await push_lock._update()
+            assert push_lock._unanswered_combined_status_polls == expected
+            assert push_lock._earliest_combined_status_poll_time == float("-inf")
+            assert push_lock._combined_status_poll_in_use() is True
+
+        await push_lock._update()
+
+        assert (
+            push_lock._unanswered_combined_status_polls
+            == COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+        )
+        assert (
+            push_lock._earliest_combined_status_poll_time
+            >= before + COMBINED_STATUS_POLL_FAILURE_BACKOFF
+        )
+        assert "has not answered the combined lock and door status poll" in caplog.text
+        assert push_lock.lock_status is LockStatus.LOCKED
+
+        # The next cycle asks for the door on its own and sends no combined poll.
+        combined_before = mock_lock.lock_and_door_status.await_count
+        await push_lock._update()
+
+    assert mock_lock.lock_and_door_status.await_count == combined_before
+    mock_lock.door_status.assert_awaited_once()
+    assert push_lock.door_status is DoorStatus.OPENED
+
+
+@pytest.mark.asyncio
+async def test_the_lock_only_poll_is_the_cycle_s_answered_request() -> None:
+    """The lock-only keep-alive poll sets the last operation time.
+
+    On a lock without a door sensor the lock-only poll is the cycle's only
+    request, so _last_operation_complete_time is set from it.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:66", always_connected=True)
+    push_lock._lock_info = NO_DOOR_SENSE_LOCK_INFO
+    push_lock._running = True
+    _auto_lock_setting_current(push_lock)
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._update_any_state(
+        [LockStatus.LOCKED, DoorStatus.CLOSED, BatteryState(4.0, 90)]
+    )
+    push_lock._next_battery_refresh_time = time.monotonic() + BATTERY_REFRESH_INTERVAL
+    mock_lock = _status_poll_lock(push_lock)
+    before = time.monotonic()
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+
+    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_not_awaited()
+    mock_lock.battery.assert_not_awaited()
+    assert push_lock._last_operation_complete_time >= before
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_poll_records_the_round_trip_as_a_success() -> None:
+    """The fallback poll records its round trip, and only after the answer.
+
+    The combined poll went unanswered, so the answer that reaches the display
+    is the one the poll after it brought back. Recording the success before
+    that await would credit a round trip the lock had not yet made.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:60", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+
+    calls: list[str] = []
+    mock_lock = _status_poll_lock(push_lock)
+    mock_lock.lock_and_door_status = AsyncMock(side_effect=TimeoutError)
+    answered = mock_lock.lock_status
+
+    async def _record_lock_status(*args: Any, **kwargs: Any) -> None:
+        calls.append("lock_status")
+        await answered(*args, **kwargs)
+
+    mock_lock.lock_status = AsyncMock(side_effect=_record_lock_status)
+
+    with patch.object(
+        push_lock,
+        "_record_auth_success",
+        side_effect=lambda: calls.append("record_auth_success"),
+    ):
+        await push_lock._poll_status(mock_lock)
+
+    mock_lock.lock_status.assert_awaited_once()
+    # The success is recorded after the answer, never before the request.
+    assert calls == ["lock_status", "record_auth_success"]
+    answered.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_door_reading_during_the_fallback_neither_credits_nor_demotes() -> None:
+    """Row N: a door reading in the fallback poll decides nothing.
+
+    Once the combined poll's wait has timed out, a door status applied while
+    the lock-only poll runs may be the combined answer arriving late or a
+    status the lock pushed, and the two are the same observation. Neither
+    spares the lock from the count nor adds to it.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:3e", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    mock_lock = _status_poll_lock(push_lock)
+    mock_lock.lock_and_door_status = AsyncMock(side_effect=TimeoutError)
+    # A door reading lands while the lock-only poll is waiting.
+    mock_lock.lock_status = publishing_read(
+        push_lock, LockStatus.LOCKED, DoorStatus.OPENED
+    )
+
+    await push_lock._poll_status(mock_lock)
+
+    assert push_lock._unanswered_combined_status_polls == 1
+    assert push_lock._earliest_combined_status_poll_time == float("-inf")
+    assert push_lock.door_status is DoorStatus.OPENED
+
+    # It does not spare the lock either: the count reaches the threshold.
+    for _ in range(COMBINED_STATUS_POLL_FAILURE_THRESHOLD - 1):
+        await push_lock._poll_status(mock_lock)
+
+    assert push_lock._combined_status_poll_in_use() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("door", "asks_again"),
+    [(DoorStatus.CLOSED, False), (DoorStatus.UNKNOWN, True)],
+    ids=["closed", "init"],
+)
+async def test_backing_off_hands_the_door_back_to_its_own_request(
+    door: DoorStatus, asks_again: bool
+) -> None:
+    """Rows R and R3: the stand-down hands the door to its own request.
+
+    The door is dropped from _seen_this_session as the combined poll stands down,
+    so _poll_door_status sends its request. A DoorStatus.UNKNOWN answer leaves
+    the door unseen, so the request is sent again; a CLOSED answer does not.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:49", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    # The lock pushed a door state, so the door is seen without any poll.
+    push_lock._update_any_state([DoorStatus.CLOSED])
+    assert DoorStatus in push_lock._seen_this_session
+    mock_lock = _status_poll_lock(push_lock, door=door)
+    mock_lock.lock_and_door_status = AsyncMock(side_effect=TimeoutError)
+
+    for _ in range(COMBINED_STATUS_POLL_FAILURE_THRESHOLD):
+        await push_lock._poll_status(mock_lock)
+
+    assert push_lock._combined_status_poll_in_use() is False
+    assert DoorStatus not in push_lock._seen_this_session
+    assert await push_lock._poll_door_status(mock_lock) is True
+    assert push_lock.door_status is door
+    assert await push_lock._poll_door_status(mock_lock) is asks_again
+    assert mock_lock.door_status.await_count == 1 + asks_again
+
+
+@pytest.mark.asyncio
+async def test_a_lock_that_answered_the_combined_poll_is_not_backed_off() -> None:
+    """Row Q: one lost notification does not stand the poll down.
+
+    The lock answers the combined poll, loses one notification, then answers
+    again, and that answer puts the count back to zero.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:64", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    mock_lock = _status_poll_lock(push_lock)
+    mock_lock.battery = publishing_read(push_lock, BatteryState(4.0, 90))
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+        assert DoorStatus in push_lock._seen_this_session
+        # Nothing else is left to read, so the cycles below are keep-alive polls.
+        push_lock._next_battery_refresh_time = (
+            time.monotonic() + BATTERY_REFRESH_INTERVAL
+        )
+
+        # One lost notification, two short of the threshold.
+        mock_lock.lock_and_door_status = AsyncMock(side_effect=TimeoutError)
+        await push_lock._update()
+        assert push_lock._unanswered_combined_status_polls == 1
+        assert push_lock._earliest_combined_status_poll_time == float("-inf")
+
+        # The combined poll answers again, so the count resets and the door is read.
+        mock_lock.lock_and_door_status = publishing_read(
+            push_lock, LockStatus.LOCKED, DoorStatus.OPENED
+        )
+        await push_lock._update()
+
+    assert push_lock._unanswered_combined_status_polls == 0
+    assert push_lock._combined_status_poll_in_use() is True
+    mock_lock.lock_and_door_status.assert_awaited_once()
+    assert push_lock.door_status is DoorStatus.OPENED
+
+
+# The error execute() raises for a link that drops while a command waits.
+_LINK_DROPPED = DisconnectedError("Test Lock: Disconnected")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("connected", "error", "count"),
+    [
+        pytest.param(True, _LINK_DROPPED, 1, id="M-DisconnectedError"),
+        pytest.param(True, BleakError("Test Lock: disconnected"), 1, id="M-BleakError"),
+        pytest.param(False, DisconnectedError("Lock is not connected"), 0, id="M3"),
+        pytest.param(True, BleakError("Test Lock: write failed"), 0, id="M2"),
+    ],
+)
+async def test_a_combined_poll_that_faults_the_link_is_named_in_the_log(
+    caplog: pytest.LogCaptureFixture, connected: bool, error: Exception, count: int
+) -> None:
+    """Rows M, M2 and M3: a fault on the combined poll is left to the retry decorator.
+
+    The error is raised to the retry decorator, which reconnects, and the log
+    line is what traces that loop back to this poll. A disconnect on a link that
+    was up as the poll started counts as an unanswered poll, with no lock-only
+    poll on the dropped link; a link already down at the poll, and any other
+    fault, is left uncounted.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:3f", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    mock_lock = _status_poll_lock(push_lock)
+    mock_lock.is_connected = connected
+    mock_lock.lock_and_door_status = AsyncMock(side_effect=error)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        pytest.raises(type(error)),
+    ):
+        await push_lock._poll_status(mock_lock)
+
+    assert f"combined status poll failed with {type(error).__name__}" in caplog.text
+    assert push_lock._earliest_combined_status_poll_time == float("-inf")
+    assert push_lock._unanswered_combined_status_polls == count
+    mock_lock.lock_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_three_link_drops_on_the_combined_poll_stand_it_down(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Row K3: a lock that drops the link on every combined poll is stood down.
+
+    Each drop is counted and raised to the retry decorator, which reconnects.
+    The third arms the backoff, and the attempt after it sends the door request
+    and the lock-only poll, so the cycle ends with both readings.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:7a", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    _auto_lock_setting_current(push_lock)
+    mock_lock = _status_poll_lock(push_lock, door=DoorStatus.OPENED)
+    mock_lock.lock_and_door_status = AsyncMock(side_effect=_LINK_DROPPED)
+    before = time.monotonic()
+
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()),
+    ):
+        await push_lock._update()
+
+    assert (
+        mock_lock.lock_and_door_status.await_count
+        == COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    )
+    assert (
+        push_lock._unanswered_combined_status_polls
+        == COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    )
+    assert (
+        push_lock._earliest_combined_status_poll_time
+        >= before + COMBINED_STATUS_POLL_FAILURE_BACKOFF
+    )
+    assert "has not answered the combined lock and door status poll 3" in caplog.text
+    mock_lock.door_status.assert_awaited_once()
+    mock_lock.lock_status.assert_awaited_once()
+    assert push_lock.lock_status is LockStatus.LOCKED
+    assert push_lock.door_status is DoorStatus.OPENED
+
+
+@pytest.mark.asyncio
+async def test_an_answer_between_link_drops_keeps_the_combined_poll(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Row Q2: an answered combined poll resets the count of link drops.
+
+    A drop, an answer, and two more drops leave the count at two, short of the
+    threshold, so the combined poll stays in use.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:7b", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    mock_lock = _status_poll_lock(push_lock)
+    mock_lock.lock_and_door_status = AsyncMock(
+        side_effect=[
+            _LINK_DROPPED,
+            None,
+            _LINK_DROPPED,
+            _LINK_DROPPED,
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
+        with pytest.raises(DisconnectedError):
+            await push_lock._poll_status(mock_lock)
+        assert push_lock._unanswered_combined_status_polls == 1
+
+        await push_lock._poll_status(mock_lock)
+        assert push_lock._unanswered_combined_status_polls == 0
+
+        for expected in (1, 2):
+            with pytest.raises(DisconnectedError):
+                await push_lock._poll_status(mock_lock)
+            assert push_lock._unanswered_combined_status_polls == expected
+
+    assert push_lock._earliest_combined_status_poll_time == float("-inf")
+    assert push_lock._combined_status_poll_in_use() is True
+    assert "has not answered the combined" not in caplog.text
+    mock_lock.lock_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("connected", "earlier_error", "writes", "count"),
+    [
+        pytest.param(True, None, 1, 1, id="M"),
+        pytest.param(False, None, 0, 0, id="M3"),
+        pytest.param(True, BleakError("write failed"), 0, 0, id="M3-refused"),
+    ],
+)
+async def test_a_link_drop_counts_only_when_the_link_was_up_at_the_combined_poll(
+    connected: bool, earlier_error: BleakError | None, writes: int, count: int
+) -> None:
+    """Rows M and M3, real Session: a drop counts only if the session could write."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:7c", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    client.is_connected = connected
+    if earlier_error is not None:
+        # An earlier write in the cycle raises with the link still up.
+        client.write_gatt_char = AsyncMock(side_effect=earlier_error)
+        assert await push_lock._poll_battery(lock, force=True) is True
+        assert lock.is_connected is True
+
+    async def drop_after_the_write(*_: object) -> None:
+        # A link drop reads as disconnected and resolves every disconnect
+        # future the session has armed.
+        client.is_connected = False
+        for future in session._disconnected_futures:
+            asyncio.get_running_loop().call_soon(future.set_result, None)
+
+    client.write_gatt_char = AsyncMock(side_effect=drop_after_the_write)
+
+    with pytest.raises(DisconnectedError):
+        await push_lock._poll_status(lock)
+    await asyncio.sleep(0)
+
+    assert client.write_gatt_char.await_count == writes
+    assert push_lock._unanswered_combined_status_polls == count
+
+
+@pytest.mark.asyncio
+async def test_a_combined_poll_whose_write_does_not_return_counts_as_a_drop() -> None:
+    """Real Session: a 0x2F write that does not return counts as a drop."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:98", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    session.cipher_encrypt = MagicMock(update=bytes)
+    written: list[int] = []
+
+    async def write(_char: object, command: bytearray, _response: bool) -> None:
+        written.append(command[0x04])
+        if command[0x04] == StatusType.DOOR_AND_LOCK.value:
+            await asyncio.Event().wait()
+        session._notify(0, bytearray(_STATUS_ANSWERS[command[0x04]]))
+
+    client.write_gatt_char = AsyncMock(side_effect=write)
+
+    with (
+        patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.05)),
+        pytest.raises(TimeoutError),
+    ):
+        await push_lock._poll_status(lock)
+    await asyncio.sleep(0)
+
+    assert written == [StatusType.DOOR_AND_LOCK.value]
+    assert push_lock._unanswered_combined_status_polls == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_fallback_poll_raises_and_arms_nothing() -> None:
+    """Row L: a lock that answers neither poll is handled as a link fault.
+
+    The second timeout is raised to the caller, which reconnects, and nothing
+    is backed off: the lock has shown nothing about which subtype it takes.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:3c", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    mock_lock = _status_poll_lock(push_lock)
+    mock_lock.lock_and_door_status = AsyncMock(side_effect=TimeoutError)
+    mock_lock.lock_status = AsyncMock(side_effect=TimeoutError)
+
+    with pytest.raises(TimeoutError):
+        await push_lock._poll_status(mock_lock)
+
+    mock_lock.lock_and_door_status.assert_awaited_once()
+    mock_lock.lock_status.assert_awaited_once()
+    assert push_lock._earliest_combined_status_poll_time == float("-inf")
+    # A link fault says nothing about the subtype, so it does not count.
+    assert push_lock._unanswered_combined_status_polls == 0
+
+
+@pytest.mark.asyncio
+async def test_combined_poll_backoff_survives_reconnect() -> None:
+    """Row S: the backoff outlives the connection that armed it.
+
+    A reconnect clears what the lock reported this session; it does not clear
+    what the lock showed about the subtype it takes.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:3d", always_connected=True)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    deadline = time.monotonic() + COMBINED_STATUS_POLL_FAILURE_BACKOFF
+    push_lock._earliest_combined_status_poll_time = deadline
+    push_lock._unanswered_combined_status_polls = COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    push_lock._seen_this_session.add(DoorStatus)
+
+    mock_lock = _status_poll_lock(push_lock)
+    mock_lock.battery = publishing_read(push_lock, BatteryState(4.0, 90))
+    with patch.object(push_lock, "_get_lock_instance", return_value=mock_lock):
+        await push_lock._ensure_connected()
+
+    # The reconnect cleared _seen_this_session but must NOT clear the backoff.
+    assert DoorStatus not in push_lock._seen_this_session
+    assert push_lock._earliest_combined_status_poll_time == deadline
+    assert (
+        push_lock._unanswered_combined_status_polls
+        == COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+    )
+    assert push_lock._combined_status_poll_in_use() is False
+
+    # The cycle on the new connection reads the door on its own request.
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock._update()
+
+    mock_lock.battery.assert_awaited_once()
+    mock_lock.door_status.assert_awaited_once()
+    mock_lock.lock_status.assert_awaited_once()
+    mock_lock.lock_and_door_status.assert_not_awaited()
+    assert push_lock._seen_this_session >= {LockStatus, DoorStatus, BatteryState}
