@@ -40,7 +40,13 @@ from .const import (
     LockStateValue,
     LockStatus,
 )
-from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
+from .lock import (
+    ActivityLogOverrunError,
+    Lock,
+    validate_keycode_slot,
+    validate_parameter_id,
+    validate_parameter_value,
+)
 from .session import (
     AuthError,
     BluetoothError,
@@ -1183,6 +1189,38 @@ class PushLock:
         """Clear a keypad slot."""
         validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
+
+    async def get_parameter(self, parameter: int) -> int:
+        """Read one parameter from the lock and return the value it reports.
+
+        Raises ValueError before connecting, RuntimeError when not running, and
+        TimeoutError when the lock does not answer, with the connection kept.
+        """
+        validate_parameter_id(parameter)
+        return await self._run_on_lock(
+            f"get_parameter 0x{parameter:02X}",
+            lambda lock: lock.get_parameter(parameter),
+        )
+
+    async def set_parameter(self, parameter: int, value: int) -> int:
+        """Write one parameter and return the value field of the lock's reply.
+
+        After a write, answered or not, the next update cycle polls the lock status.
+        Raises as get_parameter, plus ValueError for a value outside four bytes.
+        """
+        validate_parameter_id(parameter)
+        validate_parameter_value(value)
+        try:
+            return await self._run_on_lock(
+                f"set_parameter 0x{parameter:02X}",
+                lambda lock: lock.set_parameter(parameter, value),
+            )
+        finally:
+            # A write may change the lock status, which the library does not rely on
+            # a push to report, and a write the lock did not answer may still have
+            # been applied, so every exit makes the next update cycle poll the lock
+            # status.
+            self._force_lock_status_poll = True
 
     @operation_lock
     async def _run_on_lock(

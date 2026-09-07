@@ -15,6 +15,7 @@ from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
     MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
+    RESPONSE_FRAME_LEN,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
     BatteryState,
@@ -1142,10 +1143,20 @@ async def test_set_keycode_pin_validation(pin: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_keycode_operations_require_a_connection() -> None:
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("get_keycode", (1,)),
+        ("get_parameter", (0xB2,)),
+        ("set_parameter", (0xB2, 30)),
+    ],
+)
+async def test_lock_commands_require_a_connection(
+    method: str, args: tuple[int, ...]
+) -> None:
     lock = _make_lock()
     with pytest.raises(DisconnectedError):
-        await lock.get_keycode(1)
+        await getattr(lock, method)(*args)
 
 
 def test_encode_decode_keycode_pin() -> None:
@@ -1742,3 +1753,173 @@ def test_op_response_callback_fires_on_op_responses_not_acks() -> None:
     lock._parse_state(_op_response_frame(Commands.UNLOCK, OperationError.MECH_POSITION))
 
     assert op_calls == [1, 1]
+
+
+def _settings_frame(opcode: int, parameter: int, value: int) -> bytes:
+    """Build the 0xBB settings response with the opcode, the id, and the value."""
+    frame = bytearray(RESPONSE_FRAME_LEN)
+    frame[0x00] = 0xBB
+    frame[0x01] = opcode
+    frame[0x04] = parameter
+    frame[0x08:0x0C] = value.to_bytes(4, "little")
+    frame[0x03] = _simple_checksum(frame)
+    return bytes(frame)
+
+
+def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
+    """Deliver frames on the notify path when the command is written."""
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        for frame in frames:
+            session._notify(0, bytearray(frame))
+
+    return AsyncMock(side_effect=deliver)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args", "frames", "value", "states"),
+    [
+        pytest.param(
+            "get_parameter",
+            (0x28,),
+            [SETTINGS_READ_ACK, SETTINGS_READ_RESPONSE],
+            0x07080708,
+            [],
+            id="read-ack-then-answer",
+        ),
+        pytest.param(
+            "set_parameter",
+            (0x28, 0x005A005A),
+            [
+                SETTINGS_WRITE_ACK,
+                _settings_frame(Commands.WRITESETTING.value, 0x28, value=5),
+            ],
+            5,
+            [],
+            id="write-ack-then-answer-reporting-another-value",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            [_settings_frame(Commands.READSETTING.value, 0xB2, value=30)],
+            30,
+            [],
+            id="read-lone-answer",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            [
+                _settings_frame(Commands.READSETTING.value, 0x84, value=4000),
+                _settings_frame(Commands.READSETTING.value, 0xB2, value=30),
+            ],
+            30,
+            [],
+            id="read-answer-for-another-id-first",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            [
+                # Status push reporting UNLOCKED.
+                LOCK_FRAME,
+                _settings_frame(Commands.READSETTING.value, 0xB2, value=30),
+            ],
+            30,
+            [[LockStatus.UNLOCKED]],
+            id="read-status-push-first",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            [
+                # Failure op-response with no operation in flight.
+                _op_response_frame(Commands.LOCK, OperationError.MECH_POSITION),
+                _settings_frame(Commands.READSETTING.value, 0xB2, value=30),
+            ],
+            30,
+            [[LockStatus.JAMMED]],
+            id="read-op-response-first",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            # Captured answer to a read of a parameter the lock has never stored.
+            [bytes.fromhex("bb04008db20200005aa55aa5000000000200")],
+            0xA55AA55A,
+            [],
+            id="read-never-stored-parameter",
+        ),
+    ],
+)
+async def test_a_parameter_command_completes_on_its_own_bb_frame(
+    method: str,
+    args: tuple[int, ...],
+    frames: list[bytes],
+    value: int,
+    states: list[list[LockStateValue]],
+) -> None:
+    """The command returns the value field of the 0xBB frame with its opcode and id."""
+    received: list[list[LockStateValue]] = []
+    lock, session = _connected_lock(lambda s: received.append(list(s)))
+    session.client.write_gatt_char = _answered_by(session, *frames)
+
+    assert await getattr(lock, method)(*args) == value
+    assert received == states
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parameter", "value", "value_bytes"),
+    [
+        pytest.param(0xB2, 0x80000001, "01000080", id="little-endian"),
+        pytest.param(0x00, 0, "00000000", id="lowest-id-and-value"),
+        pytest.param(0xFF, 0xFFFFFFFF, "ffffffff", id="highest-id-and-value"),
+    ],
+)
+async def test_set_parameter_writes_the_value_little_endian_and_returns_the_answer(
+    parameter: int, value: int, value_bytes: str
+) -> None:
+    """The frame holds the id at byte 4 and the value little-endian at bytes 8 to 11."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = _answered_by(
+        session,
+        _settings_frame(Commands.WRITESETTING.value, parameter, value=value),
+    )
+
+    assert await lock.set_parameter(parameter, value) == value
+
+    (written,) = (
+        call.args[1] for call in session.client.write_gatt_char.await_args_list
+    )
+    assert written[0x00] == 0xEE
+    assert written[0x01] == Commands.WRITESETTING.value
+    assert written[0x04] == parameter
+    assert written[0x08:0x0C] == bytes.fromhex(value_bytes)
+    assert written[0x10] == 0x02
+    assert len(written) == RESPONSE_FRAME_LEN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args", "match"),
+    [
+        ("get_parameter", (-1,), "not an unsigned one-byte value"),
+        ("get_parameter", (0x100,), "not an unsigned one-byte value"),
+        ("set_parameter", (0x100, 30), "not an unsigned one-byte value"),
+        ("set_parameter", (0xB2, -1), "not an unsigned four-byte value"),
+        ("set_parameter", (0xB2, 0x100000000), "not an unsigned four-byte value"),
+    ],
+)
+async def test_parameter_commands_reject_an_argument_the_frame_cannot_hold(
+    method: str, args: tuple[int, ...], match: str
+) -> None:
+    """An argument outside its field raises ValueError and nothing is written."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = AsyncMock()
+
+    with pytest.raises(ValueError, match=match):
+        await getattr(lock, method)(*args)
+
+    session.client.write_gatt_char.assert_not_awaited()

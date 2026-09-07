@@ -2566,6 +2566,7 @@ def _keycode_push_lock() -> tuple[PushLock, MagicMock]:
 @pytest.mark.asyncio
 async def test_push_lock_keycode_round_trip() -> None:
     push_lock, lock = _keycode_push_lock()
+    assert push_lock._disconnect_timer is None
     with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
         assert await push_lock.get_keycode(200) == "135790"
         await push_lock.set_keycode(200, "135790")
@@ -2574,6 +2575,7 @@ async def test_push_lock_keycode_round_trip() -> None:
     lock.set_keycode.assert_awaited_once_with(200, "135790")
     lock.clear_keycode.assert_awaited_once_with(200)
     assert push_lock._last_operation_complete_time != NEVER_TIME
+    assert push_lock._disconnect_timer is not None
 
 
 @pytest.mark.asyncio
@@ -7461,6 +7463,11 @@ def _answer_frame(opcode: int, byte_4: int, payload: bytes) -> bytes:
     return bytes(frame)
 
 
+def _parameter_answer(opcode: int, parameter: int, value: int) -> bytes:
+    """Build a 0xBB parameter answer with the opcode, the id, and the value."""
+    return _answer_frame(opcode, parameter, value.to_bytes(4, "little"))
+
+
 # The answers a cycle's status polls take, keyed by the opcode and subtype each
 # asks for; the battery answer clears the 3.0 V floor in _update_any_state.
 _STATUS_ANSWERS = {
@@ -7532,3 +7539,223 @@ async def test_update_sends_no_settings_command(
         (command[0x01], command[0x04]) for command in written[second_cycle_start:]
     ] == second_cycle
     assert push_lock.lock_status is LockStatus.LOCKED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args", "name"),
+    [
+        ("get_parameter", (0xB2,), "get_parameter 0xB2"),
+        ("set_parameter", (0xB2, 30), "set_parameter 0xB2"),
+    ],
+)
+async def test_push_parameter_commands_warn_once_on_no_answer(
+    method: str,
+    args: tuple[int, ...],
+    name: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One warning names the command, without a value, and says it was not answered."""
+    push_lock, lock, _session, client = _keycode_real_session("aa:bb:cc:dd:ee:37")
+    client.write_gatt_char = AsyncMock()
+
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.01)),
+        pytest.raises(TimeoutError) as raised,
+    ):
+        await getattr(push_lock, method)(*args)
+
+    error = f"Test Lock: lock did not answer {name}"
+    assert str(raised.value) == error
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == [f"Test Lock: {name} failed: TimeoutError: {error}"]
+
+
+@pytest.mark.asyncio
+async def test_push_parameter_commands_publish_no_state() -> None:
+    """A parameter answer publishes nothing and leaves the lock state as it was."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    before = LockState(
+        lock=LockStatus.LOCKED,
+        door=DoorStatus.CLOSED,
+        battery=None,
+        auth=AuthState(successful=True),
+    )
+    push_lock._lock_state = before
+    published: list[LockState] = []
+    push_lock.register_callback(lambda state, info, conn: published.append(state))
+    _record_and_answer(
+        session,
+        client,
+        {
+            (opcode, 0xB2): _parameter_answer(opcode, 0xB2, 30)
+            for opcode in (Commands.READSETTING.value, Commands.WRITESETTING.value)
+        },
+    )
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        assert await push_lock.get_parameter(0xB2) == 30
+        assert await push_lock.set_parameter(0xB2, 30) == 30
+
+    assert published == []
+    assert push_lock.lock_state == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args", "opcode", "answer", "during_cycle", "cycle_polls"),
+    [
+        pytest.param(
+            "set_parameter",
+            (0xB2, 30),
+            Commands.WRITESETTING,
+            30,
+            True,
+            [(Commands.GETSTATUS, StatusType.LOCK_ONLY.value)],
+            id="answered-write",
+        ),
+        pytest.param(
+            "set_parameter",
+            (0xB2, 30),
+            Commands.WRITESETTING,
+            None,
+            True,
+            [(Commands.GETSTATUS, StatusType.LOCK_ONLY.value)],
+            id="unanswered-write",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            Commands.READSETTING,
+            30,
+            True,
+            [],
+            id="read-during-a-cycle",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            Commands.READSETTING,
+            30,
+            False,
+            [],
+            id="read-after-a-cycle",
+        ),
+    ],
+)
+async def test_only_a_parameter_write_makes_the_next_cycle_poll_the_lock_status(
+    method: str,
+    args: tuple[int, ...],
+    opcode: Commands,
+    answer: int | None,
+    during_cycle: bool,
+    cycle_polls: list[tuple[Commands, int]],
+) -> None:
+    """A write, not a read, makes the next update cycle poll the lock status."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3f")
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    answers = dict(_STATUS_ANSWERS)
+    if answer is not None:
+        answers[(opcode.value, 0xB2)] = _parameter_answer(opcode.value, 0xB2, answer)
+    written = _record_and_answer(session, client, answers)
+    published: list[LockState] = []
+    cycle_connecting = asyncio.Event()
+    cycle_released = asyncio.Event()
+
+    async def ensure_connected() -> Lock:
+        cycle_connecting.set()
+        await cycle_released.wait()
+        return lock
+
+    with (
+        patch.object(push_lock, "_ensure_connected", ensure_connected),
+        patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.05)),
+    ):
+        # The first cycle polls the lock status, so the cycle under test has a reading.
+        cycle = asyncio.create_task(push_lock._update())
+        await cycle_connecting.wait()
+        if not during_cycle:
+            cycle_released.set()
+            await cycle
+        # During the first cycle the command queues on the operation lock that cycle
+        # holds, so a flag set before the command would be cleared by that cycle's poll.
+        command = asyncio.create_task(getattr(push_lock, method)(*args))
+        await asyncio.sleep(0)
+        cycle_released.set()
+        await cycle
+        push_lock.register_callback(lambda state, info, conn: published.append(state))
+        with (
+            nullcontext()
+            if answer is not None
+            else pytest.raises(TimeoutError, match="did not answer")
+        ):
+            assert await command == answer
+        await push_lock._update()
+
+    push_lock._running = False
+
+    assert [(Commands(command[0x01]), command[0x04]) for command in written] == [
+        (Commands.GETSTATUS, StatusType.BATTERY.value),
+        (Commands.GETSTATUS, StatusType.DOOR_ONLY.value),
+        (Commands.GETSTATUS, StatusType.LOCK_ONLY.value),
+        (opcode, 0xB2),
+        *cycle_polls,
+    ]
+    # The cycle under test publishes its state on completion, in every row.
+    assert [state.lock for state in published] == [LockStatus.LOCKED]
+
+
+@pytest.mark.asyncio
+async def test_push_parameter_late_answer_is_taken_by_the_next_write() -> None:
+    """Known limit: a write of an id takes a late answer that arrives while it waits."""
+    push_lock, lock, session, client = _keycode_real_session("aa:bb:cc:dd:ee:36")
+    late = _parameter_answer(Commands.WRITESETTING.value, 0xB2, 30)
+    own = _parameter_answer(Commands.WRITESETTING.value, 0xB2, 3)
+    writes = 0
+
+    async def write_gatt_char(*_: object) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            session._notify(0, bytearray(late))
+            session._notify(0, bytearray(own))
+
+    client.write_gatt_char = write_gatt_char
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.01)),
+    ):
+        with pytest.raises(TimeoutError, match="did not answer set_parameter 0xB2"):
+            await push_lock.set_parameter(0xB2, 30)
+        assert await push_lock.set_parameter(0xB2, 3) == 30
+
+    assert writes == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "args", "match"),
+    [
+        ("get_parameter", (0x100,), "not an unsigned one-byte value"),
+        ("set_parameter", (0x100, 30), "not an unsigned one-byte value"),
+        ("set_parameter", (0xB2, 0x100000000), "not an unsigned four-byte value"),
+    ],
+)
+async def test_push_parameter_commands_refuse_a_bad_argument_without_connecting(
+    name: str,
+    args: tuple[int, ...],
+    match: str,
+) -> None:
+    """A bad argument raises ValueError without taking the operation lock."""
+    push_lock, _lock, _session, _client = _keycode_real_session("aa:bb:cc:dd:ee:42")
+
+    with pytest.raises(ValueError, match=match):
+        # Held, so a command that took the operation lock would time out here.
+        async with push_lock._operation_lock, asyncio.timeout(1):
+            await getattr(push_lock, name)(*args)
+
+    push_lock._running = False

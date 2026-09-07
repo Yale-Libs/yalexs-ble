@@ -215,6 +215,23 @@ def validate_keycode_slot(slot: int) -> None:
         raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
 
 
+def validate_parameter_id(parameter: int) -> None:
+    """Raise ValueError for a parameter id that does not fit one unsigned byte."""
+    if not 0 <= parameter <= 0xFF:
+        raise ValueError(
+            f"Parameter id is not an unsigned one-byte value (0 to 0xFF): {parameter}"
+        )
+
+
+def validate_parameter_value(value: int) -> None:
+    """Raise ValueError for a parameter value that does not fit four unsigned bytes."""
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError(
+            "Parameter value is not an unsigned four-byte value "
+            f"(0 to 0xFFFFFFFF): {value}"
+        )
+
+
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
     """Match the acknowledgment (0xAA + opcode + operation byte) of a command.
 
@@ -840,6 +857,58 @@ class Lock:
     async def battery(self) -> BatteryState:
         response = await self._poll_status(StatusType.BATTERY, "battery")
         return self._parse_battery_state(response)
+
+    @raise_if_not_connected
+    async def get_parameter(self, parameter: int) -> int:
+        """Read one parameter and return the value the lock reports.
+
+        Raises ValueError for an id outside one byte, before any frame is built,
+        and TimeoutError when the lock does not answer within the session's wait.
+        """
+        validate_parameter_id(parameter)
+        _LOGGER.debug("%s: Reading parameter 0x%02X", self.name, parameter)
+        response = await self._execute_command(
+            Commands.READSETTING,
+            parameter,
+            "get_parameter",
+            _settings_response_matcher(Commands.READSETTING.value, parameter),
+        )
+        # Byte 5 is not read, because its meaning is known for one parameter only.
+        value = util._bytes_to_int(response[0x08:0x0C])
+        _LOGGER.debug("%s: Parameter 0x%02X reads 0x%08X", self.name, parameter, value)
+        return value
+
+    @raise_if_not_connected
+    async def set_parameter(self, parameter: int, value: int) -> int:
+        """Write one parameter and return the value field of the lock's reply.
+
+        Raises ValueError for an id outside one byte or a value outside four bytes,
+        before any frame is built, and TimeoutError as get_parameter does.
+        """
+        validate_parameter_id(parameter)
+        validate_parameter_value(value)
+        _LOGGER.debug(
+            "%s: Writing parameter 0x%02X as 0x%08X", self.name, parameter, value
+        )
+        assert self.session is not None  # nosec
+        command = self.session.build_operation_command(Commands.WRITESETTING, parameter)
+        command[0x08:0x0C] = util._int_to_bytes(value, 4)
+        response = await self.session.execute(
+            command,
+            "set_parameter",
+            _settings_response_matcher(Commands.WRITESETTING.value, parameter),
+        )
+        # Byte 5 is not read, as in get_parameter, and the reply's value is not
+        # compared with the value written, because the library interprets no
+        # parameter.
+        answered = util._bytes_to_int(response[0x08:0x0C])
+        _LOGGER.debug(
+            "%s: Parameter 0x%02X write answered with 0x%08X",
+            self.name,
+            parameter,
+            answered,
+        )
+        return answered
 
     @raise_if_not_connected
     async def get_log(self) -> bytes:
