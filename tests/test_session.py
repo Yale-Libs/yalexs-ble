@@ -11,7 +11,7 @@ from bleak import BleakError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from yalexs_ble import util
-from yalexs_ble.const import Commands, OperationError, SettingType
+from yalexs_ble.const import Commands, OperationError
 from yalexs_ble.lock import (
     _ack_matcher,
     _keycode_response_matcher,
@@ -34,11 +34,12 @@ from yalexs_ble.session import (
     Session,
 )
 
-# Verbatim field frames (2026-07-16 capture, YUR/DEL fw 2.1.0): the READSETTING
-# acknowledgment and, ~40 ms later, the 0xBB frame carrying the stored value
-# (Timed 1800: both uint16 timers set to 1800).
+# Captured READSETTING acknowledgment and, about 40 ms later, the 0xBB response,
+# whose bytes 8 to 11 hold the setting's value; byte 4 of each frame is the setting
+# id the command asked for.
 READ_ACK = bytes.fromhex("aa0400282800000000000000000000000200")
 READ_ANSWER = bytes.fromhex("bb0400fb2800000008070807000000000000")
+SETTING_ID = READ_ANSWER[0x04]
 # The same value frame with its checksum byte cleared, so _validate_response
 # rejects it the way a corrupted frame off the air is rejected.
 CORRUPT_ANSWER = bytes.fromhex("bb0400002800000008070807000000000000")
@@ -61,17 +62,10 @@ def _make_session(received: list[bytes], key: bytes | None = None) -> Session:
 
 @pytest.mark.asyncio
 async def test_settings_wait_skips_ack_and_completes_on_value_frame() -> None:
-    """With a matcher, the acknowledgment does not answer the command.
-
-    The 0xAA acknowledgment arrives first and must leave the wait armed (its
-    zero value field would decode as auto-lock off); the 0xBB settings frame
-    resolves it. Both frames still reach the state callback.
-    """
+    """A matcher holds the wait past the acknowledgment until the response arrives."""
     received: list[bytes] = []
     session = _make_session(received)
-    matcher = _settings_response_matcher(
-        Commands.READSETTING.value, SettingType.AUTOLOCK.value
-    )
+    matcher = _settings_response_matcher(Commands.READSETTING.value, SETTING_ID)
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
         # The wait is armed before the GATT write, so both response frames
@@ -82,7 +76,7 @@ async def test_settings_wait_skips_ack_and_completes_on_value_frame() -> None:
         session._notify(0, bytearray(READ_ANSWER))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session.execute(bytearray(18), "auto_lock_status", matcher)
+    result = await session.execute(bytearray(18), "command", matcher)
 
     assert result == READ_ANSWER
     assert received == [READ_ACK, READ_ANSWER]
@@ -98,7 +92,7 @@ async def test_execute_without_matcher_takes_first_valid_frame() -> None:
         session._notify(0, bytearray(READ_ACK))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session.execute(bytearray(18), "auto_lock_status")
+    result = await session.execute(bytearray(18), "command")
 
     assert result == READ_ACK
 
@@ -127,7 +121,7 @@ async def test_the_answering_frame_reaches_the_callback_before_the_wait() -> Non
         session._notify(0, bytearray(READ_ACK))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session.execute(bytearray(18), "auto_lock_status")
+    result = await session.execute(bytearray(18), "command")
 
     assert result == READ_ACK
     assert received == [READ_ACK]
@@ -146,16 +140,14 @@ async def test_corrupt_frame_disarms_the_wait_and_the_command_is_retried() -> No
     """
     received: list[bytes] = []
     session = _make_session(received)
-    matcher = _settings_response_matcher(
-        Commands.READSETTING.value, SettingType.AUTOLOCK.value
-    )
+    matcher = _settings_response_matcher(Commands.READSETTING.value, SETTING_ID)
     frames = [CORRUPT_ANSWER, READ_ANSWER]
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
         session._notify(0, bytearray(frames.pop(0)))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session.execute(bytearray(18), "auto_lock_status", matcher)
+    result = await session.execute(bytearray(18), "command", matcher)
 
     assert result == READ_ANSWER
     assert session.client.write_gatt_char.await_count == 2
@@ -178,7 +170,7 @@ async def test_corrupt_frame_on_every_attempt_raises_and_leaves_the_slot_empty()
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
 
     with pytest.raises(ResponseError):
-        await session._locked_write(bytearray(18), "auto_lock_status")
+        await session._locked_write(bytearray(18), "command")
 
     assert session.client.write_gatt_char.await_count == 3
     assert session._notify_future is None
@@ -200,7 +192,7 @@ async def test_locked_write_clears_slot_on_success() -> None:
         session._notify(0, bytearray(READ_ANSWER))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session._locked_write(bytearray(18), "auto_lock_status")
+    result = await session._locked_write(bytearray(18), "command")
 
     assert result == READ_ANSWER
     assert session._notify_future is None
@@ -219,7 +211,7 @@ async def test_locked_write_clears_slot_on_timeout() -> None:
         patch.object(util, "asyncio_timeout", _short_timeout),
         pytest.raises(TimeoutError),
     ):
-        await session._locked_write(bytearray(18), "auto_lock_status")
+        await session._locked_write(bytearray(18), "command")
 
     assert session._notify_future is None
     assert session._notify_matcher is None
@@ -240,7 +232,7 @@ async def test_late_notify_after_timeout_is_ignored() -> None:
         patch.object(util, "asyncio_timeout", _short_timeout),
         pytest.raises(TimeoutError),
     ):
-        await session._locked_write(bytearray(18), "auto_lock_status")
+        await session._locked_write(bytearray(18), "command")
 
     assert session._notify_future is None
     session._notify(0, bytearray(READ_ANSWER))
@@ -260,14 +252,14 @@ async def test_fresh_command_rearms_slot_after_timeout() -> None:
         patch.object(util, "asyncio_timeout", _short_timeout),
         pytest.raises(TimeoutError),
     ):
-        await session._locked_write(bytearray(18), "auto_lock_status")
+        await session._locked_write(bytearray(18), "command")
     assert session._notify_future is None
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
         session._notify(0, bytearray(READ_ANSWER))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session._locked_write(bytearray(18), "auto_lock_status")
+    result = await session._locked_write(bytearray(18), "command")
 
     assert result == READ_ANSWER
     assert session._notify_future is None
@@ -329,7 +321,7 @@ async def test_a_rejection_during_a_failing_write_is_not_left_unretrieved() -> N
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
     with pytest.raises(BleakError, match="write failed"):
-        await session.execute(bytearray(18), "auto_lock_status")
+        await session.execute(bytearray(18), "command")
 
     assert session._notify_future is None
     # _log_traceback is the flag asyncio checks on GC to emit "exception was
@@ -437,7 +429,7 @@ async def test_a_short_frame_ends_an_armed_wait_and_the_command_is_re_sent() -> 
         session._notify(0, frames.pop(0))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session.execute(bytearray(18), "auto_lock_status")
+    result = await session.execute(bytearray(18), "command")
 
     assert result == READ_ANSWER
     assert session.client.write_gatt_char.await_count == 2
@@ -463,7 +455,7 @@ async def test_an_empty_notification_leaves_an_armed_wait_armed() -> None:
         session._notify(0, bytearray(READ_ANSWER))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session.execute(bytearray(18), "auto_lock_status")
+    result = await session.execute(bytearray(18), "command")
 
     assert result == READ_ANSWER
     assert session.client.write_gatt_char.await_count == 1
