@@ -4,6 +4,7 @@ import struct
 import time
 from collections.abc import Callable
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -3614,13 +3615,19 @@ async def test_lock_stamps_transitional_only_at_write_success():
 async def test_a_raising_stamp_still_opens_the_window():
     """The window opens even when stamping the transitional raises."""
     push_lock = _operational_push_lock()
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
 
     with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
         patch.object(
             push_lock, "_update_any_state", side_effect=RuntimeError("stamp failed")
         ),
         pytest.raises(RuntimeError),
     ):
+        # As _run_lock_operation sets it when the command is issued.
+        push_lock._operation_issued_at = clock[0]
         push_lock._operation_write_success(LockStatus.LOCKING)
 
     assert push_lock._operation_window_open is True
@@ -3964,14 +3971,13 @@ async def test_a_stop_mid_operation_keeps_the_owed_poll_and_the_floor():
 
 
 @pytest.mark.asyncio
-async def test_a_jam_recorded_before_the_stop_reaches_no_later_operation():
-    """A stopped operation clears its jam record so no later operation sees it."""
+async def test_an_operation_ending_while_stopped_discards_the_jams_time():
+    """An operation that ends while the watcher is stopped discards the jam's time."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:2d")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
     async def _jam_then_stop_then_fail(write_success_callback):
         write_success_callback()
-        # Filtered by the open window; the operation carries the record.
         push_lock._update_any_state([LockStatus.JAMMED])
         push_lock._running = False
         raise OperationIncompleteError("no op-response, and we were stopped")
@@ -3985,9 +3991,7 @@ async def test_a_jam_recorded_before_the_stop_reaches_no_later_operation():
     ):
         await push_lock.lock()
 
-    assert push_lock._seen_intervention_status is None
-
-    # A leaked record would raise OperationIncompleteError and show JAMMED.
+    # The stopped exit reset the jam's time, so the jam takes no precedence here.
     push_lock._running = True
     with (
         patch.object(
@@ -4006,17 +4010,19 @@ async def test_a_jam_recorded_before_the_stop_reaches_no_later_operation():
 
 
 @pytest.mark.asyncio
-async def test_jam_inside_the_window_outranks_a_successful_result() -> None:
-    """A jam received while the window is open replaces the completed state at exit."""
+async def test_a_jam_inside_the_window_is_displayed_when_it_arrives() -> None:
+    """A jam received while the window is open is displayed when it arrives."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
 
     mock_lock = MagicMock()
 
     async def force_lock(write_success_callback):
         write_success_callback()  # opens window, stamps LOCKING
         push_lock._update_any_state([LockStatus.JAMMED])
-        assert push_lock.lock_status == LockStatus.LOCKING  # dropped mid-window
+        assert push_lock.lock_status is LockStatus.JAMMED
 
     mock_lock.force_lock = force_lock
 
@@ -4025,8 +4031,8 @@ async def test_jam_inside_the_window_outranks_a_successful_result() -> None:
     ):
         await push_lock.lock()
 
+    assert emissions == [LockStatus.LOCKING, LockStatus.JAMMED]
     assert push_lock.lock_status == LockStatus.JAMMED
-    assert push_lock._seen_intervention_status is None  # cleared when the window closed
 
 
 def test_manual_intervention_statuses_is_public_and_complete() -> None:
@@ -4050,13 +4056,15 @@ async def test_a_setup_condition_inside_the_window_reaches_the_display(
     """Calibration and polarity discovery survive the window as a jam does."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
 
     mock_lock = MagicMock()
 
     async def force_lock(write_success_callback):
         write_success_callback()  # opens window, stamps LOCKING
         push_lock._update_any_state([setup_condition])
-        assert push_lock.lock_status == LockStatus.LOCKING  # dropped mid-window
+        assert push_lock.lock_status is setup_condition
 
     mock_lock.force_lock = force_lock
 
@@ -4065,8 +4073,8 @@ async def test_a_setup_condition_inside_the_window_reaches_the_display(
     ):
         await push_lock.lock()
 
+    assert emissions == [LockStatus.LOCKING, setup_condition]
     assert push_lock.lock_status is setup_condition
-    assert push_lock._seen_intervention_status is None  # cleared when the window closed
 
 
 @pytest.mark.asyncio
@@ -4092,37 +4100,87 @@ async def test_jam_inside_the_window_replaces_the_unknown_of_a_lost_result() -> 
 
     assert push_lock.lock_status == LockStatus.JAMMED
     assert push_lock._operation_window_open is False
-    assert push_lock._seen_intervention_status is None
 
 
 @pytest.mark.asyncio
-async def test_jam_inside_the_window_ends_the_attempt_ladder() -> None:
+@pytest.mark.parametrize(
+    "jam_before_the_issue",
+    [False, True],
+    ids=["jam-inside-the-window", "jam-3-s-before-the-issue"],
+)
+async def test_a_retryable_failure_under_precedence_ends_the_attempts(
+    jam_before_the_issue: bool,
+) -> None:
     """A retryable failure after a jam was reported does not re-send."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     attempts = 0
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
 
     async def force_lock(write_success_callback):
         nonlocal attempts
         attempts += 1
-        write_success_callback()
-        push_lock._update_any_state([LockStatus.JAMMED])
+        if not jam_before_the_issue:
+            write_success_callback()
+            push_lock._update_any_state([LockStatus.JAMMED])
         raise DisconnectedError("dropped after the jam was reported")
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
 
     with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
         patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
-        pytest.raises(OperationIncompleteError),
     ):
-        await push_lock.lock()
+        if jam_before_the_issue:
+            push_lock._update_any_state([LockStatus.JAMMED])
+            clock[0] = start + 3.0
+        with pytest.raises(OperationIncompleteError):
+            await push_lock.lock()
 
     assert attempts == 1  # the command was written once, and not again
     assert push_lock.lock_status == LockStatus.JAMMED
     assert push_lock._operation_window_open is False
-    assert push_lock._seen_intervention_status is None
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_retryable_failure_after_the_precedence_time_re_sends() -> None:
+    """A retryable failure re-sends when the jam is older than the precedence time."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:80")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    attempts = 0
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+
+    async def force_lock(write_success_callback):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise DisconnectedError("write failed")
+        write_success_callback()
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+    ):
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 6.0
+        await push_lock.lock()
+
+    assert attempts == 2
+    assert push_lock.lock_status is LockStatus.LOCKED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
 
 
 # Lock-opcode ack and op-responses, and a LOCK_ONLY status push carrying a jam.
@@ -4177,16 +4235,29 @@ def _write_delivering(
     return _write
 
 
+def _write_returning_first(
+    session: Session, frames: list[bytearray]
+) -> Callable[..., None]:
+    """Build a write whose frames are handled on the loop turn after it returns."""
+
+    def _write(*_: object) -> None:
+        loop = asyncio.get_running_loop()
+        for frame in frames:
+            loop.call_soon(session._notify, 0, bytearray(frame))
+
+    return _write
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "report",
     [[_OP_RESPONSE_JAMMED], [_STATUS_PUSH_JAMMED, _OP_RESPONSE_OK]],
     ids=["failure-op-response", "status-push"],
 )
-async def test_a_jam_reported_before_the_write_returns_is_put_back_at_the_exit(
+async def test_a_jam_reported_before_the_write_returns_never_leaves_the_display(
     report: list[str],
 ) -> None:
-    """A jam the lock reports before the write call returns is put back at the exit."""
+    """A jam the lock reports before the write call returns never leaves the display."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:70")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     emissions: list[LockStatus] = []
@@ -4199,7 +4270,7 @@ async def test_a_jam_reported_before_the_write_returns_is_put_back_at_the_exit(
         await push_lock.lock()
 
     assert client.write_gatt_char.await_count == 1
-    assert emissions == [LockStatus.JAMMED, LockStatus.LOCKING, LockStatus.JAMMED]
+    assert emissions == [LockStatus.JAMMED]
     push_lock._cancel_future_update()
     push_lock._cancel_disconnect_timer()
 
@@ -4232,14 +4303,370 @@ async def test_a_jam_reported_before_the_write_returns_ends_the_attempts() -> No
 
 
 @pytest.mark.asyncio
-async def test_a_jam_with_no_operation_in_flight_is_not_recorded() -> None:
-    """A jam reported with no operation in flight is displayed and not recorded."""
-    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:72")
+async def test_a_command_issued_within_the_precedence_time_keeps_the_jam_on_display():
+    """A command issued within the precedence time leaves the jam on display."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:81")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
 
-    push_lock._update_any_state([LockStatus.JAMMED])
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+    ):
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 3.0
+        await push_lock.lock()
 
+    assert client.write_gatt_char.await_count == 1
+    assert emissions == [LockStatus.JAMMED]
     assert push_lock.lock_status is LockStatus.JAMMED
-    assert push_lock._seen_intervention_status is None
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_command_issued_after_the_precedence_time_shows_its_result():
+    """A command issued after the precedence time shows its transitional and result."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:82")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+    ):
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 6.0
+        await push_lock.lock()
+
+    assert client.write_gatt_char.await_count == 1
+    assert emissions == [LockStatus.JAMMED, LockStatus.LOCKING, LockStatus.LOCKED]
+    assert push_lock.lock_status is LockStatus.LOCKED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_jam_pushed_during_the_connect_keeps_the_display() -> None:
+    """A jam pushed while the command connects keeps the display."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:83")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
+
+    def connect_with_a_jam_pushed() -> Lock:
+        session._notify(0, bytearray(_with_checksum(_STATUS_PUSH_JAMMED)))
+        return lock
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(side_effect=connect_with_a_jam_pushed)
+    ):
+        await push_lock.lock()
+
+    assert client.write_gatt_char.await_count == 1
+    assert emissions == [LockStatus.JAMMED]
+    assert push_lock.lock_status is LockStatus.JAMMED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("write", "emitted"),
+    [
+        (
+            _write_returning_first,
+            [LockStatus.JAMMED, LockStatus.LOCKING, LockStatus.JAMMED],
+        ),
+        (_write_delivering, [LockStatus.JAMMED]),
+    ],
+    ids=["handled-after-the-write-returned", "handled-before-the-write-returned"],
+)
+async def test_a_re_jam_after_the_precedence_time_shows_the_attempt(
+    write: Callable[[Session, list[bytearray]], Callable[..., None]],
+    emitted: list[LockStatus],
+) -> None:
+    """A re-jam against a command past the precedence time leaves JAMMED on display."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:84")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_JAMMED)]
+    client.write_gatt_char = AsyncMock(side_effect=write(session, frames))
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+    ):
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 6.0
+        await push_lock.lock()
+
+    assert client.write_gatt_char.await_count == 1
+    assert emissions == emitted
+    assert push_lock.lock_status is LockStatus.JAMMED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_precedence_is_read_from_the_issue_time_not_the_stamp() -> None:
+    """Precedence is read from the command's issue time, not from its write's return."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:85")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    deliver = _write_delivering(session, frames)
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+
+    def write_returning_late(*args: object) -> None:
+        clock[0] = start + 6.0
+        deliver(*args)
+
+    client.write_gatt_char = AsyncMock(side_effect=write_returning_late)
+
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+    ):
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 4.0
+        await push_lock.lock()
+
+    assert client.write_gatt_char.await_count == 1
+    assert emissions == [LockStatus.JAMMED]
+    assert push_lock.lock_status is LockStatus.JAMMED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_ends_the_precedence_of_a_reported_jam() -> None:
+    """A jam reported before a stop takes no precedence after a restart."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:86")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+
+    async def force_lock(write_success_callback):
+        write_success_callback()
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+    ):
+        push_lock._update_any_state([LockStatus.JAMMED])
+        push_lock._cancel()
+        await asyncio.gather(*push_lock._background_tasks)
+        push_lock._running = True
+        emissions: list[LockStatus] = []
+        push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+        clock[0] = start + 3.0
+        await push_lock.lock()
+
+    assert push_lock._last_jam_event_time == NEVER_TIME
+    assert emissions == [LockStatus.LOCKING, LockStatus.LOCKED]
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_a_command_keeps_the_jams_precedence() -> None:
+    """A stop and restart during a command leave the jam's precedence in place."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:8a")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    attempts = 0
+
+    async def force_lock(write_success_callback):
+        nonlocal attempts
+        attempts += 1
+        write_success_callback()
+        # Stopped and restarted while the command is in flight, so _cancel leaves
+        # the jam's time alone.
+        push_lock._update_any_state([LockStatus.JAMMED])
+        push_lock._cancel()
+        push_lock._running = True
+        raise DisconnectedError("dropped after the jam was reported")
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+        pytest.raises(OperationIncompleteError),
+    ):
+        await push_lock.lock()
+
+    assert attempts == 1
+    assert push_lock.lock_status is LockStatus.JAMMED
+    await asyncio.gather(*push_lock._background_tasks)
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_jam_report_restarts_the_precedence_time() -> None:
+    """A repeated jam report restarts the precedence time."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:8b")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+
+    async def force_lock(write_success_callback):
+        write_success_callback()
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+    ):
+        push_lock._update_any_state([LockStatus.JAMMED])
+        emissions: list[LockStatus] = []
+        push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+        clock[0] = start + 20.0
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 23.0
+        await push_lock.lock()
+
+    assert emissions == []
+    assert push_lock.lock_status is LockStatus.JAMMED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_jam_displayed_during_a_command_counts_from_its_report() -> None:
+    """The precedence time runs from the lock's report, not from the exit."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:8c")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+
+    async def jam_then_lose_the_result(write_success_callback):
+        write_success_callback()
+        clock[0] = start + 1.0
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 12.0
+        raise OperationIncompleteError("acknowledged, and no op-response")
+
+    async def force_lock(write_success_callback):
+        write_success_callback()
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = jam_then_lose_the_result
+
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+    ):
+        with pytest.raises(OperationIncompleteError):
+            await push_lock.lock()
+
+        assert emissions == [LockStatus.LOCKING, LockStatus.JAMMED]
+        assert push_lock._last_jam_event_time == start + 1.0
+
+        clock[0] = start + 14.0
+        mock_lock.force_lock = force_lock
+        await push_lock.lock()
+
+    assert emissions == [
+        LockStatus.LOCKING,
+        LockStatus.JAMMED,
+        LockStatus.LOCKING,
+        LockStatus.LOCKED,
+    ]
+    assert push_lock.lock_status is LockStatus.LOCKED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "emitted", "poll_delay"),
+    [
+        (None, [LockStatus.LOCKING, LockStatus.LOCKED], KEEP_ALIVE_TIME),
+        (
+            OperationIncompleteError("acknowledged, and no op-response"),
+            [LockStatus.LOCKING, LockStatus.UNKNOWN],
+            LOCK_STALE_STATE_DEBOUNCE_DELAY,
+        ),
+    ],
+    ids=["success", "op-response-lost"],
+)
+async def test_a_command_over_a_position_admitted_after_a_jam_shows_its_result(
+    failure: Exception | None, emitted: list[LockStatus], poll_delay: float
+) -> None:
+    """A command over a position admitted after the jam shows its own result."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:88")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+
+    async def force_lock(write_success_callback):
+        write_success_callback()
+        if failure is not None:
+            raise failure
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(push_lock, "_schedule_future_update") as scheduled,
+    ):
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 0.8
+        push_lock._update_any_state([LockStatus.UNLOCKED])
+        emissions: list[LockStatus] = []
+        push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+        clock[0] = start + 3.0
+        if failure is None:
+            await push_lock.lock()
+        else:
+            with pytest.raises(OperationIncompleteError):
+                await push_lock.lock()
+
+    assert emissions == emitted
+    scheduled.assert_called_once_with(poll_delay)
+    push_lock._cancel_disconnect_timer()
 
 
 @pytest.mark.asyncio
@@ -4292,21 +4719,32 @@ async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
 
 
 @pytest.mark.asyncio
-async def test_window_filter_drops_lock_status_admits_the_door_member() -> None:
-    """The window refuses every lock status, records a jam, and admits the door."""
+async def test_the_window_refuses_a_position_and_passes_a_jam_and_the_door_member():
+    """The window refuses a position and passes a jam and the door member."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3b")
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+    # As _run_lock_operation sets them when the command is issued.
     push_lock._operation_in_flight = True
+    push_lock._operation_issued_at = start
 
-    push_lock._operation_write_success(LockStatus.LOCKING)
-    assert push_lock.lock_status is LockStatus.LOCKING
-    assert push_lock._operation_window_open is True
+    with patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])):
+        push_lock._operation_write_success(LockStatus.LOCKING)
+        assert push_lock.lock_status is LockStatus.LOCKING
+        assert push_lock._operation_window_open is True
 
-    push_lock._update_any_state([LockStatus.LOCKED])
-    assert push_lock.lock_status is LockStatus.LOCKING
+        push_lock._update_any_state([LockStatus.LOCKED])
+        assert push_lock.lock_status is LockStatus.LOCKING
 
-    push_lock._update_any_state([LockStatus.JAMMED, DoorStatus.OPENED])
-    assert push_lock.lock_status is LockStatus.LOCKING
-    assert push_lock._seen_intervention_status is LockStatus.JAMMED
+        clock[0] = start + 0.5
+        push_lock._update_any_state([LockStatus.JAMMED, DoorStatus.OPENED])
+        # Read _lock_state directly: mypy narrows lock_status to LOCKING after the
+        # assert above and marks the lines below unreachable.
+        displayed = push_lock._lock_state
+        assert displayed is not None
+        assert displayed.lock is LockStatus.JAMMED
+        assert push_lock._last_jam_event_time == start + 0.5
 
     assert push_lock.door_status is DoorStatus.OPENED
 
@@ -4438,15 +4876,15 @@ async def test_cancelled_mid_operation_closes_window_without_unknown() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_mid_operation_displays_a_jam_it_received() -> None:
-    """A cancel applies a jam the window filtered out, as every other exit does."""
+async def test_a_cancel_leaves_a_reported_jam_on_display() -> None:
+    """A cancel leaves a jam the lock reported during the command on display."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:4f")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
     async def force_lock(write_success_callback: Callable[[], None]) -> None:
         write_success_callback()  # opens the window, stamps LOCKING
         push_lock._update_any_state([LockStatus.JAMMED])
-        assert push_lock.lock_status == LockStatus.LOCKING  # dropped mid-window
+        assert push_lock.lock_status is LockStatus.JAMMED
         raise asyncio.CancelledError
 
     mock_lock = MagicMock()
@@ -4460,7 +4898,6 @@ async def test_cancelled_mid_operation_displays_a_jam_it_received() -> None:
 
     assert push_lock.lock_status == LockStatus.JAMMED
     assert push_lock._operation_window_open is False
-    assert push_lock._seen_intervention_status is None  # cleared when the window closed
     push_lock._cancel_future_update()
     push_lock._cancel_disconnect_timer()
 
@@ -4621,9 +5058,15 @@ async def test_a_refused_reading_leaves_the_status_poll_owed() -> None:
     """A reading the window refuses does not mark LockStatus as seen."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6c")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
-    push_lock._operation_write_success(LockStatus.UNLOCKING)  # opens the window
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
 
-    push_lock._update_any_state([LockStatus.UNLOCKED])
+    with patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])):
+        # As _run_lock_operation sets it when the command is issued.
+        push_lock._operation_issued_at = clock[0]
+        push_lock._operation_write_success(LockStatus.UNLOCKING)  # opens the window
+        push_lock._update_any_state([LockStatus.UNLOCKED])
 
     assert push_lock.lock_status is LockStatus.UNLOCKING  # the reading was refused
     assert LockStatus not in push_lock._seen_this_session

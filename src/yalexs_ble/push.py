@@ -121,6 +121,10 @@ SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
 
+# How long after the lock last reported a jam or setup condition the report
+# takes precedence over a command of ours.
+JAMMED_PRECEDENCE_TIME = 5.0
+
 # How long to wait before re-checking while an operation holds the lock.
 OPERATION_IN_PROGRESS_DEFER_SECONDS = 1.0
 
@@ -397,9 +401,8 @@ class PushLock:
         self._first_update_future: asyncio.Future[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._init_operation_state()
-        # A status needing someone at the lock, seen while an operation was in
-        # flight; the operation applies it at exit. Survives a reconnect.
-        self._seen_intervention_status: LockStatus | None = None
+        # When the lock last reported a jam or setup condition; a stop resets it.
+        self._last_jam_event_time = NEVER_TIME
         # The next cycle reads lock_status() even if _seen_this_session would
         # skip it, since that reading may be the one to replace.
         self._force_lock_status_poll = False
@@ -804,6 +807,7 @@ class PushLock:
         self._operation_outcome = None
         self._operation_window_open = False
         self._operation_in_flight = False
+        self._operation_issued_at = NEVER_TIME
 
     @operation_lock
     async def _run_lock_operation(
@@ -813,6 +817,9 @@ class PushLock:
         self._cancel_future_update()
         self._operation_outcome = None
         self._operation_in_flight = True
+        # Taken under the operation lock, so a command queued behind another
+        # counts from when it runs.
+        self._operation_issued_at = time.monotonic()
         try:
             await self._execute_lock_operation(op_attr, pending_state, complete_state)
         except Exception:
@@ -822,42 +829,68 @@ class PushLock:
         finally:
             self._finalize_operation()
 
+    def _jam_takes_precedence(self) -> bool:
+        """Whether a reported jam or setup condition takes precedence over the command.
+
+        True for a report within JAMMED_PRECEDENCE_TIME before the command was
+        issued, or since.
+        """
+        return (
+            self._last_jam_event_time
+            >= self._operation_issued_at - JAMMED_PRECEDENCE_TIME
+        )
+
     def _operation_write_success(self, pending_state: LockStatus) -> None:
         """Stamp the transitional, then open the operation window.
 
-        Opened in a finally: the session swallows errors from this hook and
-        keeps waiting, so a failed stamp must not leave the window closed.
+        The transitional is not displayed while a reported jam or setup
+        condition takes precedence and is still on display. Opened in a
+        finally: the session swallows errors from this hook and keeps waiting,
+        so a failed stamp must not leave the window closed.
         """
         try:
-            self._update_any_state([pending_state])
+            if not (
+                self._jam_takes_precedence()
+                and self.lock_status in MANUAL_INTERVENTION_STATUSES
+            ):
+                self._update_any_state([pending_state])
+            else:
+                _LOGGER.debug(
+                    "%s: %s not stamped; a status needing attention takes precedence",
+                    self.name,
+                    pending_state,
+                )
         finally:
             self._operation_window_open = True
 
     def _close_operation_window(self) -> None:
-        """Close the operation window and drop the recorded intervention status."""
+        """Close the operation window."""
         self._operation_window_open = False
-        self._seen_intervention_status = None
 
     def _finalize_operation(self) -> None:
         """Close the operation window, display the outcome, schedule the next poll."""
         self._operation_in_flight = False
         outcome = self._operation_outcome
-        # A jam or setup condition the lock reported while the operation ran
-        # may never be reported again, so it replaces the outcome.
-        if (recorded := self._seen_intervention_status) is not None:
-            outcome = recorded
-            _LOGGER.debug(
-                "%s: the lock reported %s while the operation was in flight",
-                self.name,
-                recorded,
-            )
+        precedence = self._jam_takes_precedence()
         self._close_operation_window()
         # Set before the stop check so a restarted watcher inherits them.
         self._force_lock_status_poll = True
         self._earliest_update_time = time.monotonic() + LOCK_STALE_STATE_DEBOUNCE_DELAY
         if not self._running:
             # Stopped mid-operation: a cycle armed now would outlive the stop.
+            # A restarted watcher polls the lock afresh, so a report from before
+            # the stop takes no precedence over its commands.
+            self._last_jam_event_time = NEVER_TIME
             return
+        if precedence and self.lock_status in MANUAL_INTERVENTION_STATUSES:
+            # The outcome yields to a jam or setup condition the lock reported
+            # within the precedence time or during the command.
+            _LOGGER.debug(
+                "%s: %s not applied; a status needing attention takes precedence",
+                self.name,
+                outcome,
+            )
+            outcome = None
         if outcome is not None:
             self._update_any_state([outcome])
         # The exit owns the next poll; drop any cycle armed during the operation.
@@ -880,12 +913,13 @@ class PushLock:
         Every incoming lock status, polled or pushed, must pass through
         here.
         """
-        if incoming in MANUAL_INTERVENTION_STATUSES and self._operation_in_flight:
-            # The lock may never report it again; the operation applies it at exit.
-            self._seen_intervention_status = incoming
-        if self._operation_window_open:
-            # The operation applies its own outcome; door and battery values in
-            # the same frame still apply.
+        now = time.monotonic()
+        if incoming in MANUAL_INTERVENTION_STATUSES:
+            self._last_jam_event_time = now
+        if self._operation_window_open and incoming not in MANUAL_INTERVENTION_STATUSES:
+            # The operation applies its own outcome, which says nothing about a
+            # jam or setup condition, so those pass, as do door and battery
+            # values in the same frame.
             _LOGGER.debug(
                 "%s: Operation in flight, not accepting lock status %s",
                 self.name,
@@ -914,7 +948,8 @@ class PushLock:
                 )
             )
         except OperationIncompleteError:
-            # Raised as is; the arm below would rewrap it when a status is recorded.
+            # Re-raised as is; the arm below would wrap it while a jam takes
+            # precedence.
             _LOGGER.debug(
                 "%s: %s did not complete; the result never arrived",
                 self.name,
@@ -922,13 +957,14 @@ class PushLock:
             )
             raise
         except Exception as ex:
-            if (recorded := self._seen_intervention_status) is not None:
-                # Non-retryable: a retry would drive the motor into a mechanism
-                # that needs attention.
+            # A retry would drive the motor into a mechanism the lock reported as
+            # needing attention, so the attempts end with a type outside the
+            # retry set.
+            if self._jam_takes_precedence():
                 raise OperationIncompleteError(
-                    f"{self.name}: the lock reported {recorded} while "
-                    f"{op_attr} was in flight; the command was not re-sent "
-                    f"and the result is unknown"
+                    f"{self.name}: a jam or setup condition the lock reported takes "
+                    f"precedence over {op_attr}, whose attempt ended with {ex!r}; the "
+                    f"command was not retried"
                 ) from ex
             # Close the window so a retry re-stamps at its write-success.
             self._close_operation_window()
@@ -1752,6 +1788,10 @@ class PushLock:
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
+        if not self._operation_in_flight:
+            # Left set while a command is in flight so a jam reported during it
+            # still ends its attempts; the stopped exit resets it instead.
+            self._last_jam_event_time = NEVER_TIME
         self.background_task(self._execute_forced_disconnect("stopping"))
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:
