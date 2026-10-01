@@ -5139,6 +5139,26 @@ async def test_no_update_cycle_is_armed_inside_an_operation() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reported",
+    [LockStatus.UNLOCKED, LockStatus.JAMMED],
+    ids=["unlocked-over-locked", "jammed-over-locked"],
+)
+async def test_a_status_the_lock_reports_arms_no_cycle(reported: LockStatus) -> None:
+    """A status the lock reports arms no update cycle of ours."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:89")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    assert push_lock._cancel_deferred_update is None
+
+    with patch.object(push_lock, "_schedule_future_update") as scheduled:
+        push_lock._update_any_state([reported])
+
+    assert push_lock.lock_status is reported
+    assert push_lock._cancel_deferred_update is None
+    scheduled.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
     """A deferred update armed before the operation is cancelled before it connects."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:63")
