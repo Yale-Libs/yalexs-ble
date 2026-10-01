@@ -73,8 +73,6 @@ DISCONNECT_DELAY = 5.1
 # How long to wait to disconnect after an operation if there is a pending update
 DISCONNECT_DELAY_PENDING_UPDATE = 12.5
 
-RESYNC_DELAY = 0.01
-
 KEEP_ALIVE_TIME = 25.0  # Lock will disconnect after 30 seconds of inactivity
 
 # Reconnect delay while updates keep failing; doubles per failure up to the
@@ -831,7 +829,7 @@ class PushLock:
         keeps waiting, so a failed stamp must not leave the window closed.
         """
         try:
-            self._update_any_state([pending_state], arm_resync=False)
+            self._update_any_state([pending_state])
         finally:
             self._operation_window_open = True
 
@@ -861,7 +859,7 @@ class PushLock:
             # Stopped mid-operation: a cycle armed now would outlive the stop.
             return
         if outcome is not None:
-            self._update_any_state([outcome], arm_resync=False)
+            self._update_any_state([outcome])
         # The exit owns the next poll; drop any cycle armed during the operation.
         self._cancel_future_update()
         # Unsettled, or always-connected with the link down (this cycle is its
@@ -1105,16 +1103,10 @@ class PushLock:
     def _update_any_state(
         self,
         states: Iterable[LockStateValue | AuthState],
-        arm_resync: bool = True,
     ) -> None:
-        """Apply states to the display.
-
-        arm_resync=False for states an operation applies itself; its own
-        follow-up poll reads them back instead of a resync cycle.
-        """
+        """Apply states to the display."""
         _LOGGER.debug("%s: State changed: %s", self.name, states)
         lock_state = self._get_current_state()
-        original_lock_status = lock_state.lock
         changes: dict[str, Any] = {}
         for state in states:
             if isinstance(state, BatteryState) and state.voltage <= 3.0:
@@ -1181,14 +1173,6 @@ class PushLock:
             return
 
         lock_state = replace(lock_state, **changes)
-        if (
-            arm_resync
-            and original_lock_status != lock_state.lock
-            and (not lock_state.auth or lock_state.auth.successful)
-            and original_lock_status != LockStatus.UNKNOWN
-        ):
-            self._schedule_future_update(RESYNC_DELAY)
-
         self._callback_state(lock_state)
 
     def _record_auth_success(self) -> None:
