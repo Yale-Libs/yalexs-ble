@@ -128,7 +128,8 @@ POST_OPERATION_SYNC_TIME = 10.00
 JAMMED_PRECEDENCE_TIME = 5.0
 
 # How long a jam or setup condition stays on display once it arrives; polls
-# after a jam may return a plain position and nothing announces its end.
+# after a jam may return a plain position and nothing announces its end. A
+# command of ours issued after JAMMED_PRECEDENCE_TIME releases it.
 JAMMED_HOLD_TIME = 30.0
 
 # How long to wait before re-checking while an operation holds the lock.
@@ -926,22 +927,22 @@ class PushLock:
     def _operation_write_success(self, pending_state: LockStatus) -> None:
         """Display the operation's transitional state.
 
-        Skipped once the op-response has been handled, and while a reported jam
-        or setup condition takes precedence and is still on display. The display
-        hold is released first.
+        Does nothing once the op-response has been handled, or while a reported
+        jam or setup condition takes precedence and is still on display;
+        otherwise the display hold is released first.
         """
         if self._operation_answered:
             return
-        if time.monotonic() < self._jammed_hold_deadline:
-            _LOGGER.debug(
-                "%s: New operation write succeeded; releasing the display hold",
-                self.name,
-            )
-        self._release_jam_hold()
         if not (
             self._jam_takes_precedence()
             and self.lock_status in MANUAL_INTERVENTION_STATUSES
         ):
+            if time.monotonic() < self._jammed_hold_deadline:
+                _LOGGER.debug(
+                    "%s: New operation write succeeded; releasing the display hold",
+                    self.name,
+                )
+            self._release_jam_hold()
             self._update_any_state([pending_state], operation=True)
         else:
             _LOGGER.debug(
