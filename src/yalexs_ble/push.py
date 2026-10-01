@@ -959,7 +959,8 @@ class PushLock:
         except Exception as ex:
             # A retry would drive the motor into a mechanism the lock reported as
             # needing attention, so the attempts end with a type outside the
-            # retry set.
+            # retry set. The display is not consulted: a position the lock
+            # answers right after a jam does not make a re-send safe.
             if self._jam_takes_precedence():
                 raise OperationIncompleteError(
                     f"{self.name}: a jam or setup condition the lock reported takes "

@@ -4670,6 +4670,46 @@ async def test_a_command_over_a_position_admitted_after_a_jam_shows_its_result(
 
 
 @pytest.mark.asyncio
+async def test_a_failure_over_a_position_admitted_after_a_jam_is_not_retried() -> None:
+    """A failure over a position admitted after a jam is not retried."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:8d")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    attempts = 0
+
+    async def force_lock(write_success_callback):
+        nonlocal attempts
+        attempts += 1
+        write_success_callback()
+        raise DisconnectedError("dropped after the write")
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+    # Started from the real clock so a time left at NEVER_TIME never reads as recent.
+    start = time.monotonic()
+    clock = [start]
+
+    with (
+        patch("yalexs_ble.push.time", SimpleNamespace(monotonic=lambda: clock[0])),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(push_lock, "_schedule_future_update") as scheduled,
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+    ):
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 0.8
+        push_lock._update_any_state([LockStatus.UNLOCKED])
+        emissions: list[LockStatus] = []
+        push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+        clock[0] = start + 3.0
+        with pytest.raises(OperationIncompleteError):
+            await push_lock.lock()
+
+    assert attempts == 1
+    assert emissions == [LockStatus.LOCKING, LockStatus.UNKNOWN]
+    scheduled.assert_called_once_with(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
 async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
     """A second operation queued on the operation lock stamps nothing."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3a")
