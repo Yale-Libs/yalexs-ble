@@ -666,9 +666,6 @@ async def test_update_does_not_revert_a_mid_cycle_change() -> None:
         push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
     ):
         update_task = asyncio.create_task(push_lock._update())
-        # As _deferred_update would, so the resync the change arms defers to
-        # this cycle instead of starting a second one mid-test.
-        push_lock._update_task = update_task
 
         await auto_lock_in_progress.wait()
         push_lock._update_any_state([LockStatus.UNLOCKED, DoorStatus.OPENED])
@@ -676,7 +673,6 @@ async def test_update_does_not_revert_a_mid_cycle_change() -> None:
         allow_auto_lock_to_continue.set()
 
         await update_task
-        push_lock._cancel_future_update()
 
     assert push_lock.lock_status == LockStatus.UNLOCKED
     assert push_lock.door_status == DoorStatus.OPENED
@@ -4673,7 +4669,7 @@ async def test_exhausted_retries_after_write_success_stamp_unknown() -> None:
 async def test_no_update_cycle_is_armed_inside_an_operation() -> None:
     """Nothing the operation applies arms a cycle while the operation runs."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:43")
-    # A known prior status, so a change to the transitional would arm a resync.
+    # A known prior status, so the transitional changes the display.
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     armed_during: list[float] = []
 
@@ -4962,7 +4958,7 @@ async def test_a_value_the_lock_is_not_holding_is_not_a_status_reading(
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:47")
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
 
-    push_lock._update_any_state([status], arm_resync=False)
+    push_lock._update_any_state([status])
 
     assert push_lock.lock_status == status
     assert LockStatus not in push_lock._seen_this_session
@@ -4987,7 +4983,7 @@ async def test_a_position_the_lock_holds_counts_as_a_status_reading(
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:67")
     push_lock._lock_state = _known_state(LockStatus.UNKNOWN)
 
-    push_lock._update_any_state([position], arm_resync=False)
+    push_lock._update_any_state([position])
 
     assert push_lock.lock_status == position
     assert LockStatus in push_lock._seen_this_session
