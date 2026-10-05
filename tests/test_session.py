@@ -830,6 +830,80 @@ async def test_a_raising_write_success_callback_does_not_abort_the_staged_wait(
 
 
 @pytest.mark.asyncio
+async def test_the_result_callback_runs_once_before_the_wait_resolves() -> None:
+    """The result callback runs once, on the op-response, before the wait resolves."""
+    session, client = _make_operation_session()
+    progress = OperationProgress()
+    command = session.build_operation_command(Commands.LOCK, 0x04)
+    ack = _with_checksum(_ACK_SECUREMODE)
+    other_opcode = _with_checksum("bb0a00000000000000000000000000000200")
+    settled = _with_checksum(_SETTLED_STATUS)
+    op_response = _with_checksum(_OP_RESPONSE_OK)
+    calls: list[tuple[bytes, bool]] = []
+
+    def result_cb(frame: bytes) -> None:
+        future = session._notify_future
+        calls.append((frame, future is not None and not future.done()))
+
+    async def feed() -> None:
+        await _spin_until_written(client)
+        for frame in (ack, other_opcode, settled, op_response, op_response):
+            session._notify(0, bytearray(frame))
+
+    feeder = asyncio.create_task(feed())
+    result = await session.execute_operation(
+        command,
+        "force_securemode",
+        ack_matcher=_ack_matcher(0x0B, 0x04),
+        response_matcher=_operation_response_matcher(0x0B),
+        response_timeout=5.0,
+        progress=progress,
+        result_callback=result_cb,
+    )
+    await feeder
+
+    assert result == bytes(op_response)
+    assert calls == [(bytes(op_response), True)]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_result_callback_still_completes_the_staged_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising result callback is contained and the op-response completes the wait."""
+    session, client = _make_operation_session()
+    result_cb = MagicMock(side_effect=RuntimeError("callback bug"))
+    progress = OperationProgress()
+    command = session.build_operation_command(Commands.LOCK, 0x04)
+    ack = _with_checksum(_ACK_SECUREMODE)
+    op_response = _with_checksum(_OP_RESPONSE_OK)
+
+    async def feed() -> None:
+        await _spin_until_written(client)
+        session._notify(0, bytearray(ack))
+        await _spin_until(lambda: progress.acknowledged)
+        session._notify(0, bytearray(op_response))
+
+    feeder = asyncio.create_task(feed())
+    with caplog.at_level("ERROR", logger="yalexs_ble.session"):
+        result = await session.execute_operation(
+            command,
+            "force_securemode",
+            ack_matcher=_ack_matcher(0x0B, 0x04),
+            response_matcher=_operation_response_matcher(0x0B),
+            response_timeout=5.0,
+            progress=progress,
+            result_callback=result_cb,
+        )
+    await feeder
+
+    assert result == bytes(op_response)
+    result_cb.assert_called_once_with(bytes(op_response))
+    assert "result callback raised" in caplog.text
+    assert "callback bug" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_execute_operation_ignores_foreign_frames() -> None:
     """A settle and a foreign ack mid-wait do not complete the operation."""
     seen: list[bytes] = []
