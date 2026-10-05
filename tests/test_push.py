@@ -3623,25 +3623,6 @@ async def test_lock_stamps_transitional_only_at_write_success():
 
 
 @pytest.mark.asyncio
-async def test_a_raising_stamp_still_opens_the_window():
-    """The window opens even when stamping the transitional raises."""
-    push_lock = _operational_push_lock()
-
-    with (
-        _patched_clock() as clock,
-        patch.object(
-            push_lock, "_update_any_state", side_effect=RuntimeError("stamp failed")
-        ),
-        pytest.raises(RuntimeError),
-    ):
-        # As _run_lock_operation sets it when the command is issued.
-        push_lock._operation_issued_at = clock[0]
-        push_lock._operation_write_success(LockStatus.LOCKING)
-
-    assert push_lock._operation_window_open is True
-
-
-@pytest.mark.asyncio
 async def test_window_filters_foreign_settle_until_close():
     """A lock status is dropped while the window is open and admitted after."""
     push_lock = _operational_push_lock()
@@ -3697,7 +3678,7 @@ async def test_a_recorded_outcome_stands_when_the_operation_fails() -> None:
 
 @pytest.mark.asyncio
 async def test_early_error_before_write_leaves_no_window_and_stamps_unknown():
-    """A retryable failure before the write opens no window and stamps UNKNOWN."""
+    """A retryable failure before the write closes the window and displays UNKNOWN."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
 
@@ -3727,7 +3708,7 @@ async def test_nonretryable_after_write_stamps_unknown():
     mock_lock = MagicMock()
 
     async def force_lock(write_success_callback, result_callback):
-        write_success_callback()  # opens window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         raise exc
 
     mock_lock.force_lock = force_lock
@@ -3761,7 +3742,7 @@ async def test_queued_second_operation_waits_for_the_first_to_settle():
         nonlocal first_attempt
         if first_attempt:
             first_attempt = False
-            write_success_callback()  # opens window, stamps LOCKING
+            write_success_callback()  # puts LOCKING on the display
             await proceed.wait()
             raise OperationIncompleteError("no op-response")
         write_success_callback()  # the second operation succeeds
@@ -3799,7 +3780,7 @@ async def test_cancelled_queued_operation_leaves_the_window_alone():
     proceed = asyncio.Event()
 
     async def force_lock(write_success_callback, result_callback):
-        write_success_callback()  # opens window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         await proceed.wait()
         result_callback(True)
 
@@ -3840,7 +3821,7 @@ async def test_retry_restamps_at_write_success_without_unknown():
     async def force_lock(write_success_callback, result_callback):
         nonlocal attempts
         attempts += 1
-        write_success_callback()  # opens window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         after_each_hook.append(
             (push_lock.lock_status, push_lock._operation_window_open)
         )
@@ -3880,23 +3861,29 @@ async def test_a_settled_status_between_attempts_reaches_the_display():
     push_lock.register_callback(cb)
 
     attempts = 0
+    connects = 0
 
     async def force_lock(write_success_callback, result_callback):
         nonlocal attempts
         attempts += 1
+        write_success_callback()  # puts LOCKING on the display
         if attempts == 1:
-            write_success_callback()  # opens the window, stamps LOCKING
             raise DisconnectedError("dropped before ack")
-        # Between attempts the window is closed, so this reading is admitted.
-        push_lock._update_any_state([LockStatus.LOCKED])
-        write_success_callback()
         result_callback(True)
+
+    def connect() -> MagicMock:
+        nonlocal connects
+        connects += 1
+        if connects == 2:
+            # Delivered as the second attempt connects, where the window is closed.
+            push_lock._update_any_state([LockStatus.LOCKED])
+        return mock_lock
 
     mock_lock = MagicMock()
     mock_lock.force_lock = force_lock
 
     with (
-        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(side_effect=connect)),
         patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
     ):
         await push_lock.lock()
@@ -4035,7 +4022,7 @@ async def test_a_jam_inside_the_window_is_displayed_when_it_arrives() -> None:
     mock_lock = MagicMock()
 
     async def force_lock(write_success_callback, result_callback):
-        write_success_callback()  # opens window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         push_lock._update_any_state([LockStatus.JAMMED])
         assert push_lock.lock_status is LockStatus.JAMMED
         result_callback(True)
@@ -4078,7 +4065,7 @@ async def test_a_setup_condition_inside_the_window_reaches_the_display(
     mock_lock = MagicMock()
 
     async def force_lock(write_success_callback, result_callback):
-        write_success_callback()  # opens window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         push_lock._update_any_state([setup_condition])
         assert push_lock.lock_status is setup_condition
         result_callback(True)
@@ -4197,13 +4184,14 @@ async def test_a_retryable_failure_after_the_precedence_time_re_sends() -> None:
     push_lock._cancel_disconnect_timer()
 
 
-# Lock-opcode ack and op-responses, and LOCK_ONLY status pushes carrying a jam
-# and the unlocked position.
+# Lock-opcode ack and op-responses, and LOCK_ONLY status pushes carrying a jam,
+# Unlocked, and Locked.
 _ACK_LOCK = "aa0b00000000000000000000000000000200"
 _OP_RESPONSE_OK = "bb0b00000000000000000000000000000200"
 _OP_RESPONSE_JAMMED = "bb0b000000000000000000000000001f0200"
 _STATUS_PUSH_JAMMED = "bb0200000200000007000000000000000000"
 _STATUS_PUSH_UNLOCKED = "bb0200000200000003000000000000000000"
+_STATUS_PUSH_LOCKED = "bb0200000200000005000000000000000000"
 
 
 def _with_checksum(hex_str: str) -> bytearray:
@@ -4568,6 +4556,60 @@ async def test_an_op_response_after_a_stop_leaves_the_display_alone() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_window_opens_as_the_command_is_sent() -> None:
+    """The window opens as the command is sent and the transitional is displayed."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:a4")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    seen: list[tuple[bool, LockStatus]] = []
+
+    async def force_lock(write_success_callback, result_callback):
+        seen.append((push_lock._operation_window_open, push_lock.lock_status))
+        write_success_callback()
+        seen.append((push_lock._operation_window_open, push_lock.lock_status))
+        result_callback(True)
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+
+    assert seen == [(True, LockStatus.UNLOCKED), (True, LockStatus.LOCKING)]
+    assert push_lock.lock_status is LockStatus.LOCKED
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_status_handled_before_write_success_is_refused() -> None:
+    """A status handled during the write, before write-success, is refused."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:a5")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    emissions: list[LockStatus] = []
+    push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    inside = _write_delivering(session, [_with_checksum(_STATUS_PUSH_LOCKED)])
+    after = _write_returning_first(
+        session, [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    )
+
+    def write(*args: object) -> None:
+        inside(*args)
+        after(*args)
+
+    client.write_gatt_char = AsyncMock(side_effect=write)
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        await push_lock.lock()
+
+    assert emissions == [LockStatus.LOCKING, LockStatus.LOCKED]
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
 async def test_precedence_is_read_from_the_issue_time_not_the_stamp() -> None:
     """Precedence is read from the command's issue time, not from its write's return."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:85")
@@ -4898,9 +4940,10 @@ async def test_the_window_refuses_a_position_and_passes_a_jam_and_the_door_membe
 
     with _patched_clock() as clock:
         start = clock[0]
-        # As _run_lock_operation sets them when the command is issued.
+        # As the operation sets them before its write.
         push_lock._operation_in_flight = True
         push_lock._operation_issued_at = start
+        push_lock._operation_window_open = True
 
         push_lock._operation_write_success(LockStatus.LOCKING)
         assert push_lock.lock_status is LockStatus.LOCKING
@@ -5039,7 +5082,7 @@ async def test_cancelled_mid_operation_closes_window_without_unknown() -> None:
         write_success_callback: Callable[[], None],
         result_callback: Callable[[bool], None],
     ) -> None:
-        write_success_callback()  # opens window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         raise asyncio.CancelledError
 
     mock_lock = MagicMock()
@@ -5066,7 +5109,7 @@ async def test_a_cancel_leaves_a_reported_jam_on_display() -> None:
         write_success_callback: Callable[[], None],
         result_callback: Callable[[bool], None],
     ) -> None:
-        write_success_callback()  # opens the window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         push_lock._update_any_state([LockStatus.JAMMED])
         assert push_lock.lock_status is LockStatus.JAMMED
         raise asyncio.CancelledError
@@ -5141,7 +5184,10 @@ async def test_execute_lock_operation_hands_the_hooks_to_the_operation():
     after_each_hook.append((push_lock.lock_status, push_lock._operation_window_open))
     result_hook(True)
     after_each_hook.append((push_lock.lock_status, push_lock._operation_window_open))
-    assert after_each_hook == [(LockStatus.LOCKING, True), (LockStatus.LOCKED, False)]
+    assert after_each_hook == [
+        (LockStatus.LOCKING, False),
+        (LockStatus.LOCKED, False),
+    ]
 
 
 def _answering_lock(push_lock: PushLock) -> MagicMock:
@@ -5166,7 +5212,7 @@ async def test_failed_operation_leaves_the_status_poll_armed() -> None:
         write_success_callback: Callable[[], None],
         result_callback: Callable[[bool], None],
     ) -> None:
-        write_success_callback()  # opens the window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         raise OperationIncompleteError("no op-response")
 
     mock_lock.force_lock = force_lock
@@ -5212,7 +5258,7 @@ async def test_cancelled_operation_leaves_the_status_poll_armed() -> None:
         write_success_callback: Callable[[], None],
         result_callback: Callable[[bool], None],
     ) -> None:
-        write_success_callback()  # opens the window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         await gate.wait()
 
     mock_lock.force_lock = force_lock
@@ -5254,9 +5300,10 @@ async def test_a_refused_reading_leaves_the_status_poll_owed() -> None:
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
     with _patched_clock() as clock:
-        # As _run_lock_operation sets it when the command is issued.
+        # As the operation sets them before its write.
         push_lock._operation_issued_at = clock[0]
-        push_lock._operation_write_success(LockStatus.UNLOCKING)  # opens the window
+        push_lock._operation_window_open = True
+        push_lock._operation_write_success(LockStatus.UNLOCKING)
         push_lock._update_any_state([LockStatus.UNLOCKED])
 
     assert push_lock.lock_status is LockStatus.UNLOCKING  # the reading was refused
@@ -5279,7 +5326,7 @@ async def test_exhausted_retries_after_write_success_stamp_unknown() -> None:
     ) -> None:
         nonlocal calls
         calls += 1
-        write_success_callback()  # opens the window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         raise DisconnectedError("dropped after the write, before the ack")
 
     mock_lock = MagicMock()
@@ -5314,7 +5361,7 @@ async def test_no_update_cycle_is_armed_inside_an_operation() -> None:
         write_success_callback: Callable[[], None],
         result_callback: Callable[[bool], None],
     ) -> None:
-        write_success_callback()  # opens the window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         result_callback(True)
         if push_lock._cancel_deferred_update is not None:
             armed_during.append(
@@ -5411,7 +5458,7 @@ async def test_every_operation_exit_schedules_the_status_poll(
         write_success_callback: Callable[[], None],
         result_callback: Callable[[bool], None],
     ) -> None:
-        write_success_callback()  # opens the window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         if jam:
             push_lock._update_any_state([LockStatus.JAMMED])
         if error is not None:
@@ -5547,7 +5594,7 @@ async def test_cancellation_polls_sooner_than_the_keep_alive() -> None:
         write_success_callback: Callable[[], None],
         result_callback: Callable[[bool], None],
     ) -> None:
-        write_success_callback()  # opens the window, stamps LOCKING
+        write_success_callback()  # puts LOCKING on the display
         raise asyncio.CancelledError
 
     mock_lock = MagicMock()
