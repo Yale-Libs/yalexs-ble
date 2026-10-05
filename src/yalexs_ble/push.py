@@ -865,33 +865,27 @@ class PushLock:
                 complete_state,
             )
             return
-        self._update_any_state([complete_state])
+        self._update_any_state([complete_state], operation=True)
 
     def _operation_write_success(self, pending_state: LockStatus) -> None:
-        """Stamp the transitional, then open the operation window.
+        """Display the operation's transitional state.
 
-        Does nothing once the op-response has been handled. The transitional
-        is not displayed while a reported jam or setup condition takes
-        precedence and is still on display. Opened in a finally: the session
-        swallows errors from this hook and keeps waiting, so a failed stamp
-        must not leave the window closed.
+        Skipped once the op-response has been handled, and while a reported jam
+        or setup condition takes precedence and is still on display.
         """
         if self._operation_answered:
             return
-        try:
-            if not (
-                self._jam_takes_precedence()
-                and self.lock_status in MANUAL_INTERVENTION_STATUSES
-            ):
-                self._update_any_state([pending_state])
-            else:
-                _LOGGER.debug(
-                    "%s: %s not stamped; a status needing attention takes precedence",
-                    self.name,
-                    pending_state,
-                )
-        finally:
-            self._operation_window_open = True
+        if not (
+            self._jam_takes_precedence()
+            and self.lock_status in MANUAL_INTERVENTION_STATUSES
+        ):
+            self._update_any_state([pending_state], operation=True)
+        else:
+            _LOGGER.debug(
+                "%s: %s not stamped; a status needing attention takes precedence",
+                self.name,
+                pending_state,
+            )
 
     def _close_operation_window(self) -> None:
         """Close the operation window."""
@@ -924,7 +918,7 @@ class PushLock:
             )
             outcome = None
         if outcome is not None:
-            self._update_any_state([outcome])
+            self._update_any_state([outcome], operation=True)
         # The exit owns the next poll; drop any cycle armed during the operation.
         self._cancel_future_update()
         # Unsettled, or always-connected with the link down (this cycle is its
@@ -974,6 +968,9 @@ class PushLock:
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
+            # Opened before the write: a status handled while the write is
+            # awaited cannot be placed before or after the lock took the command.
+            self._operation_window_open = True
             await getattr(lock, op_attr)(
                 write_success_callback=functools.partial(
                     self._operation_write_success, pending_state
@@ -1002,7 +999,7 @@ class PushLock:
                     f"precedence over {op_attr}, whose attempt ended with {ex!r}; the "
                     f"command was not retried"
                 ) from ex
-            # Close the window so a retry re-stamps at its write-success.
+            # Closed so a status the lock reports before the retry is admitted.
             self._close_operation_window()
             _LOGGER.debug(
                 "%s: Failed to execute lock operation due to %s",
@@ -1174,8 +1171,13 @@ class PushLock:
     def _update_any_state(
         self,
         states: Iterable[LockStateValue | AuthState],
+        operation: bool = False,
     ) -> None:
-        """Apply states to the display."""
+        """Apply states to the display.
+
+        operation marks a status the operation itself puts on the display; it
+        is not a report from the lock, so it skips admission.
+        """
         _LOGGER.debug("%s: State changed: %s", self.name, states)
         lock_state = self._get_current_state()
         changes: dict[str, Any] = {}
@@ -1200,8 +1202,13 @@ class PushLock:
                 if lock_state.auth != state:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
-                # Every lock status, repeats included, passes the admission filter.
-                admitted = self._admit_lock_status(state, lock_state.lock)
+                # Every lock status the lock reports, repeats included, passes
+                # the admission filter.
+                admitted = (
+                    state
+                    if operation
+                    else self._admit_lock_status(state, lock_state.lock)
+                )
                 if admitted not in POSITION_READINGS:
                     # An unsettled display must not suppress the follow-up poll.
                     self._seen_this_session.discard(type(state))
