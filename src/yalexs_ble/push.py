@@ -808,6 +808,7 @@ class PushLock:
         self._operation_window_open = False
         self._operation_in_flight = False
         self._operation_issued_at = NEVER_TIME
+        self._operation_answered = False
 
     @operation_lock
     async def _run_lock_operation(
@@ -816,6 +817,7 @@ class PushLock:
         """Run a lock operation; _finalize_operation runs on every exit."""
         self._cancel_future_update()
         self._operation_outcome = None
+        self._operation_answered = False
         self._operation_in_flight = True
         # Taken under the operation lock, so a command queued behind another
         # counts from when it runs.
@@ -840,14 +842,42 @@ class PushLock:
             >= self._operation_issued_at - JAMMED_PRECEDENCE_TIME
         )
 
+    def _operation_result(self, complete_state: LockStatus, succeeded: bool) -> None:
+        """Close the operation window and display the command's end state.
+
+        Runs as the op-response frame is handled. A failure op-response has
+        already put JAMMED on the display, so only a success updates it, unless
+        the watcher is stopped or a reported jam or setup condition takes
+        precedence and is still on display.
+        """
+        self._operation_answered = True
+        self._close_operation_window()
+        if not self._running or not succeeded:
+            return
+        self._operation_outcome = complete_state
+        if (
+            self._jam_takes_precedence()
+            and self.lock_status in MANUAL_INTERVENTION_STATUSES
+        ):
+            _LOGGER.debug(
+                "%s: %s not applied; a status needing attention takes precedence",
+                self.name,
+                complete_state,
+            )
+            return
+        self._update_any_state([complete_state])
+
     def _operation_write_success(self, pending_state: LockStatus) -> None:
         """Stamp the transitional, then open the operation window.
 
-        The transitional is not displayed while a reported jam or setup
-        condition takes precedence and is still on display. Opened in a
-        finally: the session swallows errors from this hook and keeps waiting,
-        so a failed stamp must not leave the window closed.
+        Does nothing once the op-response has been handled. The transitional
+        is not displayed while a reported jam or setup condition takes
+        precedence and is still on display. Opened in a finally: the session
+        swallows errors from this hook and keeps waiting, so a failed stamp
+        must not leave the window closed.
         """
+        if self._operation_answered:
+            return
         try:
             if not (
                 self._jam_takes_precedence()
@@ -870,7 +900,9 @@ class PushLock:
     def _finalize_operation(self) -> None:
         """Close the operation window, display the outcome, schedule the next poll."""
         self._operation_in_flight = False
-        outcome = self._operation_outcome
+        # The op-response decided the display when it arrived; the exit
+        # decides it only for an operation that ended without one.
+        outcome = None if self._operation_answered else self._operation_outcome
         precedence = self._jam_takes_precedence()
         self._close_operation_window()
         # Set before the stop check so a restarted watcher inherits them.
@@ -945,7 +977,10 @@ class PushLock:
             await getattr(lock, op_attr)(
                 write_success_callback=functools.partial(
                     self._operation_write_success, pending_state
-                )
+                ),
+                result_callback=functools.partial(
+                    self._operation_result, complete_state
+                ),
             )
         except OperationIncompleteError:
             # Re-raised as is; the arm below would wrap it while a jam takes
@@ -975,7 +1010,6 @@ class PushLock:
                 ex,
             )
             raise
-        self._operation_outcome = complete_state
         _LOGGER.debug("%s: Finished %s", self.name, complete_state)
         self._complete_operation(time.monotonic())
 

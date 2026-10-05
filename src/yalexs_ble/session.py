@@ -126,6 +126,8 @@ class Session:
         self._ack_matcher: Callable[[bytes], bool] | None = None
         # Set for the whole staged wait; tells _notify a staged wait is active.
         self._operation_progress: OperationProgress | None = None
+        # Called by _notify with the op-response of the staged wait.
+        self._result_callback: Callable[[bytes], None] | None = None
         self._state_callback = state_callback
         self._disconnected_futures = disconnected_futures
         self._first_request = True
@@ -334,6 +336,18 @@ class Session:
             return
         if progress is not None:
             progress.result = decrypted_data
+            if (result_callback := self._result_callback) is not None:
+                # Called on the frame, before the waiting task resumes, so a
+                # frame handled in between cannot reach the state callback
+                # ahead of the op-response reaching the caller. Contained so
+                # the op-response still completes the wait.
+                try:
+                    result_callback(decrypted_data)
+                except Exception:
+                    _LOGGER.exception(
+                        "%s: result callback raised, completing the staged wait",
+                        self.name,
+                    )
         if (future := self._disarm_wait()) is not None and not future.done():
             future.set_result(decrypted_data)
 
@@ -420,6 +434,7 @@ class Session:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        result_callback: Callable[[bytes], None] | None = None,
     ) -> bytes:
         """Write a mechanical command, then wait for its acknowledgment
         (ACK_TIMEOUT) and op-response (response_timeout), both timed from the
@@ -438,6 +453,7 @@ class Session:
         self._notify_future = result_future
         self._notify_matcher = response_matcher
         self._operation_progress = progress
+        self._result_callback = result_callback
         try:
             _LOGGER.debug(
                 "%s: Writing command to %s: %s",
@@ -493,6 +509,7 @@ class Session:
         finally:
             # The session lock serializes operations, so these are this one's.
             self._operation_progress = None
+            self._result_callback = None
             self._disarm_ack()
             self._disarm_wait()
         return self._completed(result, progress, command_name)
@@ -623,12 +640,17 @@ class Session:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        result_callback: Callable[[bytes], None] | None = None,
     ) -> bytes:
         """Run a mechanical operation with the staged wait.
 
         A failure after the acknowledgment raises OperationIncompleteError; one
         before it is raised as execute() would, for the caller to retry.
         response_timeout must exceed ACK_TIMEOUT.
+
+        write_success_callback runs when the write succeeds; result_callback
+        runs with the op-response as that frame is handled, before the wait
+        resolves.
         """
         if progress.write_attempted or progress.acknowledged or progress.result:
             # A reused record would report a previous attempt's frames as this one's.
@@ -645,6 +667,7 @@ class Session:
                     response_timeout,
                     progress,
                     write_success_callback,
+                    result_callback,
                 )
         except OperationIncompleteError:
             raise

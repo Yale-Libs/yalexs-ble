@@ -1538,8 +1538,8 @@ async def _drive_operation(
 ) -> list[str]:
     """Run a force_* method, feeding its ack then op-response through notify.
 
-    Returns the write-success callback and the fed frames in order. Optional
-    before_* frames must leave the stage they precede armed.
+    Returns the order of the write-success and result callbacks and the fed
+    frames. Optional before_* frames must leave the stage they precede armed.
     """
     session = lock.session
     assert session is not None
@@ -1563,7 +1563,8 @@ async def _drive_operation(
 
     feeder = asyncio.create_task(feed())
     await getattr(lock, op_attr)(
-        write_success_callback=lambda: events.append("write_success")
+        write_success_callback=lambda: events.append("write_success"),
+        result_callback=lambda succeeded: events.append(f"result {succeeded}"),
     )
     await feeder
     return events
@@ -1603,7 +1604,37 @@ async def test_force_operations_complete_on_ack_then_op_response(
     """Each force_* completes on its own ack then op-response, after write-success."""
     lock = _make_connected_lock_with_session()
     events = await _drive_operation(lock, op_attr, opcode, ack)
-    assert events == ["write_success", "ack", "op_response"]
+    assert events == ["write_success", "ack", "result True", "op_response"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "succeeded"),
+    [(OperationError.COMM_SUCCESS, True), (OperationError.MECH_POSITION, False)],
+    ids=["success", "failure"],
+)
+async def test_the_result_callback_is_told_whether_the_op_response_reported_success(
+    result: int, succeeded: bool
+) -> None:
+    """The result byte of the op-response decides what the result callback is told."""
+    lock = _make_connected_lock_with_session()
+    session = lock.session
+    assert session is not None
+    reported: list[bool] = []
+
+    async def feed() -> None:
+        await _spin_until(lambda: session._ack_future is not None)
+        session._notify(
+            0, bytearray(bytes.fromhex("aa0b00490000000000000000000000000200"))
+        )
+        await asyncio.sleep(0)
+        session._notify(0, bytearray(_op_response_frame(Commands.LOCK, result)))
+
+    feeder = asyncio.create_task(feed())
+    await lock.force_lock(result_callback=reported.append)
+    await feeder
+
+    assert reported == [succeeded]
 
 
 @pytest.mark.asyncio
