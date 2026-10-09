@@ -49,6 +49,7 @@ from .session import (
     NoAdvertisementError,
     OperationIncompleteError,
     ResponseError,
+    UnlatchError,
     YaleXSBLEError,
 )
 from .util import asyncio_timeout, is_disconnected_error, local_name_is_unique
@@ -132,12 +133,14 @@ OPERATION_IN_PROGRESS_DEFER_SECONDS = 1.0
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 
 # Statuses that report a position the lock is holding; the setup conditions
-# qualify because they end only by hand. Any other status must stay out of
-# _seen_this_session so the follow-up lock_status() poll runs.
+# qualify because they end only by hand, and UNLATCHED because the lock holds
+# it for the dwell. Any other status must stay out of _seen_this_session so the
+# follow-up lock_status() poll runs.
 POSITION_READINGS = frozenset(
     {
         LockStatus.LOCKED,
         LockStatus.UNLOCKED,
+        LockStatus.UNLATCHED,
         LockStatus.SECUREMODE,
         LockStatus.JAMMED,
         LockStatus.UNKNOWN_01,
@@ -838,6 +841,16 @@ class PushLock:
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
 
+    async def unlatch(self) -> None:
+        """Unlatch (momentarily open) the lock.
+
+        Completes as UNLATCHED; the state the lock settles to after the dwell
+        arrives as a later status update.
+        """
+        await self._run_lock_operation(
+            "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLATCHED
+        )
+
     def _init_operation_state(self) -> None:
         """Initialize the per-operation fields so they read before any operation."""
         self._operation_outcome = None
@@ -1017,14 +1030,10 @@ class PushLock:
                     self._operation_result, complete_state
                 ),
             )
-        except OperationIncompleteError:
-            # Re-raised as is; the arm below would wrap it while a jam takes
+        except (OperationIncompleteError, UnlatchError):
+            # Re-raised as is; the arm below would wrap them while a jam takes
             # precedence.
-            _LOGGER.debug(
-                "%s: %s did not complete; the result never arrived",
-                self.name,
-                op_attr,
-            )
+            _LOGGER.debug("%s: %s ended without a result", self.name, op_attr)
             raise
         except Exception as ex:
             # A retry would drive the motor into a mechanism the lock reported as

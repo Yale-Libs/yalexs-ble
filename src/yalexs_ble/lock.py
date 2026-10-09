@@ -46,12 +46,15 @@ from .const import (
 from .secure_session import SecureSession
 from .session import (
     OPERATION_RESPONSE_TIMEOUT,
+    UNLATCH_OPERATION_RESPONSE_TIMEOUT,
     AuthError,
     DisconnectedError,
     KeycodeError,
+    OperationIncompleteError,
     OperationProgress,
     ResponseError,
     Session,
+    UnlatchError,
     YaleXSBLEError,
 )
 
@@ -63,6 +66,10 @@ LOCK_INFO_ATTEMPTS = 2
 # Upper bound on the records read in one drain of the activity log
 MAX_ACTIVITY_RECORDS = 32
 
+
+# byte[4] of a Lock command: 0x04 turns the plain lock into securemode.
+# Operation byte that makes an Unlock command an unlatch (retract the latch).
+UNLATCH_OPERATION_BYTE = 0x0A
 # Operation byte (byte[4]) that makes a Lock command securemode.
 SECUREMODE_OPERATION_BYTE = 0x04
 
@@ -560,8 +567,11 @@ class Lock:
         opcode: int,
         operation_byte: int,
         command_name: str,
+        response_timeout: float = OPERATION_RESPONSE_TIMEOUT,
+        progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> int:
         """Run a mechanical operation; return the result code the lock reported.
 
@@ -580,10 +590,11 @@ class Lock:
             command_name,
             ack_matcher=_ack_matcher(opcode, operation_byte),
             response_matcher=_operation_response_matcher(opcode),
-            response_timeout=OPERATION_RESPONSE_TIMEOUT,
-            progress=OperationProgress(),
+            response_timeout=response_timeout,
+            progress=progress or OperationProgress(),
             write_success_callback=write_success_callback,
             result_callback=_on_result,
+            wait_for_ack=wait_for_ack,
         )
         result = response[RESULT_BYTE]
         _LOGGER.debug(
@@ -602,8 +613,8 @@ class Lock:
             Commands.LOCK,
             SECUREMODE_OPERATION_BYTE,
             "force_securemode",
-            write_success_callback,
-            result_callback,
+            write_success_callback=write_success_callback,
+            result_callback=result_callback,
         )
 
     @raise_if_not_connected
@@ -614,7 +625,11 @@ class Lock:
     ) -> int:
         """Force the lock to lock; returns the lock's result code."""
         return await self._execute_operation(
-            Commands.LOCK, 0x00, "force_lock", write_success_callback, result_callback
+            Commands.LOCK,
+            0x00,
+            "force_lock",
+            write_success_callback=write_success_callback,
+            result_callback=result_callback,
         )
 
     @raise_if_not_connected
@@ -628,9 +643,44 @@ class Lock:
             Commands.UNLOCK,
             0x00,
             "force_unlock",
-            write_success_callback,
-            result_callback,
+            write_success_callback=write_success_callback,
+            result_callback=result_callback,
         )
+
+    @raise_if_not_connected
+    async def force_unlatch(
+        self,
+        write_success_callback: Callable[[], None] | None = None,
+        result_callback: Callable[[bool], None] | None = None,
+    ) -> int:
+        """Retract the latch (momentary open); returns the lock's result code.
+
+        A repeated unlatch opens the door again, so once the write was
+        attempted any failure converts to the non-retryable UnlatchError.
+        """
+        progress = OperationProgress()
+        try:
+            return await self._execute_operation(
+                Commands.UNLOCK,
+                UNLATCH_OPERATION_BYTE,
+                "force_unlatch",
+                response_timeout=UNLATCH_OPERATION_RESPONSE_TIMEOUT,
+                progress=progress,
+                write_success_callback=write_success_callback,
+                result_callback=result_callback,
+                wait_for_ack=False,
+            )
+        except OperationIncompleteError:
+            raise  # already non-retryable
+        except Exception as err:
+            # Broad on purpose: cancellation is a BaseException and passes.
+            if progress.write_attempted:
+                raise UnlatchError(
+                    f"{self.name}: Unlatch failed after the command write was "
+                    f"attempted, and a repeated unlatch opens the door again, "
+                    f"so it was not retried: {err!r}"
+                ) from err
+            raise
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
@@ -750,6 +800,10 @@ class Lock:
     async def unlock(self) -> None:
         if (await self.lock_status()) != LockStatus.UNLOCKED:
             await self.force_unlock()
+
+    async def unlatch(self) -> None:
+        """Unlatch; always runs, as there is no resting state to compare."""
+        await self.force_unlatch()
 
     async def _execute_command(
         self,

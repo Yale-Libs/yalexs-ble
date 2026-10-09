@@ -21,6 +21,7 @@ from .session import (
     DisconnectedError,
     KeycodeError,
     OperationIncompleteError,
+    UnlatchError,
     YaleXSBLEError,
 )
 from .util import (
@@ -52,6 +53,7 @@ __all__ = [
     "LockStatus",
     "OperationIncompleteError",
     "PushLock",
+    "UnlatchError",
     "ValidatedLockConfig",
     "YaleXSBLEDiscovery",
     "YaleXSBLEError",
