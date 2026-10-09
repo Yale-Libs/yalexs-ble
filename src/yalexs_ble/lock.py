@@ -179,17 +179,17 @@ def _poll_response_matcher(
     return matches
 
 
-KEYCODE_OPCODES = frozenset(
+# Opcodes whose frames carry no lock state; their results go to the waiting command.
+NO_STATE_OPCODES = frozenset(
     {
         Commands.KEYCODE_SET.value,
         Commands.KEYCODE_CLEAR.value,
         Commands.KEYCODE_ACCESS.value,
         Commands.KEYCODE_COMMIT.value,
         Commands.KEYCODE_GET.value,
+        Commands.LOCK_ACTIVITY.value,
     }
 )
-# Opcodes whose frames carry no lock state; their results go to the waiting command.
-NO_STATE_OPCODES = KEYCODE_OPCODES | {Commands.LOCK_ACTIVITY.value}
 KEYCODE_ACCESS_ALWAYS = 0x80
 KEYCODE_CREDENTIAL_PIN = 0x00
 KEYCODE_MAX_SLOT = 0xFFFF
@@ -234,16 +234,22 @@ def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
 
 
 def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
-    """Match the op-response (0xBB + opcode) sent when the motor stops.
+    """Match the 0xBB result frame for opcode; the floor admits the result byte.
 
-    The operation byte is 0x00 for every variant, so it is not matched. The
-    floor admits only a frame carrying the result byte at 0x0F.
+    The operation byte is 0x00 for every variant, so it is not matched.
     """
 
     def _matches(data: bytes) -> bool:
         return len(data) > RESULT_BYTE and data[0x00] == 0xBB and data[0x01] == opcode
 
     return _matches
+
+
+class ActivityLogOverrunError(ResponseError):
+    """The activity log did not end within the read cap."""
+
+
+_LOCK_ACTIVITY_MATCHER = _poll_response_matcher(Commands.LOCK_ACTIVITY.value)
 
 
 class Lock:
@@ -369,9 +375,9 @@ class Lock:
             # any non-zero = failure (0x1E-0x23 = MECH_* motor stall / jam).
             if (
                 state[1] in (Commands.LOCK.value, Commands.UNLOCK.value)
-                and len(state) > 0x0F
+                and len(state) > RESULT_BYTE
             ):
-                result = state[0x0F]
+                result = state[RESULT_BYTE]
                 self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
                     error = VALUE_TO_OPERATION_ERROR.get(result)
@@ -940,7 +946,7 @@ class Lock:
         return await self.session.execute(
             self.session.build_command(Commands.LOCK_ACTIVITY.value),
             "lock_activity",
-            _poll_response_matcher(Commands.LOCK_ACTIVITY.value),
+            _LOCK_ACTIVITY_MATCHER,
         )
 
     @raise_if_not_connected
@@ -950,10 +956,8 @@ class Lock:
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
         return self._parse_lock_activity(response)
 
-    async def drain_lock_activity(
-        self, max_records: int = MAX_ACTIVITY_RECORDS
-    ) -> AsyncIterator[DoorActivity | LockActivity]:
-        """Pop and yield records until the end marker; ResponseError past the cap.
+    async def drain_lock_activity(self) -> AsyncIterator[DoorActivity | LockActivity]:
+        """Pop and yield records until the end marker; raise past the read cap.
 
         Each read pops the lock's oldest record, so records are yielded as
         they arrive. Unknown types are skipped.
@@ -961,15 +965,15 @@ class Lock:
         if not self.is_connected:
             raise DisconnectedError("Lock is not connected")
         _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
-        for _ in range(max_records):
+        for _ in range(MAX_ACTIVITY_RECORDS):
             response = await self._read_lock_activity_response()
             if response[0x04] == LockActivityType.NONE.value:
                 _LOGGER.debug("%s: Finished drain_lock_activity", self.name)
                 return
             if (activity := self._parse_lock_activity(response)) is not None:
                 yield activity
-        raise ResponseError(
-            f"{self.name}: Activity log did not end within {max_records} reads"
+        raise ActivityLogOverrunError(
+            f"{self.name}: Activity log did not end within {MAX_ACTIVITY_RECORDS} reads"
         )
 
     async def disconnect(self) -> None:

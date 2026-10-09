@@ -66,7 +66,7 @@ def decode_keycode_pin(data: bytes | bytearray) -> str | None:
 
     Raises ValueError for a field that is not digits followed by padding.
     """
-    field = bytes(data[:KEYCODE_PIN_BYTES]).hex()
+    field = data[:KEYCODE_PIN_BYTES].hex()
     pin = field.rstrip("f")
     if pin and not pin.isdigit():
         raise ValueError(f"Malformed PIN field: {field}")

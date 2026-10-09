@@ -576,22 +576,14 @@ async def test_write_checksum_keeps_the_frame_valid_when_it_already_has_one() ->
     assert util._simple_checksum(command) == 0
 
 
-def _checksummed(flag: int, opcode: int, slot: int) -> bytes:
-    frame = bytearray(RESPONSE_FRAME_LEN)
-    frame[0x00], frame[0x01] = flag, opcode
-    frame[0x04:0x06] = slot.to_bytes(2, "little")
-    frame[0x03] = util._simple_checksum(frame)
-    return bytes(frame)
-
-
 @pytest.mark.asyncio
 async def test_keycode_wait_skips_ack_and_wrong_slot() -> None:
     """The ack and a result for another slot leave a GET wait armed."""
     received: list[bytes] = []
     session = _make_session(received)
     matcher = _keycode_response_matcher(Commands.KEYCODE_GET.value, 200)
-    ack = _checksummed(0xAA, 0x39, slot=200)
-    other_slot = _checksummed(0xBB, 0x39, slot=201)
+    ack = _with_checksum("aa390000c800000000000000000000000000")
+    other_slot = _with_checksum("bb390000c900000000000000000000000000")
     answer = bytes.fromhex("bb39004ec800135790ffffffff0000000000")
 
     async def deliver(*_args: object, **_kwargs: object) -> None:

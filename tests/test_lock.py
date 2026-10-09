@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable, Iterable
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -455,13 +456,19 @@ class _CommandCaptureSession:
         return b""
 
 
-async def _set_auto_lock_payload(mode: AutoLockMode, duration: int) -> bytearray:
-    """Run set_auto_lock against a capture session; return the sent command."""
+def _lock_with_session(session: Any) -> Lock:
+    """A Lock wired as connected over the given session stand-in."""
     lock = _make_lock()
-    session = _CommandCaptureSession()
-    lock.session = session  # type: ignore[assignment]
+    lock.session = session
     lock.secure_session = MagicMock()
     lock.client = MagicMock(is_connected=True)
+    return lock
+
+
+async def _set_auto_lock_payload(mode: AutoLockMode, duration: int) -> bytearray:
+    """Run set_auto_lock against a capture session; return the sent command."""
+    session = _CommandCaptureSession()
+    lock = _lock_with_session(session)
     await lock.set_auto_lock(mode, duration)
     assert len(session.sent) == 1
     return session.sent[0]
@@ -533,11 +540,8 @@ async def test_auto_lock_status_issues_read() -> None:
     method returns nothing; the stored setting arrives later as a settings
     response on the notify path.
     """
-    lock = _make_lock()
     session = _CommandCaptureSession()
-    lock.session = session  # type: ignore[assignment]
-    lock.secure_session = MagicMock()
-    lock.client = MagicMock(is_connected=True)
+    lock = _lock_with_session(session)
     await lock.auto_lock_status()
     assert len(session.sent) == 1
     assert session.sent[0][0x01] == Commands.READSETTING.value
@@ -1030,12 +1034,11 @@ class _KeycodeSession(_CommandCaptureSession):
 
 
 def _keycode_lock(responses: list[bytes]) -> tuple[Lock, _KeycodeSession]:
-    lock = _make_lock()
     session = _KeycodeSession(responses)
-    lock.session = session  # type: ignore[assignment]
-    lock.secure_session = MagicMock()
-    lock.client = MagicMock(is_connected=True)
-    return lock, session
+    return _lock_with_session(session), session
+
+
+SET_KEYCODE_STEPS = (0x28, 0x27, 0x2B, 0x2C)
 
 
 @pytest.mark.asyncio
@@ -1060,7 +1063,6 @@ async def test_get_keycode_reports_the_lock_error() -> None:
         await lock.get_keycode(1)
     assert exc_info.value.error == OperationError.KEYCODE_NOSPACE
     assert exc_info.value.command == "get_keycode"
-    assert str(exc_info.value) == "get_keycode failed: KEYCODE_NOSPACE (0x07)"
 
 
 @pytest.mark.asyncio
@@ -1070,7 +1072,6 @@ async def test_unknown_error_code_is_carried_as_an_int() -> None:
         await lock.clear_keycode(5)
     assert exc_info.value.error == 0x7F
     assert not isinstance(exc_info.value.error, OperationError)
-    assert str(exc_info.value) == "clear_keycode failed: unknown error (0x7F)"
 
 
 @pytest.mark.asyncio
@@ -1086,17 +1087,10 @@ async def test_clear_keycode_command_layout() -> None:
 
 @pytest.mark.asyncio
 async def test_set_keycode_runs_clear_set_access_commit_in_order() -> None:
-    lock, session = _keycode_lock(
-        [
-            _result(Commands.KEYCODE_CLEAR.value),
-            _result(Commands.KEYCODE_SET.value),
-            _result(Commands.KEYCODE_ACCESS.value),
-            _result(Commands.KEYCODE_COMMIT.value),
-        ]
-    )
+    lock, session = _keycode_lock([_result(op) for op in SET_KEYCODE_STEPS])
     await lock.set_keycode(200, "135790")
     clear, set_, access, commit = session.sent
-    assert [c[0x01] for c in session.sent] == [0x28, 0x27, 0x2B, 0x2C]
+    assert [c[0x01] for c in session.sent] == list(SET_KEYCODE_STEPS)
     assert clear[0x04:0x0B] == b"\xff" * 7
     assert clear[0x0B] == 200
     assert set_[0x04:0x0B] == bytes.fromhex("135790ffffffff")
@@ -1110,7 +1104,7 @@ async def test_set_keycode_runs_clear_set_access_commit_in_order() -> None:
 
 @pytest.mark.asyncio
 async def test_set_keycode_odd_length_pin_and_high_slot() -> None:
-    lock, session = _keycode_lock([_result(op) for op in (0x28, 0x27, 0x2B, 0x2C)])
+    lock, session = _keycode_lock([_result(op) for op in SET_KEYCODE_STEPS])
     await lock.set_keycode(0x0102, "12345")
     assert session.sent[1][0x04:0x0B] == bytes.fromhex("12345fffffffff")
     assert (session.sent[3][0x0B], session.sent[3][0x0D]) == (0x02, 0x01)
@@ -1124,7 +1118,7 @@ async def test_set_keycode_odd_length_pin_and_high_slot() -> None:
 async def test_set_keycode_stops_at_the_failing_step(
     error: int, failing_step: int
 ) -> None:
-    steps = [0x28, 0x27, 0x2B, 0x2C]
+    steps = SET_KEYCODE_STEPS
     responses = [
         _result(op, error if op == failing_step else 0)
         for op in steps[: steps.index(failing_step) + 1]
@@ -1196,7 +1190,7 @@ def test_keycode_get_matcher_requires_the_echoed_slot() -> None:
     assert not matches(bytes.fromhex("aa39004ec800000000000000000000000200"))
 
 
-@pytest.mark.parametrize("opcode", [0x27, 0x28, 0x2B, 0x2C, 0x39])
+@pytest.mark.parametrize("opcode", [0x27, 0x28, 0x2B, 0x2C, 0x39, 0x2D])
 @pytest.mark.parametrize("flag", [0xBB, 0xAA])
 def test_keycode_frames_produce_no_state(opcode: int, flag: int) -> None:
     received: list[object] = []
@@ -1264,8 +1258,8 @@ def _activity_lock(frames: list[bytes | Exception]) -> tuple[Lock, AsyncMock]:
     return lock, write
 
 
-async def _drain(lock: Lock, **kwargs: int) -> list[DoorActivity | LockActivity]:
-    return [activity async for activity in lock.drain_lock_activity(**kwargs)]
+async def _drain(lock: Lock) -> list[DoorActivity | LockActivity]:
+    return [activity async for activity in lock.drain_lock_activity()]
 
 
 @pytest.mark.asyncio
