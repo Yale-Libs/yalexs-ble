@@ -283,6 +283,7 @@ class Lock:
         state_callback: Callable[[Iterable[LockStateValue]], None],
         info: LockInfo | None = None,
         disconnect_callback: Callable[[], None] | None = None,
+        op_response_callback: Callable[[], None] | None = None,
     ) -> None:
         self.ble_device_callback = ble_device_callback
         self.key = bytes.fromhex(keyString)
@@ -295,6 +296,9 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
+        # Fires per LOCK/UNLOCK op-response; external operations send one only on
+        # failure.
+        self._op_response_callback = op_response_callback
         # Set from write-success to the exit of one of our operations; a
         # failure op-response that does not match it logs at warning.
         self._awaited_operation_opcode: int | None = None
@@ -385,6 +389,17 @@ class Lock:
         await client.clear_cache()
         raise BleakError(f"Missing characteristic {char_uuid}")
 
+    def _run_stream_hook(self, hook: Callable[[], None] | None, hook_name: str) -> None:
+        """Run a stream hook, logging what it raises so the frame still parses."""
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            _LOGGER.exception(
+                "%s: %s raised, continuing to parse the frame", self.name, hook_name
+            )
+
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
         if state[0] in (0xAA, 0xBB) and state[1] in NO_STATE_OPCODES:
             return ()  # Answered to the waiting command; carries no state
@@ -397,6 +412,9 @@ class Lock:
                 and len(state) > RESULT_BYTE
             ):
                 result = state[RESULT_BYTE]
+                self._run_stream_hook(
+                    self._op_response_callback, "op_response_callback"
+                )
                 if result != OperationError.COMM_SUCCESS:
                     solicited = state[1] == self._awaited_operation_opcode
                     if solicited and result in MECHANICAL_OPERATION_ERRORS:
