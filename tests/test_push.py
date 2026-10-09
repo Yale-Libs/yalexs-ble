@@ -3,7 +3,7 @@ import logging
 import struct
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +22,7 @@ from yalexs_ble.const import (
     AutoLockMode,
     AutoLockState,
     BatteryState,
+    ConnectionInfo,
     DoorActivity,
     DoorStatus,
     LockActivity,
@@ -29,7 +30,6 @@ from yalexs_ble.const import (
     LockOperationSource,
     LockState,
     LockStatus,
-    OperationError,
 )
 from yalexs_ble.lock import ActivityLogOverrunError, Lock
 from yalexs_ble.push import (
@@ -67,7 +67,9 @@ from yalexs_ble.session import (
     AuthError,
     DisconnectedError,
     KeycodeError,
+    OperationFailedError,
     OperationIncompleteError,
+    OperationProgress,
     ResponseError,
     Session,
     UnlatchError,
@@ -3474,6 +3476,59 @@ async def test_execute_lock_operation_success_stamps_complete_state(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "op_attr", "transitional"),
+    [
+        ("lock", "force_lock", LockStatus.LOCKING),
+        ("unlock", "force_unlock", LockStatus.UNLOCKING),
+        # From an unknown position securemode may have to lock first.
+        ("securemode", "force_securemode", LockStatus.LOCKING),
+        ("unlatch", "force_unlatch", LockStatus.UNLATCHING),
+    ],
+)
+async def test_a_failure_op_response_displays_jammed_inside_the_window(
+    method: str, op_attr: str, transitional: LockStatus
+) -> None:
+    """A mid-window failure JAMMED is applied after the window and the error raised."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:2b")
+    events: list[LockStatus] = []
+
+    def cb(
+        lock_state: LockState,
+        lock_info: LockInfo,
+        connection_info: ConnectionInfo,
+    ) -> None:
+        events.append(lock_state.lock)
+
+    push_lock.register_callback(cb)
+
+    mock_lock = MagicMock()
+
+    async def operation(
+        write_success_callback: Callable[[], None],
+        result_callback: Callable[[bool], None],
+    ) -> None:
+        write_success_callback()  # puts the transitional on the display
+        push_lock._state_callback([LockStatus.JAMMED])
+        result_callback(False)
+        raise OperationFailedError(f"{op_attr} reported failure", 0x1F)
+
+    setattr(mock_lock, op_attr, operation)
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationFailedError),
+    ):
+        await getattr(push_lock, method)()
+
+    assert events == [transitional, LockStatus.JAMMED]
+    assert push_lock.lock_status == LockStatus.JAMMED
+    assert push_lock._last_operation_complete_time != NEVER_TIME
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
 async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
     """Securing an already-locked lock moves the secure lock and not the main."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:60")
@@ -3620,6 +3675,37 @@ async def test_secure_projection_invariant_table(
 
     assert emissions == expected
     assert all(LockStatus.SECURING not in pair for pair in emissions)
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_secure_projection_shares_a_jam() -> None:
+    """A failed operation puts both locks in JAMMED."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:62")
+    push_lock._lock_state = _known_state(
+        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
+    )
+
+    async def force_unlock(
+        write_success_callback: Callable[[], None],
+        result_callback: Callable[[bool], None],
+    ) -> None:
+        write_success_callback()
+        push_lock._state_callback([LockStatus.JAMMED])
+        result_callback(False)
+        raise OperationFailedError("force_unlock reported failure", 0x1F)
+
+    mock_lock = MagicMock()
+    mock_lock.force_unlock = force_unlock
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(OperationFailedError),
+    ):
+        await push_lock.unlock()
+
+    assert push_lock.lock_status is LockStatus.JAMMED
+    assert push_lock.secure_status is LockStatus.JAMMED
     push_lock._cancel_disconnect_timer()
 
 
@@ -4602,12 +4688,15 @@ def _write_returning_first(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "report",
-    [[_OP_RESPONSE_JAMMED], [_STATUS_PUSH_JAMMED, _OP_RESPONSE_OK]],
+    ("report", "raised"),
+    [
+        ([_OP_RESPONSE_JAMMED], OperationFailedError),
+        ([_STATUS_PUSH_JAMMED, _OP_RESPONSE_OK], None),
+    ],
     ids=["failure-op-response", "status-push"],
 )
 async def test_a_jam_reported_before_the_write_returns_never_leaves_the_display(
-    report: list[str],
+    report: list[str], raised: type[Exception] | None
 ) -> None:
     """A jam the lock reports before the write call returns never leaves the display."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:70")
@@ -4618,7 +4707,10 @@ async def test_a_jam_reported_before_the_write_returns_never_leaves_the_display(
     frames = [_with_checksum(frame) for frame in (_ACK_LOCK, *report)]
     client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
 
-    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        pytest.raises(raised) if raised is not None else nullcontext(),
+    ):
         await push_lock.lock()
 
     assert client.write_gatt_char.await_count == 1
@@ -4769,7 +4861,8 @@ async def test_a_re_jam_after_the_precedence_time_shows_the_attempt(
         start = clock[0]
         push_lock._update_any_state([LockStatus.JAMMED])
         clock[0] = start + 6.0
-        await push_lock.lock()
+        with pytest.raises(OperationFailedError):
+            await push_lock.lock()
 
     assert client.write_gatt_char.await_count == 1
     assert emissions == emitted
@@ -5483,15 +5576,14 @@ async def test_operation_outside_the_gate_cannot_open_the_window():
         operation_byte: int,
         command_name: str,
         response_timeout: float = 0.0,
-        progress: object | None = None,
+        progress: OperationProgress | None = None,
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
         wait_for_ack: bool = True,
-    ) -> int:
+    ) -> None:
         handed.append(write_success_callback)
         if write_success_callback is not None:
             write_success_callback()
-        return OperationError.COMM_SUCCESS
 
     lock._execute_operation = _capture  # type: ignore[method-assign]
 
@@ -5848,7 +5940,7 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
     assert push_lock._cancel_deferred_update is not None
 
     mock_lock = MagicMock()
-    mock_lock.force_lock = AsyncMock(return_value=True)
+    mock_lock.force_lock = AsyncMock()
     pending_at_connect: list[bool] = []
 
     async def connected() -> MagicMock:
@@ -5870,6 +5962,7 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
     ("error", "jam", "delay"),
     [
         (None, False, KEEP_ALIVE_TIME),
+        (OperationFailedError("reported failure", 0x1F), False, KEEP_ALIVE_TIME),
         (
             OperationIncompleteError("no op-response"),
             False,
@@ -5881,7 +5974,7 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
             KEEP_ALIVE_TIME,
         ),
     ],
-    ids=["success", "no-result", "jam-ends-the-ladder"],
+    ids=["success", "reported-failure", "no-result", "jam-ends-the-ladder"],
 )
 async def test_every_operation_exit_owes_the_status_poll(
     error: Exception | None, jam: bool, delay: float
@@ -5897,6 +5990,9 @@ async def test_every_operation_exit_owes_the_status_poll(
         write_success_callback()  # puts LOCKING on the display
         if jam:
             push_lock._update_any_state([LockStatus.JAMMED])
+        if isinstance(error, OperationFailedError):
+            # The parser emits JAMMED before the session resolves the waiter.
+            push_lock._state_callback([LockStatus.JAMMED])
         if error is not None:
             raise error
         result_callback(True)
@@ -6000,14 +6096,13 @@ async def test_the_exit_keeps_the_reconnect_an_always_connected_lock_owes(
     async def force_lock(
         write_success_callback: Callable[[], None] | None = None,
         result_callback: Callable[[bool], None] | None = None,
-    ) -> int:
+    ) -> None:
         assert write_success_callback is not None
         assert result_callback is not None
         write_success_callback()
         result_callback(True)
         if link_drops:
             lock.disconnected()
-        return OperationError.COMM_SUCCESS
 
     lock.force_lock = force_lock  # type: ignore[method-assign]
 

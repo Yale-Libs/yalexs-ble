@@ -47,6 +47,7 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    OperationFailedError,
     OperationIncompleteError,
     ResponseError,
     UnlatchError,
@@ -825,19 +826,19 @@ class PushLock:
             return self._client
 
     async def securemode(self) -> None:
-        """Set the lock into securemode."""
+        """Set securemode; raises OperationFailedError on a reported failure."""
         await self._run_lock_operation(
             "force_securemode", LockStatus.SECURING, LockStatus.SECUREMODE
         )
 
     async def lock(self) -> None:
-        """Lock the lock."""
+        """Lock the lock; raises OperationFailedError on a reported failure."""
         await self._run_lock_operation(
             "force_lock", LockStatus.LOCKING, LockStatus.LOCKED
         )
 
     async def unlock(self) -> None:
-        """Unlock the lock."""
+        """Unlock the lock; raises OperationFailedError on a reported failure."""
         await self._run_lock_operation(
             "force_unlock", LockStatus.UNLOCKING, LockStatus.UNLOCKED
         )
@@ -846,7 +847,8 @@ class PushLock:
         """Unlatch (momentarily open) the lock.
 
         Completes as UNLATCHED; the state the lock settles to after the dwell
-        arrives as a later status update.
+        arrives as a later status update. Raises OperationFailedError on a
+        reported failure.
         """
         await self._run_lock_operation(
             "force_unlatch", LockStatus.UNLATCHING, LockStatus.UNLATCHED
@@ -1031,6 +1033,15 @@ class PushLock:
                     self._operation_result, complete_state
                 ),
             )
+        except OperationFailedError:
+            # Backstop for the parser's JAMMED recorded for _finalize_operation.
+            self._operation_outcome = LockStatus.JAMMED
+            _LOGGER.debug(
+                "%s: %s reported failure; recording JAMMED", self.name, op_attr
+            )
+            # The exchange completed, so the link is alive: move the timers.
+            self._complete_operation(time.monotonic())
+            raise
         except (OperationIncompleteError, UnlatchError):
             # Re-raised as is; the arm below would wrap them while a jam takes
             # precedence.
