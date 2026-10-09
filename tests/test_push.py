@@ -5477,9 +5477,12 @@ async def test_the_locks_answer_releases_the_hold_when_the_write_then_fails(
 
     assert client.write_gatt_char.await_count == 1
     assert push_lock.lock_status is displayed
-    assert push_lock._jammed_hold_deadline == (
-        held_deadline if hold_stands else NEVER_TIME
-    )
+    if _STATUS_PUSH_JAMMED in report:
+        assert push_lock._jammed_hold_deadline == clock[0] + JAMMED_HOLD_TIME
+    else:
+        assert push_lock._jammed_hold_deadline == (
+            held_deadline if hold_stands else NEVER_TIME
+        )
     assert (push_lock._jam_hold_timer is not None) is hold_stands
     push_lock._cancel_jam_hold_timer()
     push_lock._cancel_future_update()
@@ -5509,7 +5512,6 @@ async def test_a_jam_reported_during_a_command_under_a_hold_does_not_flap() -> N
     ):
         start = clock[0]
         push_lock._update_any_state([LockStatus.UNKNOWN_01])
-        held_deadline = push_lock._jammed_hold_deadline
         emissions: list[LockStatus] = []
         push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
         clock[0] = start + 6.0
@@ -5519,7 +5521,7 @@ async def test_a_jam_reported_during_a_command_under_a_hold_does_not_flap() -> N
     assert LockStatus.LOCKING not in emissions
     assert LockStatus.LOCKED not in emissions
     assert push_lock.lock_status is LockStatus.JAMMED
-    assert push_lock._jammed_hold_deadline == held_deadline
+    assert push_lock._jammed_hold_deadline == clock[0] + JAMMED_HOLD_TIME
     assert push_lock._jam_hold_timer is not None
     push_lock._cancel_jam_hold_timer()
     push_lock._cancel_future_update()
@@ -5554,6 +5556,156 @@ async def test_settled_push_after_a_command_under_precedence_is_refused_by_the_h
 
     assert within_the_hold is LockStatus.JAMMED
     assert past_the_hold is LockStatus.LOCKED
+    push_lock._cancel_jam_hold_timer()
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("write", "issued_after"),
+    [
+        (_write_returning_first, 6.0),
+        (_write_delivering, 6.0),
+        (_write_delivering, 3.0),
+    ],
+    ids=[
+        "handled-after-the-write-returned",
+        "handled-before-the-write-returned",
+        "within-the-precedence-time",
+    ],
+)
+async def test_a_reported_failure_re_arms_the_hold_at_its_op_response(
+    write: Callable[[Session, list[bytearray]], Callable[..., None]],
+    issued_after: float,
+) -> None:
+    """A reported failure arms the hold from the frame carrying its op-response."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:93")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_JAMMED)]
+    client.write_gatt_char = AsyncMock(side_effect=write(session, frames))
+
+    with (
+        _patched_clock() as clock,
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+    ):
+        start = clock[0]
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + issued_after
+        with pytest.raises(OperationFailedError):
+            await push_lock.lock()
+
+    assert push_lock.lock_status is LockStatus.JAMMED
+    assert push_lock._jammed_hold_deadline == clock[0] + JAMMED_HOLD_TIME
+    assert push_lock._jam_hold_timer is not None
+    assert push_lock._cancel_deferred_update is None
+    push_lock._cancel_jam_hold_timer()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "before_the_exit",
+    [True, False],
+    ids=["handled-before-the-exit", "handled-after-the-exit"],
+)
+async def test_a_push_after_a_failed_command_meets_the_hold_wherever_the_exit_falls(
+    before_the_exit: bool,
+) -> None:
+    """A push after a failure op-response is refused wherever the exit falls."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:c0")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    push = _with_checksum(_STATUS_PUSH_UNLOCKED)
+    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_JAMMED)]
+    if before_the_exit:
+        frames.append(push)
+    client.write_gatt_char = AsyncMock(
+        side_effect=_write_returning_first(session, frames)
+    )
+
+    with (
+        _patched_clock() as clock,
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+    ):
+        start = clock[0]
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + JAMMED_HOLD_TIME + 1.0
+        push_lock._update_any_state([LockStatus.JAMMED])
+        assert clock[0] >= push_lock._jammed_hold_deadline
+        clock[0] += 3.0
+        with pytest.raises(OperationFailedError):
+            await push_lock.lock()
+        if not before_the_exit:
+            session._notify(0, bytearray(push))
+
+        assert push_lock.lock_status is LockStatus.JAMMED
+        assert push_lock._jammed_hold_deadline == clock[0] + JAMMED_HOLD_TIME
+    push_lock._cancel_jam_hold_timer()
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ["held", "lapsed"], ids=["hold-live", "hold-lapsed"])
+@pytest.mark.parametrize(
+    "order",
+    ["before-ws", "after-ws"],
+    ids=["jam-before-write-success", "jam-after-write-success"],
+)
+@pytest.mark.parametrize("answer", ["success", "none"], ids=["answered", "unanswered"])
+async def test_a_jam_reported_during_a_command_is_held_from_its_report(
+    hold: str, order: str, answer: str
+) -> None:
+    """A jam reported during a command is held from its report, hold live or lapsed."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:f1")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    seen: dict[str, float] = {}
+
+    async def force_lock(
+        write_success_callback: Callable[[], None],
+        result_callback: Callable[[bool], None],
+    ) -> None:
+        clock[0] += 1.0
+        if order == "before-ws":
+            push_lock._update_any_state([LockStatus.JAMMED])
+            seen["jam"] = clock[0]
+            clock[0] += 0.5
+            write_success_callback()
+        else:
+            write_success_callback()
+            clock[0] += 0.5
+            push_lock._update_any_state([LockStatus.JAMMED])
+            seen["jam"] = clock[0]
+        clock[0] += 0.5
+        if answer == "success":
+            result_callback(True)
+        else:
+            raise OperationIncompleteError("no op-response")
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = force_lock
+
+    with (
+        _patched_clock() as clock,
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+    ):
+        start = clock[0]
+        push_lock._update_any_state([LockStatus.JAMMED])
+        if hold == "lapsed":
+            clock[0] = start + JAMMED_HOLD_TIME + 1.0
+            push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] += 6.0
+        if answer == "success":
+            await push_lock.lock()
+        else:
+            with pytest.raises(OperationIncompleteError):
+                await push_lock.lock()
+        assert push_lock._jammed_hold_deadline == seen["jam"] + JAMMED_HOLD_TIME
+        assert push_lock._cancel_deferred_update is None
+        push_lock._update_any_state([LockStatus.LOCKED])
+        assert push_lock.lock_status is LockStatus.JAMMED
     push_lock._cancel_jam_hold_timer()
     push_lock._cancel_future_update()
     push_lock._cancel_disconnect_timer()

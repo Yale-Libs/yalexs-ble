@@ -899,12 +899,10 @@ class PushLock:
         )
 
     def _operation_result(self, complete_state: LockStatus, succeeded: bool) -> None:
-        """Close the operation window and display the command's end state.
+        """Close the operation window and apply the op-response to the display.
 
-        Runs as the op-response frame is handled. A failure op-response has
-        already put JAMMED on the display, so only a success updates it, unless
-        the watcher is stopped or a reported jam or setup condition takes
-        precedence and is still on display.
+        Runs as the op-response frame is handled; a failure's JAMMED reached the
+        display on that same frame, so only a success has anything left to apply.
         """
         self._operation_answered = True
         self._close_operation_window()
@@ -1075,9 +1073,10 @@ class PushLock:
             )
             return None
         if incoming in MANUAL_INTERVENTION_STATUSES:
-            if current not in MANUAL_INTERVENTION_STATUSES:
-                # Armed only on the transition; re-arming on repeats would
-                # keep a demand-connected lock polling forever.
+            if current not in MANUAL_INTERVENTION_STATUSES or self._operation_in_flight:
+                # A report during a command of ours arms the hold whatever is on
+                # display; otherwise only the transition arms it, since re-arming
+                # on every repeat would keep a demand-connected lock polling forever.
                 _LOGGER.debug(
                     "%s: Holding %s on display for %s seconds",
                     self.name,
