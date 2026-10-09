@@ -2910,10 +2910,12 @@ async def test_activity_unregister_stops_delivery_and_reads() -> None:
     """Once the last callback is unregistered nothing is read or delivered."""
     push_lock, mock_lock, received = _activity_push_lock([[]])
     await _run_update(push_lock, mock_lock)
-    push_lock._activity_callbacks.clear()
     other: list[LockActivity | DoorActivity] = []
     unregister = push_lock.register_activity_callback(other.append)
     unregister()
+    # One callback is still registered, so the log stays primed.
+    assert push_lock._activity_primed is True
+    push_lock._activity_callbacks.clear()
     assert push_lock._activity_callbacks == []
     push_lock._update_any_state([LockStatus.UNLOCKED])
     await _run_update(push_lock, mock_lock)
