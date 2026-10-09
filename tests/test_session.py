@@ -617,7 +617,7 @@ async def test_keycode_wait_skips_ack_and_wrong_slot() -> None:
             "commit_keycode failed: KEYCODE_EXISTING_KEY (0x06)",
             id="known",
         ),
-        pytest.param(0x5A, "commit_keycode failed: unknown error 0x5a", id="raw"),
+        pytest.param(0x5A, "commit_keycode failed: unknown error (0x5A)", id="raw"),
     ],
 )
 def test_keycode_error_message_names_the_error(

@@ -56,14 +56,10 @@ class KeycodeError(YaleXSBLEError):
     """The lock reported a non-zero result for a keycode command."""
 
     def __init__(self, command: str, error: OperationError | int) -> None:
-        """Init the error with the lock's result code."""
         self.command = command
         self.error = error
-        if isinstance(error, OperationError):
-            detail = f"{error.name} (0x{int(error):02X})"
-        else:
-            detail = f"unknown error 0x{int(error):02x}"
-        super().__init__(f"{command} failed: {detail}")
+        name = error.name if isinstance(error, OperationError) else "unknown error"
+        super().__init__(f"{command} failed: {name} (0x{error:02X})")
 
 
 class DisconnectedError(YaleXSBLEError):

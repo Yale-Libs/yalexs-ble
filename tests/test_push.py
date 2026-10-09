@@ -2733,95 +2733,48 @@ async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
     assert _AUTH_FAILURE_HISTORY.should_raise(address) is False
 
 
-class _PushKeycodeSession:
-    """Session stand-in feeding canned frames to a real Lock."""
-
-    def __init__(self, responses: list[bytes]) -> None:
-        self.responses = responses
-        self.sent: list[bytearray] = []
-
-    def build_command(self, opcode: int) -> bytearray:
-        cmd = bytearray(0x12)
-        cmd[0x00] = 0xEE
-        cmd[0x01] = opcode
-        cmd[0x10] = 0x02
-        return cmd
-
-    async def execute(
-        self,
-        command: bytearray,
-        command_name: str,
-        response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
-        self.sent.append(command)
-        return self.responses.pop(0)
-
-
-def _result_frame(opcode: int, error: int = 0) -> bytes:
-    frame = bytearray(18)
-    frame[0x00] = 0xBB
-    frame[0x01] = opcode
-    frame[0x0F] = error
-    return bytes(frame)
-
-
-def _keycode_push_lock(
-    responses: list[bytes],
-) -> tuple[PushLock, Lock, _PushKeycodeSession]:
-    push_lock, lock = _real_decoder_pair("aa:bb:cc:dd:ee:30")
-    session = _PushKeycodeSession(responses)
-    lock.session = session  # type: ignore[assignment]
-    lock.secure_session = MagicMock()
-    lock.client = MagicMock(is_connected=True)
+def _keycode_push_lock() -> tuple[PushLock, MagicMock]:
+    """A running PushLock whose connected Lock is a mock."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:30", always_connected=False)
     push_lock._running = True
-    return push_lock, lock, session
+    lock = MagicMock()
+    lock.get_keycode = AsyncMock(return_value="135790")
+    lock.set_keycode = AsyncMock()
+    lock.clear_keycode = AsyncMock()
+    return push_lock, lock
 
 
 @pytest.mark.asyncio
 async def test_push_lock_keycode_round_trip() -> None:
-    get_frame = bytes.fromhex("bb39004ec800135790ffffffff0000000000")
-    responses = [
-        get_frame,
-        *[_result_frame(op) for op in (0x28, 0x27, 0x2B, 0x2C)],
-        _result_frame(0x28),
-    ]
-    push_lock, lock, session = _keycode_push_lock(responses)
+    push_lock, lock = _keycode_push_lock()
     with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
         assert await push_lock.get_keycode(200) == "135790"
         await push_lock.set_keycode(200, "135790")
         await push_lock.clear_keycode(200)
-    assert [c[0x01] for c in session.sent] == [0x39, 0x28, 0x27, 0x2B, 0x2C, 0x28]
+    lock.get_keycode.assert_awaited_once_with(200)
+    lock.set_keycode.assert_awaited_once_with(200, "135790")
+    lock.clear_keycode.assert_awaited_once_with(200)
     assert push_lock._last_operation_complete_time != NEVER_TIME
 
 
 @pytest.mark.asyncio
 async def test_push_lock_keycode_error_propagates_without_retry() -> None:
-    push_lock, lock, session = _keycode_push_lock([_result_frame(0x28, 0x06)])
+    push_lock, lock = _keycode_push_lock()
+    lock.clear_keycode.side_effect = KeycodeError("clear_keycode", 0x06)
     with (
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
         pytest.raises(KeycodeError),
     ):
         await push_lock.clear_keycode(5)
-    assert len(session.sent) == 1
+    lock.clear_keycode.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_push_lock_keycode_requires_running() -> None:
-    push_lock, _, _ = _keycode_push_lock([])
+    push_lock, _ = _keycode_push_lock()
     push_lock._running = False
     with pytest.raises(RuntimeError, match="not running"):
         await push_lock.get_keycode(1)
-
-
-ACTIVITY_PUSH_ADV = AdvertisementData(
-    local_name="Test Lock",
-    service_data={},
-    service_uuids=[],
-    rssi=-50,
-    manufacturer_data={},
-    platform_data=(),
-    tx_power=0,
-)
 
 
 def _activity_push_lock(
@@ -2833,18 +2786,13 @@ def _activity_push_lock(
     Each entry of drains is one drain: the records it yields, and an
     exception in the list is raised at that point.
     """
-    push_lock = PushLock(
-        address="aa:bb:cc:dd:ee:ff",
-        key="0800200c9a66",
-        key_index=1,
-        always_connected=False,
-    )
-    push_lock._name = "Test Lock"
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:ff", always_connected=False)
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
-    push_lock._advertisement_data = ACTIVITY_PUSH_ADV
-    push_lock._seen_this_session.update({LockStatus, DoorStatus, BatteryState})
-    push_lock._seen_this_session.add(AutoLockState)
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._seen_this_session.update(
+        {LockStatus, DoorStatus, BatteryState, AutoLockState}
+    )
     outcomes = iter(drains)
 
     async def drain_lock_activity() -> Any:
@@ -2880,6 +2828,26 @@ async def test_activity_first_update_primes_without_delivering() -> None:
     assert mock_lock.drain_lock_activity.call_count == 1
     await _run_update(push_lock, mock_lock)
     assert mock_lock.drain_lock_activity.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_activity_priming_waits_for_a_follow_up_to_the_first_update() -> None:
+    """The first update does not drain; it schedules the priming for the next."""
+    push_lock, mock_lock, received = _activity_push_lock([[_unlock(1)]])
+    push_lock._lock_info = None
+    with (
+        patch.object(
+            push_lock, "_probe_lock_info", AsyncMock(return_value=TEST_LOCK_INFO)
+        ),
+        patch.object(push_lock, "_schedule_future_update") as schedule,
+    ):
+        await _run_update(push_lock, mock_lock)
+    mock_lock.drain_lock_activity.assert_not_called()
+    schedule.assert_called_once_with(0)
+    await _run_update(push_lock, mock_lock)
+    assert mock_lock.drain_lock_activity.call_count == 1
+    assert received == []
+    assert push_lock._activity_primed is True
 
 
 @pytest.mark.asyncio

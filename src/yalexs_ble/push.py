@@ -340,7 +340,7 @@ class PushLock:
             Callable[[LockActivity | DoorActivity], None]
         ] = []
         self._activity_primed = False
-        self._activity_drain_pending = False
+        self._activity_drain_pending = True
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
@@ -496,6 +496,7 @@ class PushLock:
                 # Prime again on the next registration so the backlog
                 # that built up meanwhile is not delivered as new.
                 self._activity_primed = False
+                self._activity_drain_pending = True
 
         self._activity_callbacks.append(callback)
         return unregister_activity_callback
@@ -867,7 +868,7 @@ class PushLock:
 
     async def get_keycode(self, slot: int) -> str | None:
         """Read the PIN in a keypad slot; None if the slot is empty."""
-        return await self._execute_keycode_operation(
+        return await self._run_on_lock(
             "get_keycode", lambda lock: lock.get_keycode(slot)
         )
 
@@ -876,26 +877,20 @@ class PushLock:
 
         The slot is cleared first, so a KeycodeError leaves it empty.
         """
-        await self._execute_keycode_operation(
-            "set_keycode", lambda lock: lock.set_keycode(slot, pin)
-        )
+        await self._run_on_lock("set_keycode", lambda lock: lock.set_keycode(slot, pin))
 
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot."""
-        await self._execute_keycode_operation(
-            "clear_keycode", lambda lock: lock.clear_keycode(slot)
-        )
+        await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
 
     @operation_lock
     @retry_bluetooth_connection_error
-    async def _execute_keycode_operation(
+    async def _run_on_lock(
         self, name: str, operation: Callable[[Lock], Awaitable[_T]]
     ) -> _T:
-        """Run a keycode operation on a connected lock."""
+        """Run an operation on the connected lock under the operation lock."""
         if not self._running:
-            raise RuntimeError(
-                f"{self.name}: Keycode operation not possible because not running"
-            )
+            raise RuntimeError(f"{self.name}: {name} not possible because not running")
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
@@ -1260,16 +1255,20 @@ class PushLock:
             await lock.lock_status()
             self._record_auth_success()
 
-        if self._activity_callbacks and (
-            not self._activity_primed or self._activity_drain_pending
-        ):
-            await self._drain_activity(lock)
-
         _LOGGER.debug("%s: Finished update", self.name)
 
         current = self._get_current_state()
         # Notify consumers that the update is complete, even if nothing changed.
         self._callback_state(current)
+
+        if self._activity_callbacks and self._activity_drain_pending:
+            if has_lock_info:
+                made_request = True
+                await self._drain_activity(lock)
+            else:
+                # The backlog can be long; prime on a follow-up update so
+                # it does not hold up the first one.
+                self._schedule_future_update(0)
 
         if not has_lock_info:
             # On first update free up the connection
@@ -1291,9 +1290,8 @@ class PushLock:
     async def _drain_activity(self, lock: Lock) -> None:
         """Read the lock's activity log and deliver the records.
 
-        The first drain only primes: the backlog is discarded so old records
-        are not reported as new. An incomplete drain stays pending for the
-        next update; records already read are delivered regardless.
+        The first drain only primes, discarding the backlog. An incomplete
+        drain stays pending; records already read are delivered regardless.
         """
         # Consumed before the await so a change during the drain is kept.
         self._activity_drain_pending = False
@@ -1301,17 +1299,16 @@ class PushLock:
             async for activity in lock.drain_lock_activity():
                 if self._activity_primed:
                     self._callback_activity(activity)
-        except (BleakError, TimeoutError, ResponseError) as err:
+        except Exception as err:
             self._activity_drain_pending = True
+            if not isinstance(err, (BleakError, TimeoutError, ResponseError)):
+                raise
             _LOGGER.debug(
                 "%s: Reading lock activity failed (%s), will retry on next update.",
                 self.name,
                 err,
             )
             return
-        except Exception:
-            self._activity_drain_pending = True
-            raise
         self._activity_primed = True
 
     def _callback_activity(self, activity: LockActivity | DoorActivity) -> None:

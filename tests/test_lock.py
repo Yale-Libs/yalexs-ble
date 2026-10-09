@@ -588,16 +588,15 @@ def test_parse_state_writesetting_ack_ignored() -> None:
 def test_parse_state_ack_for_other_opcode_is_unknown() -> None:
     """ACK recognition is scoped to the settings opcodes.
 
-    An 0xAA frame whose opcode is neither a lock/unlock ack nor a settings ack
-    is not claimed: it falls through to None, so a new acknowledgment type on
-    another model still surfaces as an unknown frame instead of being silently
-    dropped. Frame built from the READSETTING ACK capture above with the opcode
-    byte changed to LOCK_ACTIVITY (0x2D), which is recognized on the 0xBB flag
-    only.
+    An 0xAA frame for an opcode with no ack decode falls through to None, so a
+    new acknowledgment type still surfaces as an unknown frame. LOCK_ACTIVITY
+    carries no state on either flag, so its ack is recognised and ignored.
     """
     lock = _make_lock()
     ack = bytes.fromhex("aa2d00282800000000000000000000000200")
-    assert lock._parse_state(ack) is None
+    assert lock._parse_state(ack) == ()
+    unknown = bytes.fromhex("aa2e00282800000000000000000000000200")
+    assert lock._parse_state(unknown) is None
 
 
 def test_settings_response_matcher_takes_value_frame_not_ack() -> None:
@@ -1007,19 +1006,15 @@ def _result(opcode: int, error: int = 0, slot: int = 0) -> bytes:
     return bytes(frame)
 
 
-class _KeycodeSession:
-    """Session stand-in that replays canned results through the real matcher."""
+class _KeycodeSession(_CommandCaptureSession):
+    """Command capture that replays canned results through the real matcher."""
 
     def __init__(self, responses: list[bytes]) -> None:
+        super().__init__()
         self.responses = responses
-        self.sent: list[bytearray] = []
 
     def build_command(self, opcode: int) -> bytearray:
-        cmd = bytearray(0x12)
-        cmd[0x00] = 0xEE
-        cmd[0x01] = opcode
-        cmd[0x10] = 0x02
-        return cmd
+        return self.build_operation_command(opcode, 0)
 
     async def execute(
         self,
@@ -1075,7 +1070,7 @@ async def test_unknown_error_code_is_carried_as_an_int() -> None:
         await lock.clear_keycode(5)
     assert exc_info.value.error == 0x7F
     assert not isinstance(exc_info.value.error, OperationError)
-    assert str(exc_info.value) == "clear_keycode failed: unknown error 0x7f"
+    assert str(exc_info.value) == "clear_keycode failed: unknown error (0x7F)"
 
 
 @pytest.mark.asyncio
@@ -1117,7 +1112,7 @@ async def test_set_keycode_runs_clear_set_access_commit_in_order() -> None:
 async def test_set_keycode_odd_length_pin_and_high_slot() -> None:
     lock, session = _keycode_lock([_result(op) for op in (0x28, 0x27, 0x2B, 0x2C)])
     await lock.set_keycode(0x0102, "12345")
-    assert session.sent[1][0x04:0x0B] == bytes.fromhex("12345fffffffff"[:14])
+    assert session.sent[1][0x04:0x0B] == bytes.fromhex("12345fffffffff")
     assert (session.sent[3][0x0B], session.sent[3][0x0D]) == (0x02, 0x01)
 
 
@@ -1312,18 +1307,15 @@ async def test_drain_lock_activity_yields_each_record_as_it_is_read() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("max_records", [4, None])
-async def test_drain_lock_activity_raises_past_the_cap(max_records: int | None) -> None:
+async def test_drain_lock_activity_raises_past_the_cap() -> None:
     """Without an end marker the drain raises after max_records reads."""
-    cap = MAX_ACTIVITY_RECORDS if max_records is None else max_records
-    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * (cap + 5))
-    kwargs = {} if max_records is None else {"max_records": max_records}
+    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * (MAX_ACTIVITY_RECORDS + 5))
     seen: list[DoorActivity | LockActivity] = []
-    with pytest.raises(ResponseError, match=f"did not end within {cap} reads"):
-        async for activity in lock.drain_lock_activity(**kwargs):
+    with pytest.raises(ResponseError, match=f"within {MAX_ACTIVITY_RECORDS} reads"):
+        async for activity in lock.drain_lock_activity():
             seen.append(activity)
-    assert len(seen) == cap
-    assert write.await_count == cap
+    assert len(seen) == MAX_ACTIVITY_RECORDS
+    assert write.await_count == MAX_ACTIVITY_RECORDS
 
 
 @pytest.mark.asyncio

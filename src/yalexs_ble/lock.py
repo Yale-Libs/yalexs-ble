@@ -188,28 +188,25 @@ KEYCODE_OPCODES = frozenset(
         Commands.KEYCODE_GET.value,
     }
 )
-KEYCODE_ERROR_BYTE = 0x0F
+# Opcodes whose frames carry no lock state; their results go to the waiting command.
+NO_STATE_OPCODES = KEYCODE_OPCODES | {Commands.LOCK_ACTIVITY.value}
 KEYCODE_ACCESS_ALWAYS = 0x80
 KEYCODE_CREDENTIAL_PIN = 0x00
 KEYCODE_MAX_SLOT = 0xFFFF
+# Result code of a 0xBB op-response or keycode result.
+RESULT_BYTE = 0x0F
 
 
 def _keycode_response_matcher(
     opcode: int, slot: int | None = None
 ) -> Callable[[bytes], bool]:
-    """Match the 0xBB result answering one keycode command.
-
-    Only the 0xBB result carries the error code, so the 0xAA ack must not
-    answer the wait. A slot read also requires the echoed slot at [4:6].
-    """
+    """Match the 0xBB result of a keycode command; a read also needs its slot echoed."""
+    matches_result = _operation_response_matcher(opcode)
+    if slot is None:
+        return matches_result
 
     def matches(data: bytes) -> bool:
-        return (
-            len(data) > KEYCODE_ERROR_BYTE
-            and data[0x00] == 0xBB
-            and data[0x01] == opcode
-            and (slot is None or util._bytes_to_int(data[0x04:0x06]) == slot)
-        )
+        return matches_result(data) and util._bytes_to_int(data[0x04:0x06]) == slot
 
     return matches
 
@@ -217,12 +214,6 @@ def _keycode_response_matcher(
 def _validate_keycode_slot(slot: int) -> None:
     if not 1 <= slot <= KEYCODE_MAX_SLOT:
         raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
-
-
-def _raise_for_keycode_error(command_name: str, response: bytes) -> None:
-    result = response[KEYCODE_ERROR_BYTE]
-    if result != OperationError.COMM_SUCCESS:
-        raise KeycodeError(command_name, VALUE_TO_OPERATION_ERROR.get(result, result))
 
 
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
@@ -250,7 +241,7 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
     """
 
     def _matches(data: bytes) -> bool:
-        return len(data) > 0x0F and data[0x00] == 0xBB and data[0x01] == opcode
+        return len(data) > RESULT_BYTE and data[0x00] == 0xBB and data[0x01] == opcode
 
     return _matches
 
@@ -370,6 +361,8 @@ class Lock:
         raise BleakError(f"Missing characteristic {char_uuid}")
 
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
+        if state[0] in (0xAA, 0xBB) and state[1] in NO_STATE_OPCODES:
+            return ()  # Answered to the waiting command; carries no state
         if state[0] == 0xBB:
             # Op-response for LOCK/UNLOCK (0xBB + 0x0A/0x0B), emitted when the
             # motor stops. The operation result is byte[15]: 0x00 = success,
@@ -390,10 +383,6 @@ class Lock:
                     )
                     return [LockStatus.JAMMED]
                 return ()  # success: recognized, no state update
-            if state[1] == Commands.LOCK_ACTIVITY.value:
-                return ()  # Ignore lock activity as these are historical events
-            if state[1] in KEYCODE_OPCODES:
-                return ()  # Keycode results are consumed by their own command
             if state[1] == Commands.GETSTATUS.value:
                 if state[4] == StatusType.LOCK_ONLY.value:
                     return [self._parse_lock_status(state[0x08])]
@@ -410,8 +399,6 @@ class Lock:
                 if state[4] == SettingType.AUTOLOCK.value:
                     return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
-            if state[1] in KEYCODE_OPCODES:
-                return ()  # ACK for a keycode command; the result follows in 0xBB
             if state[1] == Commands.UNLOCK.value:
                 return [LockStatus.UNLOCKED]
             if state[1] == Commands.LOCK.value:
@@ -611,58 +598,47 @@ class Lock:
         )
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
 
-    async def _execute_keycode_command(
-        self,
-        opcode: Commands,
-        command_name: str,
-        fill: Callable[[bytearray], None],
-        slot: int | None = None,
+    async def _send_keycode(
+        self, cmd: bytearray, command_name: str, slot: int | None = None
     ) -> bytes:
-        """Send one keycode command and raise KeycodeError on a failed result."""
+        """Send a keycode command and raise KeycodeError on a failed result."""
         assert self.session is not None  # nosec
-        cmd = self.session.build_command(opcode)
-        fill(cmd)
         response = await self.session.execute(
-            cmd, command_name, _keycode_response_matcher(opcode.value, slot)
+            cmd, command_name, _keycode_response_matcher(cmd[0x01], slot)
         )
-        _raise_for_keycode_error(command_name, response)
+        if (result := response[RESULT_BYTE]) != OperationError.COMM_SUCCESS:
+            raise KeycodeError(
+                command_name, VALUE_TO_OPERATION_ERROR.get(result, result)
+            )
         return response
 
-    @staticmethod
-    def _fill_keycode_slot(cmd: bytearray, pin: bytes, slot: int) -> None:
-        """Lay out the PIN/slot/credential-type fields shared by CLEAR and COMMIT."""
+    def _keycode_slot_command(self, opcode: int, pin: bytes, slot: int) -> bytearray:
+        """Build the CLEAR or COMMIT frame: PIN, slot and credential type."""
+        assert self.session is not None  # nosec
+        cmd = self.session.build_command(opcode)
         util._copy(cmd, pin, destLocation=0x04)
         cmd[0x0B] = slot & 0xFF
         cmd[0x0C] = KEYCODE_CREDENTIAL_PIN
-        cmd[0x0D] = (slot >> 8) & 0xFF
+        cmd[0x0D] = slot >> 8
+        return cmd
 
     @raise_if_not_connected
     async def get_keycode(self, slot: int) -> str | None:
         """Read the PIN in a keypad slot; None if the slot is empty."""
         _validate_keycode_slot(slot)
-
-        def fill(cmd: bytearray) -> None:
-            util._copy(cmd, util._int_to_bytes(slot, 2), destLocation=0x04)
-
-        response = await self._execute_keycode_command(
-            Commands.KEYCODE_GET, "get_keycode", fill, slot
-        )
+        assert self.session is not None  # nosec
+        cmd = self.session.build_command(Commands.KEYCODE_GET)
+        cmd[0x04:0x06] = util._int_to_bytes(slot, 2)
+        response = await self._send_keycode(cmd, "get_keycode", slot)
         return util.decode_keycode_pin(response[0x06:0x0D])
 
     @raise_if_not_connected
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot without needing to know its PIN."""
         _validate_keycode_slot(slot)
-        await self._clear_keycode(slot)
-
-    async def _clear_keycode(self, slot: int) -> None:
-        await self._execute_keycode_command(
-            Commands.KEYCODE_CLEAR,
-            "clear_keycode",
-            lambda cmd: self._fill_keycode_slot(
-                cmd, b"\xff" * util.KEYCODE_PIN_BYTES, slot
-            ),
-        )
+        blank = b"\xff" * util.KEYCODE_PIN_BYTES
+        cmd = self._keycode_slot_command(Commands.KEYCODE_CLEAR, blank, slot)
+        await self._send_keycode(cmd, "clear_keycode")
 
     @raise_if_not_connected
     async def set_keycode(self, slot: int, pin: str) -> None:
@@ -673,27 +649,21 @@ class Lock:
         """
         _validate_keycode_slot(slot)
         encoded = util.encode_keycode_pin(pin)
+        assert self.session is not None  # nosec
+        await self.clear_keycode(slot)
 
-        def fill_set(cmd: bytearray) -> None:
-            util._copy(cmd, encoded, destLocation=0x04)
-            cmd[0x0C] = KEYCODE_CREDENTIAL_PIN
+        cmd = self.session.build_command(Commands.KEYCODE_SET)
+        util._copy(cmd, encoded, destLocation=0x04)
+        cmd[0x0C] = KEYCODE_CREDENTIAL_PIN
+        await self._send_keycode(cmd, "set_keycode")
 
-        def fill_access(cmd: bytearray) -> None:
-            cmd[0x0C] = KEYCODE_ACCESS_ALWAYS
-            cmd[0x0D] = KEYCODE_CREDENTIAL_PIN
+        cmd = self.session.build_command(Commands.KEYCODE_ACCESS)
+        cmd[0x0C] = KEYCODE_ACCESS_ALWAYS
+        cmd[0x0D] = KEYCODE_CREDENTIAL_PIN
+        await self._send_keycode(cmd, "set_keycode_access")
 
-        await self._clear_keycode(slot)
-        await self._execute_keycode_command(
-            Commands.KEYCODE_SET, "set_keycode", fill_set
-        )
-        await self._execute_keycode_command(
-            Commands.KEYCODE_ACCESS, "set_keycode_access", fill_access
-        )
-        await self._execute_keycode_command(
-            Commands.KEYCODE_COMMIT,
-            "commit_keycode",
-            lambda cmd: self._fill_keycode_slot(cmd, encoded, slot),
-        )
+        cmd = self._keycode_slot_command(Commands.KEYCODE_COMMIT, encoded, slot)
+        await self._send_keycode(cmd, "commit_keycode")
 
     async def securemode(self) -> None:
         if (await self.lock_status()) != LockStatus.SECUREMODE:
@@ -954,7 +924,7 @@ class Lock:
             # Timestamp is at 0x05-0x08
             # Slot is a uint16 at 0x0E-0x0F; 0xFFEE is the keypad master code
             timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            slot = int.from_bytes(response[0x0E:0x10], byteorder="little")
+            slot = util._bytes_to_int(response[0x0E:0x10])
             return LockActivity(
                 timestamp,
                 LockStatus.UNLOCKED,
@@ -983,12 +953,10 @@ class Lock:
     async def drain_lock_activity(
         self, max_records: int = MAX_ACTIVITY_RECORDS
     ) -> AsyncIterator[DoorActivity | LockActivity]:
-        """Pop and yield activity records until the log's end marker.
+        """Pop and yield records until the end marker; ResponseError past the cap.
 
-        Each read pops the oldest record, so records are yielded as they
-        arrive and survive a failure later in the drain. Unknown record
-        types are skipped. Raises ResponseError if the marker has not been
-        seen after max_records reads; the log is then only partly drained.
+        Each read pops the lock's oldest record, so records are yielded as
+        they arrive. Unknown types are skipped.
         """
         if not self.is_connected:
             raise DisconnectedError("Lock is not connected")
