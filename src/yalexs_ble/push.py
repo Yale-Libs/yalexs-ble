@@ -1553,7 +1553,8 @@ class PushLock:
                 self.name,
             )
         except asyncio.CancelledError:
-            failed = False  # this library giving up, not the lock failing
+            # This library giving up, not the lock failing; the re-raise
+            # skips the failure accounting below.
             self._set_update_state(RuntimeError("Update was canceled"))
             _LOGGER.debug("%s: In-progress update canceled", self.name)
             raise
@@ -1580,17 +1581,16 @@ class PushLock:
             wrapped_exc.__cause__ = ex
             self._set_update_state(wrapped_exc)
             _LOGGER.exception("%s: Unknown error updating", self.name)
-        finally:
-            if failed:
-                self._consecutive_update_failures += 1
-                if self._always_connected and not _AUTH_FAILURE_HISTORY.should_raise(
-                    self.address
-                ):
-                    # The failed update left the lock disconnected; pace the
-                    # reconnect here, not from the disconnect callback.
-                    self._schedule_future_update_with_debounce(
-                        self._reconnect_backoff_time()
-                    )
+        if failed:
+            self._consecutive_update_failures += 1
+            if self._always_connected and not _AUTH_FAILURE_HISTORY.should_raise(
+                self.address
+            ):
+                # The failed update left the lock disconnected; pace the
+                # reconnect here, not from the disconnect callback.
+                self._schedule_future_update_with_debounce(
+                    self._reconnect_backoff_time()
+                )
 
 
 # The HomeKit state record inside the advertisement payload: acid, the global
