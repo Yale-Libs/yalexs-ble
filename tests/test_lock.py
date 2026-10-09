@@ -35,7 +35,9 @@ from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
     MAX_ACTIVITY_RECORDS,
     Lock,
+    _ack_matcher,
     _keycode_response_matcher,
+    _operation_response_matcher,
     _poll_response_matcher,
     _settings_response_matcher,
     convert_voltage_to_percentage,
@@ -1330,3 +1332,31 @@ async def test_drain_lock_activity_requires_a_connection() -> None:
     lock = _make_lock()
     with pytest.raises(DisconnectedError):
         await _drain(lock)
+
+
+def test_ack_matcher_matches_only_the_written_operation() -> None:
+    """The ack matcher keys on 0xAA + the written opcode + operation byte."""
+    matches = _ack_matcher(0x0B, 0x04)
+
+    # Correct ack: 0xAA, opcode 0x0B, operation byte 0x04.
+    assert matches(bytes.fromhex("aa0b00450400000000000000000000000200"))
+    # Same opcode but operation byte 0x00, a plain-lock ack, not securemode.
+    assert not matches(bytes.fromhex("aa0b00490000000000000000000000000200"))
+    # Wrong opcode (0x0A).
+    assert not matches(bytes.fromhex("aa0a004a0000000000000000000000000200"))
+    # An op-response (0xBB), not an acknowledgment.
+    assert not matches(bytes.fromhex("bb0b00450400000000000000000000000200"))
+
+
+def test_operation_response_matcher_matches_only_its_opcode() -> None:
+    """The op-response matcher keys on 0xBB + the sent opcode, full length."""
+    matches = _operation_response_matcher(0x0A)
+
+    # An 18-byte 0xBB 0x0A op-response.
+    assert matches(bytes.fromhex("bb0a00000000000000000000000000000200"))
+    # Wrong opcode (0x0B).
+    assert not matches(bytes.fromhex("bb0b00000000000000000000000000000200"))
+    # An acknowledgment (0xAA), not an op-response.
+    assert not matches(bytes.fromhex("aa0a00000000000000000000000000000200"))
+    # Truncated: byte[15] (the result) is not present.
+    assert not matches(bytes.fromhex("bb0a0000000000000000"))
