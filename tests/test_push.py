@@ -3,6 +3,7 @@ import logging
 import struct
 import time
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -16,8 +17,11 @@ from yalexs_ble.const import (
     AutoLockMode,
     AutoLockState,
     BatteryState,
+    DoorActivity,
     DoorStatus,
+    LockActivity,
     LockInfo,
+    LockOperationSource,
     LockState,
     LockStatus,
 )
@@ -46,7 +50,7 @@ from yalexs_ble.push import (
     operation_lock,
     retry_bluetooth_connection_error,
 )
-from yalexs_ble.session import DisconnectedError, ResponseError
+from yalexs_ble.session import DisconnectedError, KeycodeError, ResponseError
 
 # Shared battery-supporting lock used across tests. model is NOT in
 # NO_BATTERY_SUPPORT_MODELS, so the battery-workaround path is not taken.
@@ -1695,7 +1699,6 @@ async def test_auto_lock_read_backoff_reearned_after_window() -> None:
     push_lock._name = "Test Lock"
     # Arriving as if a prior window has just armed and reset: no failures held,
     # and the window is already past so reads resume.
-    push_lock._auto_lock_read_ack_failures = 0
     push_lock._earliest_auto_lock_read_time = NEVER_TIME
 
     mock_lock = MagicMock()
@@ -2728,3 +2731,231 @@ async def test_every_read_a_cycle_issues_records_the_round_trip_as_a_success(
 
     assert push_lock.auth == AuthState(successful=True)
     assert _AUTH_FAILURE_HISTORY.should_raise(address) is False
+
+
+class _PushKeycodeSession:
+    """Session stand-in feeding canned frames to a real Lock."""
+
+    def __init__(self, responses: list[bytes]) -> None:
+        self.responses = responses
+        self.sent: list[bytearray] = []
+
+    def build_command(self, opcode: int) -> bytearray:
+        cmd = bytearray(0x12)
+        cmd[0x00] = 0xEE
+        cmd[0x01] = opcode
+        cmd[0x10] = 0x02
+        return cmd
+
+    async def execute(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        self.sent.append(command)
+        return self.responses.pop(0)
+
+
+def _result_frame(opcode: int, error: int = 0) -> bytes:
+    frame = bytearray(18)
+    frame[0x00] = 0xBB
+    frame[0x01] = opcode
+    frame[0x0F] = error
+    return bytes(frame)
+
+
+def _keycode_push_lock(
+    responses: list[bytes],
+) -> tuple[PushLock, Lock, _PushKeycodeSession]:
+    push_lock, lock = _real_decoder_pair("aa:bb:cc:dd:ee:30")
+    session = _PushKeycodeSession(responses)
+    lock.session = session  # type: ignore[assignment]
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+    push_lock._running = True
+    return push_lock, lock, session
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_round_trip() -> None:
+    get_frame = bytes.fromhex("bb39004ec800135790ffffffff0000000000")
+    responses = [
+        get_frame,
+        *[_result_frame(op) for op in (0x28, 0x27, 0x2B, 0x2C)],
+        _result_frame(0x28),
+    ]
+    push_lock, lock, session = _keycode_push_lock(responses)
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        assert await push_lock.get_keycode(200) == "135790"
+        await push_lock.set_keycode(200, "135790")
+        await push_lock.clear_keycode(200)
+    assert [c[0x01] for c in session.sent] == [0x39, 0x28, 0x27, 0x2B, 0x2C, 0x28]
+    assert push_lock._last_operation_complete_time != NEVER_TIME
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_error_propagates_without_retry() -> None:
+    push_lock, lock, session = _keycode_push_lock([_result_frame(0x28, 0x06)])
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        pytest.raises(KeycodeError),
+    ):
+        await push_lock.clear_keycode(5)
+    assert len(session.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_requires_running() -> None:
+    push_lock, _, _ = _keycode_push_lock([])
+    push_lock._running = False
+    with pytest.raises(RuntimeError, match="not running"):
+        await push_lock.get_keycode(1)
+
+
+ACTIVITY_PUSH_ADV = AdvertisementData(
+    local_name="Test Lock",
+    service_data={},
+    service_uuids=[],
+    rssi=-50,
+    manufacturer_data={},
+    platform_data=(),
+    tx_power=0,
+)
+
+
+def _activity_push_lock(
+    drains: list[Any],
+) -> tuple[PushLock, MagicMock, list[LockActivity | DoorActivity]]:
+    """A PushLock whose only read in _update is the activity drain.
+
+    Lock, door and battery are marked seen so a cycle reads nothing else.
+    """
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:ff",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = ACTIVITY_PUSH_ADV
+    push_lock._seen_this_session.update({LockStatus, DoorStatus, BatteryState})
+    push_lock._seen_this_session.add(AutoLockState)
+    mock_lock = MagicMock()
+    mock_lock.drain_lock_activity = AsyncMock(side_effect=drains)
+    received: list[LockActivity | DoorActivity] = []
+    push_lock.register_activity_callback(received.append)
+    return push_lock, mock_lock, received
+
+
+async def _run_update(push_lock: PushLock, mock_lock: MagicMock) -> None:
+    with patch.object(push_lock, "_ensure_connected", return_value=mock_lock):
+        await push_lock._update()
+
+
+def _unlock(slot: int) -> LockActivity:
+    return LockActivity(
+        datetime(2026, 1, 1), LockStatus.UNLOCKED, LockOperationSource.PIN, slot=slot
+    )
+
+
+@pytest.mark.asyncio
+async def test_activity_first_update_primes_without_delivering() -> None:
+    """The first drain discards the backlog; later updates read nothing."""
+    push_lock, mock_lock, received = _activity_push_lock([[_unlock(1)]])
+    await _run_update(push_lock, mock_lock)
+    assert received == []
+    assert mock_lock.drain_lock_activity.await_count == 1
+    await _run_update(push_lock, mock_lock)
+    assert mock_lock.drain_lock_activity.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_activity_delivered_after_a_status_change() -> None:
+    """A lock status change makes the next update drain and deliver in order."""
+    first, second = _unlock(205), _unlock(200)
+    push_lock, mock_lock, received = _activity_push_lock([[], [first, second]])
+    await _run_update(push_lock, mock_lock)
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    await _run_update(push_lock, mock_lock)
+    assert received == [first, second]
+    await _run_update(push_lock, mock_lock)
+    assert mock_lock.drain_lock_activity.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_activity_no_reads_without_callbacks() -> None:
+    """With no activity callback nothing is read, even after a status change."""
+    push_lock, mock_lock, _ = _activity_push_lock([])
+    push_lock._activity_callbacks.clear()
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    await _run_update(push_lock, mock_lock)
+    mock_lock.drain_lock_activity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_activity_unregister_stops_delivery_and_reads() -> None:
+    """Once the last callback is unregistered nothing is read or delivered."""
+    push_lock, mock_lock, received = _activity_push_lock([[]])
+    await _run_update(push_lock, mock_lock)
+    push_lock._activity_callbacks.clear()
+    other: list[LockActivity | DoorActivity] = []
+    unregister = push_lock.register_activity_callback(other.append)
+    unregister()
+    assert push_lock._activity_callbacks == []
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    await _run_update(push_lock, mock_lock)
+    assert mock_lock.drain_lock_activity.await_count == 1
+    assert received == []
+    assert other == []
+
+
+@pytest.mark.asyncio
+async def test_activity_callback_exception_is_isolated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising activity callback is logged and the others still run."""
+    activity = _unlock(205)
+    push_lock, mock_lock, received = _activity_push_lock([[], [activity]])
+    bad = MagicMock(side_effect=RuntimeError("boom"))
+    push_lock._activity_callbacks.insert(0, bad)
+    await _run_update(push_lock, mock_lock)
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    await _run_update(push_lock, mock_lock)
+    bad.assert_called_once_with(activity)
+    assert received == [activity]
+    assert "Error calling activity callback" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [BleakError("gone"), TimeoutError("slow")])
+async def test_activity_drain_failure_keeps_the_flag(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed drain does not break the update and is retried next time."""
+    activity = _unlock(205)
+    push_lock, mock_lock, received = _activity_push_lock([[], error, [activity]])
+    await _run_update(push_lock, mock_lock)
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        await _run_update(push_lock, mock_lock)
+    assert "Reading lock activity failed" in caplog.text
+    assert push_lock._activity_drain_pending is True
+    assert received == []
+    await _run_update(push_lock, mock_lock)
+    assert received == [activity]
+    assert push_lock._activity_drain_pending is False
+
+
+@pytest.mark.asyncio
+async def test_activity_priming_failure_retries_priming() -> None:
+    """If priming fails the backlog is still discarded on the retry."""
+    push_lock, mock_lock, received = _activity_push_lock(
+        [BleakError("gone"), [_unlock(1)]]
+    )
+    await _run_update(push_lock, mock_lock)
+    await _run_update(push_lock, mock_lock)
+    assert received == []
+    assert push_lock._activity_primed is True

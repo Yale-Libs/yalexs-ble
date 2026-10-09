@@ -1,17 +1,21 @@
 from bleak_retry_connector import close_stale_connections_by_address
 
 from .const import (
+    KEYPAD_MASTER_CODE_SLOT,
     AutoLockMode,
     ConnectionInfo,
+    DoorActivity,
     DoorStatus,
+    LockActivity,
     LockInfo,
+    LockOperationSource,
     LockState,
     LockStatus,
     YaleXSBLEDiscovery,
 )
 from .lock import Lock
 from .push import PushLock
-from .session import AuthError, DisconnectedError, YaleXSBLEError
+from .session import AuthError, DisconnectedError, KeycodeError, YaleXSBLEError
 from .util import (
     ValidatedLockConfig,
     local_name_is_unique,
@@ -24,13 +28,18 @@ from .util import (
 __version__ = "4.0.5"
 
 __all__ = [
+    "KEYPAD_MASTER_CODE_SLOT",
     "AuthError",
     "AutoLockMode",
     "ConnectionInfo",
     "DisconnectedError",
+    "DoorActivity",
     "DoorStatus",
+    "KeycodeError",
     "Lock",
+    "LockActivity",
     "LockInfo",
+    "LockOperationSource",
     "LockState",
     "LockStatus",
     "PushLock",

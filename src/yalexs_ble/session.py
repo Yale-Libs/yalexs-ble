@@ -17,7 +17,12 @@ from cryptography.hazmat.primitives.ciphers import (
 )
 
 from . import util
-from .const import READ_CHARACTERISTIC, RESPONSE_FRAME_LEN, WRITE_CHARACTERISTIC
+from .const import (
+    READ_CHARACTERISTIC,
+    RESPONSE_FRAME_LEN,
+    WRITE_CHARACTERISTIC,
+    OperationError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,6 +39,20 @@ class AuthError(YaleXSBLEError):
 
 class ResponseError(YaleXSBLEError):
     """Error during response."""
+
+
+class KeycodeError(YaleXSBLEError):
+    """The lock reported a non-zero result for a keycode command."""
+
+    def __init__(self, command: str, error: OperationError | int) -> None:
+        """Init the error with the lock's result code."""
+        self.command = command
+        self.error = error
+        if isinstance(error, OperationError):
+            detail = f"{error.name} (0x{int(error):02X})"
+        else:
+            detail = f"unknown error 0x{int(error):02x}"
+        super().__init__(f"{command} failed: {detail}")
 
 
 class DisconnectedError(YaleXSBLEError):
@@ -120,6 +139,7 @@ class Session:
         return cmd
 
     def _write_checksum(self, command: bytearray) -> None:
+        command[0x03] = 0
         checksum = util._simple_checksum(command)
         command[0x03] = checksum
 

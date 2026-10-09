@@ -44,11 +44,20 @@ from .const import (
     StatusType,
 )
 from .secure_session import SecureSession
-from .session import AuthError, DisconnectedError, Session, YaleXSBLEError
+from .session import (
+    AuthError,
+    DisconnectedError,
+    KeycodeError,
+    Session,
+    YaleXSBLEError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
+
+# Upper bound on the records read in one drain of the activity log
+MAX_ACTIVITY_RECORDS = 32
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -167,6 +176,55 @@ def _poll_response_matcher(
         )
 
     return matches
+
+
+KEYCODE_OPCODES = frozenset(
+    {
+        Commands.KEYCODE_SET.value,
+        Commands.KEYCODE_CLEAR.value,
+        Commands.KEYCODE_ACCESS.value,
+        Commands.KEYCODE_COMMIT.value,
+        Commands.KEYCODE_GET.value,
+    }
+)
+KEYCODE_ERROR_BYTE = 0x0F
+KEYCODE_ACCESS_ALWAYS = 0x80
+KEYCODE_CREDENTIAL_PIN = 0x00
+KEYCODE_MAX_SLOT = 0xFFFF
+
+
+def _keycode_response_matcher(
+    opcode: int, slot: int | None = None
+) -> Callable[[bytes], bool]:
+    """Match the 0xBB result frame answering one keycode command.
+
+    Keycode commands are answered by an optional 0xAA acknowledgment echoing
+    the request, then the 0xBB result with the opcode in byte[1]. Only the
+    0xBB result carries the error code, so neither the acknowledgment nor an
+    unsolicited push may answer the wait. A slot read also requires the
+    echoed slot (uint16 LE at [4:6]).
+    """
+
+    def matches(data: bytes) -> bool:
+        return (
+            len(data) > KEYCODE_ERROR_BYTE
+            and data[0x00] == 0xBB
+            and data[0x01] == opcode
+            and (slot is None or util._bytes_to_int(data[0x04:0x06]) == slot)
+        )
+
+    return matches
+
+
+def _validate_keycode_slot(slot: int) -> None:
+    if not 1 <= slot <= KEYCODE_MAX_SLOT:
+        raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
+
+
+def _raise_for_keycode_error(command_name: str, response: bytes) -> None:
+    result = response[KEYCODE_ERROR_BYTE]
+    if result != OperationError.COMM_SUCCESS:
+        raise KeycodeError(command_name, VALUE_TO_OPERATION_ERROR.get(result, result))
 
 
 class Lock:
@@ -306,6 +364,8 @@ class Lock:
                 return ()  # success: recognized, no state update
             if state[1] == Commands.LOCK_ACTIVITY.value:
                 return ()  # Ignore lock activity as these are historical events
+            if state[1] in KEYCODE_OPCODES:
+                return ()  # Keycode results are consumed by their own command
             if state[1] == Commands.GETSTATUS.value:
                 if state[4] == StatusType.LOCK_ONLY.value:
                     return [self._parse_lock_status(state[0x08])]
@@ -322,6 +382,8 @@ class Lock:
                 if state[4] == SettingType.AUTOLOCK.value:
                     return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
+            if state[1] in KEYCODE_OPCODES:
+                return ()  # ACK for a keycode command; the result follows in 0xBB
             if state[1] == Commands.UNLOCK.value:
                 return [LockStatus.UNLOCKED]
             if state[1] == Commands.LOCK.value:
@@ -520,6 +582,90 @@ class Lock:
             ),
         )
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
+
+    async def _execute_keycode_command(
+        self,
+        opcode: Commands,
+        command_name: str,
+        fill: Callable[[bytearray], None],
+        slot: int | None = None,
+    ) -> bytes:
+        """Send one keycode command and raise KeycodeError on a failed result."""
+        assert self.session is not None  # nosec
+        cmd = self.session.build_command(opcode)
+        fill(cmd)
+        response = await self.session.execute(
+            cmd, command_name, _keycode_response_matcher(opcode.value, slot)
+        )
+        _raise_for_keycode_error(command_name, response)
+        return response
+
+    @staticmethod
+    def _fill_keycode_slot(cmd: bytearray, pin: bytes, slot: int) -> None:
+        """Lay out the PIN/slot/credential-type fields shared by CLEAR and COMMIT."""
+        util._copy(cmd, pin, destLocation=0x04)
+        cmd[0x0B] = slot & 0xFF
+        cmd[0x0C] = KEYCODE_CREDENTIAL_PIN
+        cmd[0x0D] = (slot >> 8) & 0xFF
+
+    @raise_if_not_connected
+    async def get_keycode(self, slot: int) -> str | None:
+        """Read the PIN in a keypad slot; None if the slot is empty."""
+        _validate_keycode_slot(slot)
+
+        def fill(cmd: bytearray) -> None:
+            util._copy(cmd, util._int_to_bytes(slot, 2), destLocation=0x04)
+
+        response = await self._execute_keycode_command(
+            Commands.KEYCODE_GET, "get_keycode", fill, slot
+        )
+        return util.decode_keycode_pin(response[0x06:0x0D])
+
+    @raise_if_not_connected
+    async def clear_keycode(self, slot: int) -> None:
+        """Clear a keypad slot without needing to know its PIN."""
+        _validate_keycode_slot(slot)
+        await self._clear_keycode(slot)
+
+    async def _clear_keycode(self, slot: int) -> None:
+        await self._execute_keycode_command(
+            Commands.KEYCODE_CLEAR,
+            "clear_keycode",
+            lambda cmd: self._fill_keycode_slot(
+                cmd, b"\xff" * util.KEYCODE_PIN_BYTES, slot
+            ),
+        )
+
+    @raise_if_not_connected
+    async def set_keycode(self, slot: int, pin: str) -> None:
+        """Program a PIN into a keypad slot with an always-valid schedule.
+
+        The slot is cleared first, then the PIN is set, given an always
+        schedule and committed; each step is awaited before the next.
+        """
+        _validate_keycode_slot(slot)
+        encoded = util.encode_keycode_pin(pin)
+
+        def fill_set(cmd: bytearray) -> None:
+            util._copy(cmd, encoded, destLocation=0x04)
+            cmd[0x0C] = KEYCODE_CREDENTIAL_PIN
+
+        def fill_access(cmd: bytearray) -> None:
+            cmd[0x0C] = KEYCODE_ACCESS_ALWAYS
+            cmd[0x0D] = KEYCODE_CREDENTIAL_PIN
+
+        await self._clear_keycode(slot)
+        await self._execute_keycode_command(
+            Commands.KEYCODE_SET, "set_keycode", fill_set
+        )
+        await self._execute_keycode_command(
+            Commands.KEYCODE_ACCESS, "set_keycode_access", fill_access
+        )
+        await self._execute_keycode_command(
+            Commands.KEYCODE_COMMIT,
+            "commit_keycode",
+            lambda cmd: self._fill_keycode_slot(cmd, encoded, slot),
+        )
 
     async def securemode(self) -> None:
         if (await self.lock_status()) != LockStatus.SECUREMODE:
@@ -776,20 +922,59 @@ class Lock:
                 source=LockOperationSource.PIN,
                 slot=pin_slot,
             )
+        if activity_type == LockActivityType.KEYPAD_UNLOCK.value:
+            # Timestamp is at 0x05-0x08
+            # Slot is a uint16 at 0x0E-0x0F; 0xFFEE is the keypad master code
+            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
+            slot = int.from_bytes(response[0x0E:0x10], byteorder="little")
+            return LockActivity(
+                timestamp,
+                LockStatus.UNLOCKED,
+                source=LockOperationSource.PIN,
+                slot=slot,
+            )
         _LOGGER.warning("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
 
-    @raise_if_not_connected
-    async def lock_activity(self) -> DoorActivity | LockActivity | None:
-        _LOGGER.debug("%s: Executing lock_activity", self.name)
+    async def _read_lock_activity_response(self) -> bytes:
+        """Pop the oldest record from the lock's activity log."""
         assert self.session is not None  # nosec
-        response = await self.session.execute(
+        return await self.session.execute(
             self.session.build_command(Commands.LOCK_ACTIVITY.value),
             "lock_activity",
             _poll_response_matcher(Commands.LOCK_ACTIVITY.value),
         )
+
+    @raise_if_not_connected
+    async def lock_activity(self) -> DoorActivity | LockActivity | None:
+        _LOGGER.debug("%s: Executing lock_activity", self.name)
+        response = await self._read_lock_activity_response()
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
         return self._parse_lock_activity(response)
+
+    @raise_if_not_connected
+    async def drain_lock_activity(
+        self, max_records: int = MAX_ACTIVITY_RECORDS
+    ) -> list[DoorActivity | LockActivity]:
+        """Read the activity log until its end marker or max_records reads.
+
+        Each read pops the oldest record. Records of an unknown type are
+        skipped, and only the end marker or the cap stops the drain.
+        """
+        _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
+        activities: list[DoorActivity | LockActivity] = []
+        for _ in range(max_records):
+            response = await self._read_lock_activity_response()
+            if response[0x04] == LockActivityType.NONE.value:
+                break
+            if (activity := self._parse_lock_activity(response)) is not None:
+                activities.append(activity)
+        _LOGGER.debug(
+            "%s: Finished drain_lock_activity with %d records",
+            self.name,
+            len(activities),
+        )
+        return activities
 
     async def disconnect(self) -> None:
         """Disconnect from the lock."""

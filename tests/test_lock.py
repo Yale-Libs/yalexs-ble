@@ -7,8 +7,10 @@ import pytest
 from bleak.exc import BleakError
 from bleak_retry_connector import BLEDevice
 
+from yalexs_ble import util
 from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
+    KEYPAD_MASTER_CODE_SLOT,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
@@ -18,22 +20,26 @@ from yalexs_ble.const import (
     Commands,
     DoorActivity,
     DoorStatus,
+    LockActivity,
     LockInfo,
     LockOperationRemoteType,
     LockOperationSource,
     LockStateValue,
     LockStatus,
+    OperationError,
     SettingType,
     StatusType,
 )
 from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
+    MAX_ACTIVITY_RECORDS,
     Lock,
+    _keycode_response_matcher,
     _poll_response_matcher,
     _settings_response_matcher,
     convert_voltage_to_percentage,
 )
-from yalexs_ble.session import Session
+from yalexs_ble.session import DisconnectedError, KeycodeError, Session
 from yalexs_ble.util import _simple_checksum
 
 
@@ -975,3 +981,324 @@ async def test_the_auto_lock_read_completes_on_its_acknowledgment() -> None:
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
 
     await lock.auto_lock_status()
+
+
+GET_200_PIN = bytes.fromhex("bb39004ec800135790ffffffff0000000000")
+GET_200_EMPTY = bytes.fromhex("bb39004bc800ffffffffffffff0000000000")
+GET_1_NOSPACE = bytes.fromhex("bb3900000100000000000000000000070000")
+ACK_CLEAR = bytes.fromhex("aa2800000000000000000000000000000200")
+
+
+def _result(opcode: int, error: int = 0, slot: int = 0) -> bytes:
+    """A synthetic 0xBB result frame (checksum not needed by the stub session)."""
+    frame = bytearray(18)
+    frame[0x00] = 0xBB
+    frame[0x01] = opcode
+    frame[0x04:0x06] = slot.to_bytes(2, "little")
+    frame[0x0F] = error
+    return bytes(frame)
+
+
+class _KeycodeSession:
+    """Session stand-in that replays canned results through the real matcher."""
+
+    def __init__(self, responses: list[bytes]) -> None:
+        self.responses = responses
+        self.sent: list[bytearray] = []
+
+    def build_command(self, opcode: int) -> bytearray:
+        cmd = bytearray(0x12)
+        cmd[0x00] = 0xEE
+        cmd[0x01] = opcode
+        cmd[0x10] = 0x02
+        return cmd
+
+    async def execute(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        self.sent.append(command)
+        response = self.responses.pop(0)
+        assert response_matcher is not None
+        assert response_matcher(response)
+        return response
+
+
+def _keycode_lock(responses: list[bytes]) -> tuple[Lock, _KeycodeSession]:
+    lock = _make_lock()
+    session = _KeycodeSession(responses)
+    lock.session = session  # type: ignore[assignment]
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+    return lock, session
+
+
+@pytest.mark.asyncio
+async def test_get_keycode_decodes_the_pin() -> None:
+    lock, session = _keycode_lock([GET_200_PIN])
+    assert await lock.get_keycode(200) == "135790"
+    cmd = session.sent[0]
+    assert cmd[0x01] == Commands.KEYCODE_GET.value
+    assert cmd[0x04:0x06] == bytes.fromhex("c800")
+
+
+@pytest.mark.asyncio
+async def test_get_keycode_empty_slot_is_none() -> None:
+    lock, _ = _keycode_lock([GET_200_EMPTY])
+    assert await lock.get_keycode(200) is None
+
+
+@pytest.mark.asyncio
+async def test_get_keycode_reports_the_lock_error() -> None:
+    lock, _ = _keycode_lock([GET_1_NOSPACE])
+    with pytest.raises(KeycodeError) as exc_info:
+        await lock.get_keycode(1)
+    assert exc_info.value.error == OperationError.KEYCODE_NOSPACE
+    assert exc_info.value.command == "get_keycode"
+    assert str(exc_info.value) == "get_keycode failed: KEYCODE_NOSPACE (0x07)"
+
+
+@pytest.mark.asyncio
+async def test_unknown_error_code_is_carried_as_an_int() -> None:
+    lock, _ = _keycode_lock([_result(Commands.KEYCODE_CLEAR.value, 0x7F)])
+    with pytest.raises(KeycodeError) as exc_info:
+        await lock.clear_keycode(5)
+    assert exc_info.value.error == 0x7F
+    assert not isinstance(exc_info.value.error, OperationError)
+    assert str(exc_info.value) == "clear_keycode failed: unknown error 0x7f"
+
+
+@pytest.mark.asyncio
+async def test_clear_keycode_command_layout() -> None:
+    lock, session = _keycode_lock([_result(Commands.KEYCODE_CLEAR.value)])
+    await lock.clear_keycode(0x01C8)
+    cmd = session.sent[0]
+    assert cmd[0x01] == Commands.KEYCODE_CLEAR.value
+    assert cmd[0x04:0x0B] == b"\xff" * 7
+    assert (cmd[0x0B], cmd[0x0C], cmd[0x0D]) == (0xC8, 0x00, 0x01)
+    assert cmd[0x10] == 0x02
+
+
+@pytest.mark.asyncio
+async def test_set_keycode_runs_clear_set_access_commit_in_order() -> None:
+    lock, session = _keycode_lock(
+        [
+            _result(Commands.KEYCODE_CLEAR.value),
+            _result(Commands.KEYCODE_SET.value),
+            _result(Commands.KEYCODE_ACCESS.value),
+            _result(Commands.KEYCODE_COMMIT.value),
+        ]
+    )
+    await lock.set_keycode(200, "135790")
+    clear, set_, access, commit = session.sent
+    assert [c[0x01] for c in session.sent] == [0x28, 0x27, 0x2B, 0x2C]
+    assert clear[0x04:0x0B] == b"\xff" * 7
+    assert clear[0x0B] == 200
+    assert set_[0x04:0x0B] == bytes.fromhex("135790ffffffff")
+    assert set_[0x0C] == 0x00
+    assert access[0x04:0x0C] == bytes(8)
+    assert access[0x0C] == 0x80
+    assert access[0x0D] == 0x00
+    assert commit[0x04:0x0B] == bytes.fromhex("135790ffffffff")
+    assert (commit[0x0B], commit[0x0C], commit[0x0D]) == (200, 0x00, 0x00)
+
+
+@pytest.mark.asyncio
+async def test_set_keycode_odd_length_pin_and_high_slot() -> None:
+    lock, session = _keycode_lock([_result(op) for op in (0x28, 0x27, 0x2B, 0x2C)])
+    await lock.set_keycode(0x0102, "12345")
+    assert session.sent[1][0x04:0x0B] == bytes.fromhex("12345fffffffff"[:14])
+    assert (session.sent[3][0x0B], session.sent[3][0x0D]) == (0x02, 0x01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "failing_step"),
+    [(0x06, 0x2C), (0x39, 0x2C), (0x07, 0x28)],
+)
+async def test_set_keycode_stops_at_the_failing_step(
+    error: int, failing_step: int
+) -> None:
+    steps = [0x28, 0x27, 0x2B, 0x2C]
+    responses = [
+        _result(op, error if op == failing_step else 0)
+        for op in steps[: steps.index(failing_step) + 1]
+    ]
+    lock, session = _keycode_lock(responses)
+    with pytest.raises(KeycodeError) as exc_info:
+        await lock.set_keycode(251, "1234")
+    assert exc_info.value.error == error
+    assert session.sent[-1][0x01] == failing_step
+    assert len(session.sent) == steps.index(failing_step) + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slot", [0, -1, 0x10000])
+async def test_keycode_slot_validation(slot: int) -> None:
+    lock, session = _keycode_lock([])
+    for call in (
+        lock.get_keycode(slot),
+        lock.clear_keycode(slot),
+        lock.set_keycode(slot, "1234"),
+    ):
+        with pytest.raises(ValueError, match="slot out of range"):
+            await call
+    assert session.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin", ["", "12a4", "123456789012345", "12 4", "١٢٣٤"])
+async def test_set_keycode_pin_validation(pin: str) -> None:
+    lock, session = _keycode_lock([])
+    with pytest.raises(ValueError, match="PIN must be"):
+        await lock.set_keycode(1, pin)
+    assert session.sent == []
+
+
+@pytest.mark.asyncio
+async def test_keycode_operations_require_a_connection() -> None:
+    lock = _make_lock()
+    with pytest.raises(DisconnectedError):
+        await lock.get_keycode(1)
+
+
+def test_encode_decode_keycode_pin() -> None:
+    assert util.encode_keycode_pin("135790") == bytes.fromhex("135790ffffffff")
+    assert util.encode_keycode_pin("12345") == bytes.fromhex("12345fffffffff")
+    assert util.encode_keycode_pin("0" * 14) == bytes(7)
+    assert util.decode_keycode_pin(bytes.fromhex("135790ffffffff")) == "135790"
+    assert util.decode_keycode_pin(bytes.fromhex("12345fffffffff")) == "12345"
+    assert util.decode_keycode_pin(b"\xff" * 7) is None
+    assert util.decode_keycode_pin(bytes(7)) == "0" * 14
+
+
+def test_keycode_matcher_takes_only_the_result_frame() -> None:
+    matches = _keycode_response_matcher(Commands.KEYCODE_CLEAR.value)
+    assert matches(_result(0x28))
+    assert not matches(ACK_CLEAR)
+    assert not matches(_result(0x27))
+    assert not matches(_result(0x28)[:15])
+
+
+def test_keycode_get_matcher_requires_the_echoed_slot() -> None:
+    matches = _keycode_response_matcher(Commands.KEYCODE_GET.value, 200)
+    assert matches(GET_200_PIN)
+    assert matches(GET_200_EMPTY)
+    assert not matches(GET_1_NOSPACE)
+    assert not matches(bytes.fromhex("aa39004ec800000000000000000000000200"))
+
+
+@pytest.mark.parametrize("opcode", [0x27, 0x28, 0x2B, 0x2C, 0x39])
+@pytest.mark.parametrize("flag", [0xBB, 0xAA])
+def test_keycode_frames_produce_no_state(opcode: int, flag: int) -> None:
+    received: list[object] = []
+    lock = _make_lock(received.append)
+    frame = bytearray(_result(opcode, 0x06, 200))
+    frame[0] = flag
+    assert lock._parse_state(bytes(frame)) == ()
+    lock._internal_state_callback(bytes(frame))
+    assert received == []
+
+
+KEYPAD_UNLOCK_SLOT_205 = bytes.fromhex("bb2d0072079aa176a333004bea14cd000200")
+KEYPAD_UNLOCK_SLOT_200 = bytes.fromhex("bb2d00a4077a9e76a333004cdf14c8000200")
+KEYPAD_UNLOCK_SLOT_UNKNOWN = bytes.fromhex("bb2d00d007299c76a3330049e414eeff0200")
+KEYPAD_LOCK_BUTTON = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
+END_OF_LOG = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
+UNKNOWN_ACTIVITY = _with_checksum("bb2d00005500000000000000000000000000")
+
+
+@pytest.mark.parametrize(
+    ("frame", "slot"),
+    [
+        (KEYPAD_UNLOCK_SLOT_205, 205),
+        (KEYPAD_UNLOCK_SLOT_200, 200),
+        (KEYPAD_UNLOCK_SLOT_UNKNOWN, KEYPAD_MASTER_CODE_SLOT),
+    ],
+)
+def test_parse_keypad_unlock_activity(frame: bytes, slot: int | None) -> None:
+    """Real keypad PIN unlock records (type 0x07) from a Yale YRD256."""
+    activity = _make_lock()._parse_lock_activity(frame)
+    assert isinstance(activity, LockActivity)
+    assert activity.status is LockStatus.UNLOCKED
+    assert activity.source is LockOperationSource.PIN
+    assert activity.slot == slot
+    assert activity.remote_type is None
+    assert int(activity.timestamp.timestamp()) == int.from_bytes(
+        frame[0x05:0x09], "little"
+    )
+
+
+def test_parse_keypad_lock_button_and_end_marker() -> None:
+    """The keypad lock button is a type 0x00 record and 0x80 ends the log."""
+    lock = _make_lock()
+    activity = lock._parse_lock_activity(KEYPAD_LOCK_BUTTON)
+    assert isinstance(activity, LockActivity)
+    assert activity.status is LockStatus.LOCKED
+    assert activity.source is LockOperationSource.PIN
+    assert activity.slot is None
+    assert lock._parse_lock_activity(END_OF_LOG) is None
+
+
+def _activity_lock(frames: list[bytes]) -> tuple[Lock, AsyncMock]:
+    """A connected Lock whose activity reads answer with frames in order."""
+    lock, session = _connected_lock()
+    answers = iter(frames)
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(next(answers)))
+
+    write = AsyncMock(side_effect=deliver)
+    session.client.write_gatt_char = write
+    return lock, write
+
+
+@pytest.mark.asyncio
+async def test_drain_lock_activity_stops_at_the_end_marker() -> None:
+    """Records come back in order and the marker ends the drain."""
+    lock, write = _activity_lock(
+        [KEYPAD_UNLOCK_SLOT_205, KEYPAD_LOCK_BUTTON, END_OF_LOG, KEYPAD_UNLOCK_SLOT_200]
+    )
+    activities = await lock.drain_lock_activity()
+    assert [(a.status, getattr(a, "slot", None)) for a in activities] == [
+        (LockStatus.UNLOCKED, 205),
+        (LockStatus.LOCKED, None),
+    ]
+    assert write.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_drain_lock_activity_skips_unknown_types() -> None:
+    """An unparsable record is skipped without ending the drain."""
+    lock, write = _activity_lock([UNKNOWN_ACTIVITY, KEYPAD_UNLOCK_SLOT_200, END_OF_LOG])
+    activities = await lock.drain_lock_activity()
+    assert len(activities) == 1
+    assert isinstance(activities[0], LockActivity)
+    assert activities[0].slot == 200
+    assert write.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_drain_lock_activity_is_capped() -> None:
+    """Without an end marker the drain stops at the cap."""
+    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * 10)
+    assert len(await lock.drain_lock_activity(max_records=4)) == 4
+    assert write.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_drain_lock_activity_default_cap() -> None:
+    """The default cap is MAX_ACTIVITY_RECORDS reads."""
+    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * (MAX_ACTIVITY_RECORDS + 5))
+    assert len(await lock.drain_lock_activity()) == MAX_ACTIVITY_RECORDS
+    assert write.await_count == MAX_ACTIVITY_RECORDS
+
+
+@pytest.mark.asyncio
+async def test_drain_lock_activity_requires_a_connection() -> None:
+    """Draining a disconnected lock raises."""
+    lock = _make_lock()
+    with pytest.raises(DisconnectedError):
+        await lock.drain_lock_activity()

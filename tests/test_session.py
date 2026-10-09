@@ -10,10 +10,10 @@ from bleak import BleakError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from yalexs_ble import util
-from yalexs_ble.const import Commands, SettingType
-from yalexs_ble.lock import _settings_response_matcher
+from yalexs_ble.const import Commands, OperationError, SettingType
+from yalexs_ble.lock import _keycode_response_matcher, _settings_response_matcher
 from yalexs_ble.secure_session import SecureSession
-from yalexs_ble.session import RESPONSE_FRAME_LEN, ResponseError, Session
+from yalexs_ble.session import RESPONSE_FRAME_LEN, KeycodeError, ResponseError, Session
 
 # Verbatim field frames (2026-07-16 capture, YUR/DEL fw 2.1.0): the READSETTING
 # acknowledgment and, ~40 ms later, the 0xBB frame carrying the stored value
@@ -540,3 +540,69 @@ async def test_a_secure_session_handshake_frame_still_answers_its_wait() -> None
     assert len(on_air) == RESPONSE_FRAME_LEN
     result = await session.execute(session.build_command(0x01), "KEY_EXCHANGE")
     assert result == bytes(answer)
+
+
+@pytest.mark.asyncio
+async def test_write_checksum_keeps_the_frame_valid_when_it_already_has_one() -> None:
+    """Re-checksumming a frame must not fold its old checksum into the sum."""
+    session = _make_session([])
+    command = session.build_command(Commands.GETSTATUS)
+    session._write_checksum(command)
+    first = command[0x03]
+    assert first != 0
+    session._write_checksum(command)
+    assert command[0x03] == first
+    assert util._simple_checksum(command) == 0
+
+
+def _checksummed(flag: int, opcode: int, slot: int) -> bytes:
+    frame = bytearray(RESPONSE_FRAME_LEN)
+    frame[0x00], frame[0x01] = flag, opcode
+    frame[0x04:0x06] = slot.to_bytes(2, "little")
+    frame[0x03] = util._simple_checksum(frame)
+    return bytes(frame)
+
+
+@pytest.mark.asyncio
+async def test_keycode_wait_skips_ack_and_wrong_slot() -> None:
+    """The ack and a result for another slot leave a GET wait armed."""
+    received: list[bytes] = []
+    session = _make_session(received)
+    matcher = _keycode_response_matcher(Commands.KEYCODE_GET.value, 200)
+    ack = _checksummed(0xAA, 0x39, slot=200)
+    other_slot = _checksummed(0xBB, 0x39, slot=201)
+    answer = bytes.fromhex("bb39004ec800135790ffffffff0000000000")
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        for frame in (ack, other_slot):
+            session._notify(0, bytearray(frame))
+            assert session._notify_future is not None
+        session._notify(0, bytearray(answer))
+
+    with patch.object(
+        session.client, "write_gatt_char", AsyncMock(side_effect=deliver)
+    ):
+        result = await session.execute(bytearray(18), "get_keycode", matcher)
+
+    assert result == answer
+    assert received == [ack, other_slot, answer]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        pytest.param(
+            OperationError.KEYCODE_EXISTING_KEY,
+            "commit_keycode failed: KEYCODE_EXISTING_KEY (0x06)",
+            id="known",
+        ),
+        pytest.param(0x5A, "commit_keycode failed: unknown error 0x5a", id="raw"),
+    ],
+)
+def test_keycode_error_message_names_the_error(
+    error: OperationError | int, expected: str
+) -> None:
+    err = KeycodeError("commit_keycode", error)
+    assert str(err) == expected
+    assert err.command == "commit_keycode"
+    assert err.error == error

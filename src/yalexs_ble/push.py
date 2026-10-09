@@ -6,7 +6,7 @@ import functools
 import logging
 import struct
 import time
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import replace
 from typing import Any, TypeVar, cast
 
@@ -31,7 +31,9 @@ from .const import (
     AutoLockState,
     BatteryState,
     ConnectionInfo,
+    DoorActivity,
     DoorStatus,
+    LockActivity,
     LockInfo,
     LockState,
     LockStateValue,
@@ -54,6 +56,7 @@ _LOGGER = logging.getLogger(__name__)
 _ADV_LOGGER = logging.getLogger("yalexs_ble_adv")
 
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
+_T = TypeVar("_T")
 
 # A monotonic timestamp ~one day in the past, used as a "never happened /
 # no deadline" sentinel. Makes no assumption about the clock's epoch.
@@ -333,6 +336,11 @@ class PushLock:
         self._callbacks: list[
             Callable[[LockState, LockInfo, ConnectionInfo], None]
         ] = []
+        self._activity_callbacks: list[
+            Callable[[LockActivity | DoorActivity], None]
+        ] = []
+        self._activity_primed = False
+        self._activity_drain_pending = False
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
@@ -476,6 +484,17 @@ class PushLock:
 
         self._callbacks.append(callback)
         return unregister_callback
+
+    def register_activity_callback(
+        self, callback: Callable[[LockActivity | DoorActivity], None]
+    ) -> Callable[[], None]:
+        """Register a callback to be called for each new lock activity record."""
+
+        def unregister_activity_callback() -> None:
+            self._activity_callbacks.remove(callback)
+
+        self._activity_callbacks.append(callback)
+        return unregister_activity_callback
 
     def set_lock_key(self, key: str, slot: int) -> None:
         """Set the lock key."""
@@ -842,6 +861,44 @@ class PushLock:
             raise
         self._complete_operation(time.monotonic())
 
+    async def get_keycode(self, slot: int) -> str | None:
+        """Read the PIN in a keypad slot; None if the slot is empty."""
+        return await self._execute_keycode_operation(
+            "get_keycode", lambda lock: lock.get_keycode(slot)
+        )
+
+    async def set_keycode(self, slot: int, pin: str) -> None:
+        """Program a PIN into a keypad slot."""
+        await self._execute_keycode_operation(
+            "set_keycode", lambda lock: lock.set_keycode(slot, pin)
+        )
+
+    async def clear_keycode(self, slot: int) -> None:
+        """Clear a keypad slot."""
+        await self._execute_keycode_operation(
+            "clear_keycode", lambda lock: lock.clear_keycode(slot)
+        )
+
+    @operation_lock
+    @retry_bluetooth_connection_error
+    async def _execute_keycode_operation(
+        self, name: str, operation: Callable[[Lock], Awaitable[_T]]
+    ) -> _T:
+        """Run a keycode operation on a connected lock."""
+        if not self._running:
+            raise RuntimeError(
+                f"{self.name}: Keycode operation not possible because not running"
+            )
+        try:
+            lock = await self._ensure_connected()
+            self._cancel_future_update()
+            result = await operation(lock)
+        except Exception as ex:
+            _LOGGER.debug("%s: Failed to execute %s due to %s", self.name, name, ex)
+            raise
+        self._complete_operation(time.monotonic())
+        return result
+
     def _complete_operation(self, now: float) -> None:
         """Mark an operation as complete and reset timers."""
         self._last_operation_complete_time = now
@@ -899,6 +956,7 @@ class PushLock:
                             state,
                         )
                     changes["lock"] = state
+                    self._activity_drain_pending = True
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
@@ -1195,6 +1253,11 @@ class PushLock:
             await lock.lock_status()
             self._record_auth_success()
 
+        if self._activity_callbacks and (
+            not self._activity_primed or self._activity_drain_pending
+        ):
+            await self._drain_activity(lock)
+
         _LOGGER.debug("%s: Finished update", self.name)
 
         current = self._get_current_state()
@@ -1218,6 +1281,37 @@ class PushLock:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
 
+    async def _drain_activity(self, lock: Lock) -> None:
+        """Read the lock's activity log and deliver the records.
+
+        The first drain of the PushLock's life only primes: the backlog is
+        discarded so old records are not reported as new. A failure is left
+        for the next update to retry.
+        """
+        try:
+            activities = await lock.drain_lock_activity()
+        except (BleakError, TimeoutError, YaleXSBLEError) as err:
+            _LOGGER.debug(
+                "%s: Reading lock activity failed (%s), will retry on next update.",
+                self.name,
+                err,
+            )
+            return
+        self._activity_drain_pending = False
+        if not self._activity_primed:
+            self._activity_primed = True
+            return
+        for activity in activities:
+            self._callback_activity(activity)
+
+    def _callback_activity(self, activity: LockActivity | DoorActivity) -> None:
+        """Call the activity callbacks."""
+        for callback in self._activity_callbacks:
+            try:
+                callback(activity)
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("%s: Error calling activity callback", self.name)
+
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""
         if self._slow_params_set:
@@ -1235,7 +1329,7 @@ class PushLock:
             )
         else:
             self._slow_params_set = True
-            _LOGGER.debug("%s: Set slow connection parameters", self.name)
+            _LOGGER.debug("%s: Requested slow connection parameters", self.name)
 
     def _callback_state(self, lock_state: LockState) -> None:
         """Call the callbacks."""

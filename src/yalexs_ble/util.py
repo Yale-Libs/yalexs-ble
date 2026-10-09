@@ -49,6 +49,33 @@ def _security_checksum(buffer: bytes | bytearray) -> int:
     return (0 - (val1 + val2 + val3)) & 0xFFFFFFFF
 
 
+KEYCODE_PIN_BYTES = 7
+KEYCODE_MAX_DIGITS = KEYCODE_PIN_BYTES * 2
+
+
+def encode_keycode_pin(pin: str) -> bytes:
+    """Pack a keypad PIN as BCD, first digit in the high nibble, padded with 0xF."""
+    if not pin.isascii() or not pin.isdigit() or len(pin) > KEYCODE_MAX_DIGITS:
+        raise ValueError(f"PIN must be 1-{KEYCODE_MAX_DIGITS} digits (0-9): {pin!r}")
+    nibbles = [int(digit) for digit in pin]
+    nibbles += [0xF] * (KEYCODE_MAX_DIGITS - len(nibbles))
+    return bytes(
+        (nibbles[idx] << 4) | nibbles[idx + 1]
+        for idx in range(0, KEYCODE_MAX_DIGITS, 2)
+    )
+
+
+def decode_keycode_pin(data: bytes | bytearray) -> str | None:
+    """Unpack a BCD keypad PIN; None for an empty slot (all 0xFF)."""
+    digits = "".join(
+        str(nibble)
+        for byte in data[:KEYCODE_PIN_BYTES]
+        for nibble in (byte >> 4, byte & 0xF)
+        if nibble <= 9
+    )
+    return digits or None
+
+
 def _copy(dest: bytearray, src: bytes, destLocation: int = 0) -> None:
     dest[destLocation : (destLocation + len(src))] = src
 
