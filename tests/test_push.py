@@ -2774,13 +2774,22 @@ async def test_deferred_update_is_ignored_when_not_running() -> None:
 
 
 @pytest.mark.asyncio
-async def test_deferred_update_success_clears_backoff() -> None:
-    """A completed update drops the lock straight back to immediate retries."""
+@pytest.mark.parametrize("connected", [True, False])
+async def test_deferred_update_success_clears_backoff(connected: bool) -> None:
+    """A completed update clears the backoff, and reconnects now if the link dropped."""
     push_lock = _backoff_lock("aa:bb:cc:dd:ee:44")
     push_lock._consecutive_update_failures = 4
-    with patch.object(push_lock, "_update", return_value=None):
+    push_lock._client = MagicMock(is_connected=connected)
+    with (
+        patch.object(push_lock, "_update", return_value=None),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+    ):
         await push_lock._execute_deferred_update()
     assert push_lock._reconnect_backoff_time() == 0.0
+    if connected:
+        schedule.assert_not_called()
+    else:
+        schedule.assert_called_once_with(0.0)
 
 
 @pytest.mark.asyncio

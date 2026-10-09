@@ -1583,14 +1583,14 @@ class PushLock:
             _LOGGER.exception("%s: Unknown error updating", self.name)
         if failed:
             self._consecutive_update_failures += 1
-            if self._always_connected and not _AUTH_FAILURE_HISTORY.should_raise(
-                self.address
-            ):
-                # The failed update left the lock disconnected; pace the
-                # reconnect here, not from the disconnect callback.
-                self._schedule_future_update_with_debounce(
-                    self._reconnect_backoff_time()
-                )
+        if (
+            self._always_connected
+            and (failed or not self.is_connected)
+            and not _AUTH_FAILURE_HISTORY.should_raise(self.address)
+        ):
+            # The disconnect callback stands down while an update runs, so
+            # the update's exit owns the reconnect, paced by the backoff.
+            self._schedule_future_update_with_debounce(self._reconnect_backoff_time())
 
 
 # The HomeKit state record inside the advertisement payload: acid, the global
