@@ -4,7 +4,7 @@ import asyncio
 import bisect
 import logging
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import datetime
 from typing import Any, TypeVar, cast
 
@@ -48,6 +48,7 @@ from .session import (
     AuthError,
     DisconnectedError,
     KeycodeError,
+    ResponseError,
     Session,
     YaleXSBLEError,
 )
@@ -196,13 +197,10 @@ KEYCODE_MAX_SLOT = 0xFFFF
 def _keycode_response_matcher(
     opcode: int, slot: int | None = None
 ) -> Callable[[bytes], bool]:
-    """Match the 0xBB result frame answering one keycode command.
+    """Match the 0xBB result answering one keycode command.
 
-    Keycode commands are answered by an optional 0xAA acknowledgment echoing
-    the request, then the 0xBB result with the opcode in byte[1]. Only the
-    0xBB result carries the error code, so neither the acknowledgment nor an
-    unsolicited push may answer the wait. A slot read also requires the
-    echoed slot (uint16 LE at [4:6]).
+    Only the 0xBB result carries the error code, so the 0xAA ack must not
+    answer the wait. A slot read also requires the echoed slot at [4:6].
     """
 
     def matches(data: bytes) -> bool:
@@ -640,8 +638,8 @@ class Lock:
     async def set_keycode(self, slot: int, pin: str) -> None:
         """Program a PIN into a keypad slot with an always-valid schedule.
 
-        The slot is cleared first, then the PIN is set, given an always
-        schedule and committed; each step is awaited before the next.
+        The slot is cleared first, so a KeycodeError from a later step
+        leaves the slot empty; the error names the step that failed.
         """
         _validate_keycode_slot(slot)
         encoded = util.encode_keycode_pin(pin)
@@ -933,7 +931,7 @@ class Lock:
                 source=LockOperationSource.PIN,
                 slot=slot,
             )
-        _LOGGER.warning("%s: Unknown activity type: 0x%02X", self.name, activity_type)
+        _LOGGER.debug("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
 
     async def _read_lock_activity_response(self) -> bytes:
@@ -952,29 +950,29 @@ class Lock:
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
         return self._parse_lock_activity(response)
 
-    @raise_if_not_connected
     async def drain_lock_activity(
         self, max_records: int = MAX_ACTIVITY_RECORDS
-    ) -> list[DoorActivity | LockActivity]:
-        """Read the activity log until its end marker or max_records reads.
+    ) -> AsyncIterator[DoorActivity | LockActivity]:
+        """Pop and yield activity records until the log's end marker.
 
-        Each read pops the oldest record. Records of an unknown type are
-        skipped, and only the end marker or the cap stops the drain.
+        Each read pops the oldest record, so records are yielded as they
+        arrive and survive a failure later in the drain. Unknown record
+        types are skipped. Raises ResponseError if the marker has not been
+        seen after max_records reads; the log is then only partly drained.
         """
+        if not self.is_connected:
+            raise DisconnectedError("Lock is not connected")
         _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
-        activities: list[DoorActivity | LockActivity] = []
         for _ in range(max_records):
             response = await self._read_lock_activity_response()
             if response[0x04] == LockActivityType.NONE.value:
-                break
+                _LOGGER.debug("%s: Finished drain_lock_activity", self.name)
+                return
             if (activity := self._parse_lock_activity(response)) is not None:
-                activities.append(activity)
-        _LOGGER.debug(
-            "%s: Finished drain_lock_activity with %d records",
-            self.name,
-            len(activities),
+                yield activity
+        raise ResponseError(
+            f"{self.name}: Activity log did not end within {max_records} reads"
         )
-        return activities
 
     async def disconnect(self) -> None:
         """Disconnect from the lock."""

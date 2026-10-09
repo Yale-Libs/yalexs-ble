@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import logging
 from collections.abc import Callable, Iterable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -39,7 +40,12 @@ from yalexs_ble.lock import (
     _settings_response_matcher,
     convert_voltage_to_percentage,
 )
-from yalexs_ble.session import DisconnectedError, KeycodeError, Session
+from yalexs_ble.session import (
+    DisconnectedError,
+    KeycodeError,
+    ResponseError,
+    Session,
+)
 from yalexs_ble.util import _simple_checksum
 
 
@@ -1242,17 +1248,24 @@ def test_parse_keypad_lock_button_and_end_marker() -> None:
     assert lock._parse_lock_activity(END_OF_LOG) is None
 
 
-def _activity_lock(frames: list[bytes]) -> tuple[Lock, AsyncMock]:
+def _activity_lock(frames: list[bytes | Exception]) -> tuple[Lock, AsyncMock]:
     """A connected Lock whose activity reads answer with frames in order."""
     lock, session = _connected_lock()
     answers = iter(frames)
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
-        session._notify(0, bytearray(next(answers)))
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        session._notify(0, bytearray(answer))
 
     write = AsyncMock(side_effect=deliver)
     session.client.write_gatt_char = write
     return lock, write
+
+
+async def _drain(lock: Lock, **kwargs: int) -> list[DoorActivity | LockActivity]:
+    return [activity async for activity in lock.drain_lock_activity(**kwargs)]
 
 
 @pytest.mark.asyncio
@@ -1261,7 +1274,7 @@ async def test_drain_lock_activity_stops_at_the_end_marker() -> None:
     lock, write = _activity_lock(
         [KEYPAD_UNLOCK_SLOT_205, KEYPAD_LOCK_BUTTON, END_OF_LOG, KEYPAD_UNLOCK_SLOT_200]
     )
-    activities = await lock.drain_lock_activity()
+    activities = await _drain(lock)
     assert [(a.status, getattr(a, "slot", None)) for a in activities] == [
         (LockStatus.UNLOCKED, 205),
         (LockStatus.LOCKED, None),
@@ -1270,30 +1283,45 @@ async def test_drain_lock_activity_stops_at_the_end_marker() -> None:
 
 
 @pytest.mark.asyncio
-async def test_drain_lock_activity_skips_unknown_types() -> None:
-    """An unparsable record is skipped without ending the drain."""
+async def test_drain_lock_activity_skips_unknown_types(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unparsable record is skipped at debug without ending the drain."""
     lock, write = _activity_lock([UNKNOWN_ACTIVITY, KEYPAD_UNLOCK_SLOT_200, END_OF_LOG])
-    activities = await lock.drain_lock_activity()
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.lock"):
+        activities = await _drain(lock)
     assert len(activities) == 1
     assert isinstance(activities[0], LockActivity)
     assert activities[0].slot == 200
     assert write.await_count == 3
+    record = next(r for r in caplog.records if "Unknown activity type" in r.message)
+    assert record.levelno == logging.DEBUG
 
 
 @pytest.mark.asyncio
-async def test_drain_lock_activity_is_capped() -> None:
-    """Without an end marker the drain stops at the cap."""
-    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * 10)
-    assert len(await lock.drain_lock_activity(max_records=4)) == 4
-    assert write.await_count == 4
+async def test_drain_lock_activity_yields_each_record_as_it_is_read() -> None:
+    """Records read before a failure have already been yielded."""
+    lock, _ = _activity_lock([KEYPAD_UNLOCK_SLOT_205, BleakError("gone")])
+    seen: list[DoorActivity | LockActivity] = []
+    with pytest.raises(BleakError):
+        async for activity in lock.drain_lock_activity():
+            seen.append(activity)
+    assert [getattr(a, "slot", None) for a in seen] == [205]
 
 
 @pytest.mark.asyncio
-async def test_drain_lock_activity_default_cap() -> None:
-    """The default cap is MAX_ACTIVITY_RECORDS reads."""
-    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * (MAX_ACTIVITY_RECORDS + 5))
-    assert len(await lock.drain_lock_activity()) == MAX_ACTIVITY_RECORDS
-    assert write.await_count == MAX_ACTIVITY_RECORDS
+@pytest.mark.parametrize("max_records", [4, None])
+async def test_drain_lock_activity_raises_past_the_cap(max_records: int | None) -> None:
+    """Without an end marker the drain raises after max_records reads."""
+    cap = MAX_ACTIVITY_RECORDS if max_records is None else max_records
+    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * (cap + 5))
+    kwargs = {} if max_records is None else {"max_records": max_records}
+    seen: list[DoorActivity | LockActivity] = []
+    with pytest.raises(ResponseError, match=f"did not end within {cap} reads"):
+        async for activity in lock.drain_lock_activity(**kwargs):
+            seen.append(activity)
+    assert len(seen) == cap
+    assert write.await_count == cap
 
 
 @pytest.mark.asyncio
@@ -1301,4 +1329,4 @@ async def test_drain_lock_activity_requires_a_connection() -> None:
     """Draining a disconnected lock raises."""
     lock = _make_lock()
     with pytest.raises(DisconnectedError):
-        await lock.drain_lock_activity()
+        await _drain(lock)

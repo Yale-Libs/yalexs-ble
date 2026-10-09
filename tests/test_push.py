@@ -2825,11 +2825,13 @@ ACTIVITY_PUSH_ADV = AdvertisementData(
 
 
 def _activity_push_lock(
-    drains: list[Any],
+    drains: list[list[Any]],
 ) -> tuple[PushLock, MagicMock, list[LockActivity | DoorActivity]]:
     """A PushLock whose only read in _update is the activity drain.
 
     Lock, door and battery are marked seen so a cycle reads nothing else.
+    Each entry of drains is one drain: the records it yields, and an
+    exception in the list is raised at that point.
     """
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
@@ -2843,8 +2845,16 @@ def _activity_push_lock(
     push_lock._advertisement_data = ACTIVITY_PUSH_ADV
     push_lock._seen_this_session.update({LockStatus, DoorStatus, BatteryState})
     push_lock._seen_this_session.add(AutoLockState)
+    outcomes = iter(drains)
+
+    async def drain_lock_activity() -> Any:
+        for item in next(outcomes):
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
     mock_lock = MagicMock()
-    mock_lock.drain_lock_activity = AsyncMock(side_effect=drains)
+    mock_lock.drain_lock_activity = MagicMock(side_effect=drain_lock_activity)
     received: list[LockActivity | DoorActivity] = []
     push_lock.register_activity_callback(received.append)
     return push_lock, mock_lock, received
@@ -2867,9 +2877,9 @@ async def test_activity_first_update_primes_without_delivering() -> None:
     push_lock, mock_lock, received = _activity_push_lock([[_unlock(1)]])
     await _run_update(push_lock, mock_lock)
     assert received == []
-    assert mock_lock.drain_lock_activity.await_count == 1
+    assert mock_lock.drain_lock_activity.call_count == 1
     await _run_update(push_lock, mock_lock)
-    assert mock_lock.drain_lock_activity.await_count == 1
+    assert mock_lock.drain_lock_activity.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -2882,7 +2892,7 @@ async def test_activity_delivered_after_a_status_change() -> None:
     await _run_update(push_lock, mock_lock)
     assert received == [first, second]
     await _run_update(push_lock, mock_lock)
-    assert mock_lock.drain_lock_activity.await_count == 2
+    assert mock_lock.drain_lock_activity.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -2907,7 +2917,7 @@ async def test_activity_unregister_stops_delivery_and_reads() -> None:
     assert push_lock._activity_callbacks == []
     push_lock._update_any_state([LockStatus.UNLOCKED])
     await _run_update(push_lock, mock_lock)
-    assert mock_lock.drain_lock_activity.await_count == 1
+    assert mock_lock.drain_lock_activity.call_count == 1
     assert received == []
     assert other == []
 
@@ -2930,13 +2940,15 @@ async def test_activity_callback_exception_is_isolated(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [BleakError("gone"), TimeoutError("slow")])
+@pytest.mark.parametrize(
+    "error", [BleakError("gone"), TimeoutError("slow"), ResponseError("capped")]
+)
 async def test_activity_drain_failure_keeps_the_flag(
     error: Exception, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A failed drain does not break the update and is retried next time."""
     activity = _unlock(205)
-    push_lock, mock_lock, received = _activity_push_lock([[], error, [activity]])
+    push_lock, mock_lock, received = _activity_push_lock([[], [error], [activity]])
     await _run_update(push_lock, mock_lock)
     push_lock._update_any_state([LockStatus.UNLOCKED])
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
@@ -2950,12 +2962,63 @@ async def test_activity_drain_failure_keeps_the_flag(
 
 
 @pytest.mark.asyncio
+async def test_activity_records_before_a_failure_are_delivered() -> None:
+    """Each read pops the lock's log, so records are delivered as they arrive."""
+    first, second = _unlock(205), _unlock(200)
+    push_lock, mock_lock, received = _activity_push_lock(
+        [[], [first, BleakError("gone")], [second]]
+    )
+    await _run_update(push_lock, mock_lock)
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    await _run_update(push_lock, mock_lock)
+    assert received == [first]
+    assert push_lock._activity_drain_pending is True
+    await _run_update(push_lock, mock_lock)
+    assert received == [first, second]
+
+
+@pytest.mark.asyncio
+async def test_activity_disconnect_during_drain_is_left_to_the_update() -> None:
+    """A disconnect reaches the update's retry, which drains again."""
+    first = _unlock(205)
+    push_lock, mock_lock, received = _activity_push_lock(
+        [[], [DisconnectedError("gone")], [first]]
+    )
+    await _run_update(push_lock, mock_lock)
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    await _run_update(push_lock, mock_lock)
+    assert received == [first]
+    assert push_lock._activity_drain_pending is False
+    assert mock_lock.drain_lock_activity.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_activity_status_change_during_drain_stays_pending() -> None:
+    """A status change that lands mid-drain is not lost to the drain's own reset."""
+    first = _unlock(205)
+    push_lock, mock_lock, received = _activity_push_lock([[], [first], [first]])
+
+    def change_state(_activity: LockActivity | DoorActivity) -> None:
+        push_lock._update_any_state([LockStatus.LOCKED])
+
+    push_lock._activity_callbacks.insert(0, change_state)
+    await _run_update(push_lock, mock_lock)
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    await _run_update(push_lock, mock_lock)
+    assert received == [first]
+    assert push_lock._activity_drain_pending is True
+    await _run_update(push_lock, mock_lock)
+    assert mock_lock.drain_lock_activity.call_count == 3
+
+
+@pytest.mark.asyncio
 async def test_activity_priming_failure_retries_priming() -> None:
     """If priming fails the backlog is still discarded on the retry."""
     push_lock, mock_lock, received = _activity_push_lock(
-        [BleakError("gone"), [_unlock(1)]]
+        [[_unlock(2), BleakError("gone")], [_unlock(1)]]
     )
     await _run_update(push_lock, mock_lock)
+    assert push_lock._activity_primed is False
     await _run_update(push_lock, mock_lock)
     assert received == []
     assert push_lock._activity_primed is True

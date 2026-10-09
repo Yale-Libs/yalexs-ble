@@ -868,7 +868,10 @@ class PushLock:
         )
 
     async def set_keycode(self, slot: int, pin: str) -> None:
-        """Program a PIN into a keypad slot."""
+        """Program a PIN into a keypad slot.
+
+        The slot is cleared first, so a KeycodeError leaves it empty.
+        """
         await self._execute_keycode_operation(
             "set_keycode", lambda lock: lock.set_keycode(slot, pin)
         )
@@ -1284,25 +1287,28 @@ class PushLock:
     async def _drain_activity(self, lock: Lock) -> None:
         """Read the lock's activity log and deliver the records.
 
-        The first drain of the PushLock's life only primes: the backlog is
-        discarded so old records are not reported as new. A failure is left
-        for the next update to retry.
+        The first drain only primes: the backlog is discarded so old records
+        are not reported as new. An incomplete drain stays pending for the
+        next update; records already read are delivered regardless.
         """
+        # Consumed before the await so a change during the drain is kept.
+        self._activity_drain_pending = False
         try:
-            activities = await lock.drain_lock_activity()
-        except (BleakError, TimeoutError, YaleXSBLEError) as err:
+            async for activity in lock.drain_lock_activity():
+                if self._activity_primed:
+                    self._callback_activity(activity)
+        except (BleakError, TimeoutError, ResponseError) as err:
+            self._activity_drain_pending = True
             _LOGGER.debug(
                 "%s: Reading lock activity failed (%s), will retry on next update.",
                 self.name,
                 err,
             )
             return
-        self._activity_drain_pending = False
-        if not self._activity_primed:
-            self._activity_primed = True
-            return
-        for activity in activities:
-            self._callback_activity(activity)
+        except Exception:
+            self._activity_drain_pending = True
+            raise
+        self._activity_primed = True
 
     def _callback_activity(self, activity: LockActivity | DoorActivity) -> None:
         """Call the activity callbacks."""
