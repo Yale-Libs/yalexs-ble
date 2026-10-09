@@ -28,6 +28,7 @@ from yalexs_ble.const import (
 from yalexs_ble.lock import Lock
 from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
+    ACTIVITY_DRAIN_FAILURE_THRESHOLD,
     APPLE_MFR_ID,
     AUTH_FAILURE_TO_START_REAUTH,
     AUTO_LOCK_READ_FAILURE_BACKOFF,
@@ -2950,6 +2951,35 @@ async def test_activity_drain_failure_keeps_the_flag(
     await _run_update(push_lock, mock_lock)
     assert received == [activity]
     assert push_lock._activity_drain_pending is False
+
+
+@pytest.mark.asyncio
+async def test_activity_drain_backs_off_after_repeated_failures(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Three failed drains in a row warn once and pause the drain for a while."""
+    threshold = ACTIVITY_DRAIN_FAILURE_THRESHOLD
+    activity = _unlock(205)
+    errors = [[TimeoutError("slow")]] * threshold
+    push_lock, mock_lock, received = _activity_push_lock([*errors, [activity]])
+    drain = mock_lock.drain_lock_activity
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        for _ in range(threshold):
+            await _run_update(push_lock, mock_lock)
+    assert drain.call_count == threshold
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "not trying again" in warnings[0].message
+    assert push_lock._activity_drain_pending is True
+    # Paused: the next update does not touch the log.
+    await _run_update(push_lock, mock_lock)
+    assert drain.call_count == threshold
+    # Once the window passes the drain resumes, here still priming.
+    push_lock._earliest_activity_drain_time = NEVER_TIME
+    await _run_update(push_lock, mock_lock)
+    assert drain.call_count == threshold + 1
+    assert push_lock._activity_primed is True
+    assert received == []
 
 
 @pytest.mark.asyncio

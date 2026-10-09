@@ -153,6 +153,11 @@ AUTO_LOCK_READ_FAILURE_BACKOFF = 86400
 # Ack timeouts and response timeouts both count toward this one threshold.
 AUTO_LOCK_READ_FAILURE_THRESHOLD = 3
 
+# Consecutive failed activity drains before the drain is left alone for a
+# while; a lock whose log never ends would otherwise cost 32 reads per update.
+ACTIVITY_DRAIN_FAILURE_THRESHOLD = 3
+ACTIVITY_DRAIN_FAILURE_BACKOFF = 3600
+
 # How long to wait for the 0xBB settings response after the READSETTING ack
 # before treating the read as unresolved. The ack completes the solicited wait;
 # the value follows moments later on the notify path. This must clear two bounds:
@@ -341,6 +346,8 @@ class PushLock:
         ] = []
         self._activity_primed = False
         self._activity_drain_pending = True
+        self._activity_drain_failures = 0
+        self._earliest_activity_drain_time = NEVER_TIME
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
@@ -1262,7 +1269,11 @@ class PushLock:
         # Notify consumers that the update is complete, even if nothing changed.
         self._callback_state(current)
 
-        if self._activity_callbacks and self._activity_drain_pending:
+        if (
+            self._activity_callbacks
+            and self._activity_drain_pending
+            and time.monotonic() >= self._earliest_activity_drain_time
+        ):
             if has_lock_info:
                 made_request = True
                 await self._drain_activity(lock)
@@ -1302,10 +1313,25 @@ class PushLock:
                     self._callback_activity(activity)
         except (TimeoutError, ResponseError) as err:
             self._activity_drain_pending = True
-            _LOGGER.debug(
-                "%s: Reading lock activity failed (%s), will retry on next update.",
+            self._activity_drain_failures += 1
+            if self._activity_drain_failures < ACTIVITY_DRAIN_FAILURE_THRESHOLD:
+                _LOGGER.debug(
+                    "%s: Reading lock activity failed (%s), will retry on next update.",
+                    self.name,
+                    err,
+                )
+                return
+            self._activity_drain_failures = 0
+            self._earliest_activity_drain_time = (
+                time.monotonic() + ACTIVITY_DRAIN_FAILURE_BACKOFF
+            )
+            _LOGGER.warning(
+                "%s: Reading lock activity failed %d times in a row (%s); "
+                "not trying again for %d seconds",
                 self.name,
+                ACTIVITY_DRAIN_FAILURE_THRESHOLD,
                 err,
+                ACTIVITY_DRAIN_FAILURE_BACKOFF,
             )
             return
         except BaseException:
@@ -1313,6 +1339,7 @@ class PushLock:
             # takes it, and the drain is still owed.
             self._activity_drain_pending = True
             raise
+        self._activity_drain_failures = 0
         self._activity_primed = True
 
     def _callback_activity(self, activity: LockActivity | DoorActivity) -> None:
