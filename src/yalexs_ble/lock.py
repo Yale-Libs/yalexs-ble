@@ -412,14 +412,16 @@ class Lock:
         # door sense support, and the consumer caches the result. Retry once
         # only; the probe runs inside the first update, which setup waits on,
         # so the worst case has to stay bounded.
-        for attempt in range(LOCK_INFO_ATTEMPTS):
+        missing: set[str] = set()
+        for attempt in range(1, LOCK_INFO_ATTEMPTS + 1):
             try:
                 async with util.asyncio_timeout(LOCK_INFO_TIMEOUT):
                     for char_uuid in char_uuids:
-                        if char_uuid in results:
+                        if char_uuid in results or char_uuid in missing:
                             continue
                         char = self.client.services.get_characteristic(char_uuid)
                         if not char:
+                            missing.add(char_uuid)
                             _LOGGER.warning(
                                 "%s: Characteristic %s not found", self.name, char_uuid
                             )
@@ -442,20 +444,21 @@ class Lock:
                                 err,
                             )
             except TimeoutError:
-                if attempt < LOCK_INFO_ATTEMPTS - 1:
+                if attempt == LOCK_INFO_ATTEMPTS:
+                    _LOGGER.warning(
+                        "%s: Timeout reading lock info, using %d partial results",
+                        self.name,
+                        len(results),
+                    )
+                else:
                     _LOGGER.debug(
                         "%s: Timeout reading lock info with %d partial results, "
                         "retrying",
                         self.name,
                         len(results),
                     )
-                    continue
-                _LOGGER.warning(
-                    "%s: Timeout reading lock info, using %d partial results",
-                    self.name,
-                    len(results),
-                )
-            break
+            else:
+                break
         # Use the BLE address as fallback serial to keep devices unique
         # in Home Assistant when the characteristic read fails.
         serial_fallback = self.ble_device_callback().address
