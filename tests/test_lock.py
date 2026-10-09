@@ -272,6 +272,16 @@ def test_parse_lock_status_decodes_the_unlatch_states(
     assert ("Unrecognized lock_status_str" in caplog.text) is diagnostic_logged
 
 
+def test_no_status_byte_decodes_to_securing() -> None:
+    """No status byte decodes to SECURING."""
+    lock = _make_lock()
+
+    assert all(
+        lock._parse_lock_status(value) is not LockStatus.SECURING
+        for value in range(0x100)
+    )
+
+
 def test_parse_success_op_response_with_0200_trailer_is_no_update(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
