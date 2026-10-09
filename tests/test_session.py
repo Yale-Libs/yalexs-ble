@@ -836,9 +836,10 @@ async def test_the_result_callback_runs_once_before_the_wait_resolves() -> None:
     progress = OperationProgress()
     command = session.build_operation_command(Commands.LOCK, 0x04)
     ack = _with_checksum(_ACK_SECUREMODE)
-    other_opcode = _with_checksum("bb0a00000000000000000000000000000200")
+    other_opcode = _with_checksum("bb0a000000000000000000000000001f0200")
     settled = _with_checksum(_SETTLED_STATUS)
     op_response = _with_checksum(_OP_RESPONSE_OK)
+    late_failure = _with_checksum(_OP_RESPONSE_FAILED)
     calls: list[tuple[bytes, bool]] = []
 
     def result_cb(frame: bytes) -> None:
@@ -847,7 +848,7 @@ async def test_the_result_callback_runs_once_before_the_wait_resolves() -> None:
 
     async def feed() -> None:
         await _spin_until_written(client)
-        for frame in (ack, other_opcode, settled, op_response, op_response):
+        for frame in (ack, other_opcode, settled, op_response, late_failure):
             session._notify(0, bytearray(frame))
 
     feeder = asyncio.create_task(feed())
