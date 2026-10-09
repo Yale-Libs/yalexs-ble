@@ -2764,6 +2764,16 @@ async def test_disconnect_during_an_update_leaves_the_reconnect_to_it() -> None:
 
 
 @pytest.mark.asyncio
+async def test_deferred_update_is_ignored_when_not_running() -> None:
+    """A stopped lock neither updates nor counts a failure."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:51", always_connected=True)
+    with patch.object(push_lock, "_update") as update:
+        await push_lock._execute_deferred_update()
+    update.assert_not_called()
+    assert push_lock._consecutive_update_failures == 0
+
+
+@pytest.mark.asyncio
 async def test_deferred_update_success_clears_backoff() -> None:
     """A completed update drops the lock straight back to immediate retries."""
     push_lock = _backoff_lock("aa:bb:cc:dd:ee:44")
