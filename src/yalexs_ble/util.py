@@ -62,9 +62,15 @@ def encode_keycode_pin(pin: str) -> bytes:
 
 
 def decode_keycode_pin(data: bytes | bytearray) -> str | None:
-    """Unpack a BCD keypad PIN; None for an empty slot (all 0xFF)."""
-    digits = bytes(data[:KEYCODE_PIN_BYTES]).hex()
-    return "".join(c for c in digits if c.isdigit()) or None
+    """Unpack a BCD keypad PIN padded with 0xF; None for an empty slot.
+
+    Raises ValueError for a field that is not digits followed by padding.
+    """
+    field = bytes(data[:KEYCODE_PIN_BYTES]).hex()
+    pin = field.rstrip("f")
+    if pin and not pin.isdigit():
+        raise ValueError(f"Malformed PIN field: {field}")
+    return pin or None
 
 
 def _copy(dest: bytearray, src: bytes, destLocation: int = 0) -> None:

@@ -2797,7 +2797,7 @@ def _activity_push_lock(
 
     async def drain_lock_activity() -> Any:
         for item in next(outcomes):
-            if isinstance(item, Exception):
+            if isinstance(item, BaseException):
                 raise item
             yield item
 
@@ -2933,9 +2933,7 @@ async def test_activity_callback_exception_is_isolated(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "error", [BleakError("gone"), TimeoutError("slow"), ResponseError("capped")]
-)
+@pytest.mark.parametrize("error", [TimeoutError("slow"), ResponseError("capped")])
 async def test_activity_drain_failure_keeps_the_flag(
     error: Exception, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2959,7 +2957,7 @@ async def test_activity_records_before_a_failure_are_delivered() -> None:
     """Each read pops the lock's log, so records are delivered as they arrive."""
     first, second = _unlock(205), _unlock(200)
     push_lock, mock_lock, received = _activity_push_lock(
-        [[], [first, BleakError("gone")], [second]]
+        [[], [first, TimeoutError("slow")], [second]]
     )
     await _run_update(push_lock, mock_lock)
     push_lock._update_any_state([LockStatus.UNLOCKED])
@@ -2971,12 +2969,35 @@ async def test_activity_records_before_a_failure_are_delivered() -> None:
 
 
 @pytest.mark.asyncio
-async def test_activity_disconnect_during_drain_is_left_to_the_update() -> None:
-    """A disconnect reaches the update's retry, which drains again."""
+async def test_activity_cancel_during_drain_keeps_the_flag() -> None:
+    """A cancelled update leaves the drain owed to the next one."""
+    push_lock, mock_lock, _ = _activity_push_lock([[], [asyncio.CancelledError()]])
+    await _run_update(push_lock, mock_lock)
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    with pytest.raises(asyncio.CancelledError):
+        await _run_update(push_lock, mock_lock)
+    assert push_lock._activity_drain_pending is True
+
+
+@pytest.mark.asyncio
+async def test_activity_door_change_drains_too() -> None:
+    """A door status change also marks the log for a drain."""
+    opened = DoorActivity(datetime(2026, 1, 1), DoorStatus.OPENED)
+    push_lock, mock_lock, received = _activity_push_lock([[], [opened]])
+    await _run_update(push_lock, mock_lock)
+    push_lock._update_any_state([DoorStatus.OPENED])
+    await _run_update(push_lock, mock_lock)
+    assert received == [opened]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [DisconnectedError("gone"), BleakError("bus")])
+async def test_activity_transport_error_during_drain_is_left_to_the_update(
+    error: Exception,
+) -> None:
+    """A transport error reaches the update's retry, which drains again."""
     first = _unlock(205)
-    push_lock, mock_lock, received = _activity_push_lock(
-        [[], [DisconnectedError("gone")], [first]]
-    )
+    push_lock, mock_lock, received = _activity_push_lock([[], [error], [first]])
     await _run_update(push_lock, mock_lock)
     push_lock._update_any_state([LockStatus.UNLOCKED])
     await _run_update(push_lock, mock_lock)
@@ -3008,7 +3029,7 @@ async def test_activity_status_change_during_drain_stays_pending() -> None:
 async def test_activity_priming_failure_retries_priming() -> None:
     """If priming fails the backlog is still discarded on the retry."""
     push_lock, mock_lock, received = _activity_push_lock(
-        [[_unlock(2), BleakError("gone")], [_unlock(1)]]
+        [[_unlock(2), TimeoutError("slow")], [_unlock(1)]]
     )
     await _run_update(push_lock, mock_lock)
     assert push_lock._activity_primed is False

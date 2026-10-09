@@ -1175,6 +1175,9 @@ def test_encode_decode_keycode_pin() -> None:
     assert util.decode_keycode_pin(bytes.fromhex("12345fffffffff")) == "12345"
     assert util.decode_keycode_pin(b"\xff" * 7) is None
     assert util.decode_keycode_pin(bytes(7)) == "0" * 14
+    for malformed in ("1a23ffffffffff", "12f4ffffffffff", "aaaaaaaaaaaaaa"):
+        with pytest.raises(ValueError, match="Malformed PIN"):
+            util.decode_keycode_pin(bytes.fromhex(malformed))
 
 
 def test_keycode_matcher_takes_only_the_result_frame() -> None:

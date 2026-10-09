@@ -962,6 +962,7 @@ class PushLock:
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
+                    self._activity_drain_pending = True
             elif isinstance(state, BatteryState):
                 if lock_state.battery != state:
                     changes["battery"] = state
@@ -1299,16 +1300,19 @@ class PushLock:
             async for activity in lock.drain_lock_activity():
                 if self._activity_primed:
                     self._callback_activity(activity)
-        except Exception as err:
+        except (TimeoutError, ResponseError) as err:
             self._activity_drain_pending = True
-            if not isinstance(err, (BleakError, TimeoutError, ResponseError)):
-                raise
             _LOGGER.debug(
                 "%s: Reading lock activity failed (%s), will retry on next update.",
                 self.name,
                 err,
             )
             return
+        except BaseException:
+            # A transport error or a cancellation; the update's own handling
+            # takes it, and the drain is still owed.
+            self._activity_drain_pending = True
+            raise
         self._activity_primed = True
 
     def _callback_activity(self, activity: LockActivity | DoorActivity) -> None:
