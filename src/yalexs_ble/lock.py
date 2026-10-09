@@ -556,7 +556,11 @@ class Lock:
         return self._lock_info
 
     async def _execute_operation(
-        self, opcode: int, operation_byte: int, command_name: str
+        self,
+        opcode: int,
+        operation_byte: int,
+        command_name: str,
+        write_success_callback: Callable[[], None] | None = None,
     ) -> int:
         """Run a mechanical operation; return the result code the lock reported."""
         assert self.session is not None  # nosec
@@ -568,6 +572,7 @@ class Lock:
             response_matcher=_operation_response_matcher(opcode),
             response_timeout=OPERATION_RESPONSE_TIMEOUT,
             progress=OperationProgress(),
+            write_success_callback=write_success_callback,
         )
         result = response[RESULT_BYTE]
         _LOGGER.debug(
@@ -576,21 +581,34 @@ class Lock:
         return result
 
     @raise_if_not_connected
-    async def force_securemode(self) -> int:
+    async def force_securemode(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> int:
         """Force the lock into securemode; returns the lock's result code."""
         return await self._execute_operation(
-            Commands.LOCK, SECUREMODE_OPERATION_BYTE, "force_securemode"
+            Commands.LOCK,
+            SECUREMODE_OPERATION_BYTE,
+            "force_securemode",
+            write_success_callback,
         )
 
     @raise_if_not_connected
-    async def force_lock(self) -> int:
+    async def force_lock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> int:
         """Force the lock to lock; returns the lock's result code."""
-        return await self._execute_operation(Commands.LOCK, 0x00, "force_lock")
+        return await self._execute_operation(
+            Commands.LOCK, 0x00, "force_lock", write_success_callback
+        )
 
     @raise_if_not_connected
-    async def force_unlock(self) -> int:
+    async def force_unlock(
+        self, write_success_callback: Callable[[], None] | None = None
+    ) -> int:
         """Force the lock to unlock; returns the lock's result code."""
-        return await self._execute_operation(Commands.UNLOCK, 0x00, "force_unlock")
+        return await self._execute_operation(
+            Commands.UNLOCK, 0x00, "force_unlock", write_success_callback
+        )
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:

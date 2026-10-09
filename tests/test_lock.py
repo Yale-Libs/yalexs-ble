@@ -229,6 +229,49 @@ def test_parse_getstatus_staticposition() -> None:
     assert list(result) == [LockStatus.JAMMED]
 
 
+@pytest.mark.parametrize(
+    ("frame_hex", "expected"),
+    [
+        # Synthetic frames in the GETSTATUS layout, not captured from a device.
+        ("bb0200380200000009000000000000000000", LockStatus.UNLATCHING),
+        ("bb020037020000000a000000000000000000", LockStatus.UNLATCHED),
+    ],
+    ids=["unlatching", "unlatched"],
+)
+def test_parse_getstatus_unlatch_states(frame_hex: str, expected: LockStatus) -> None:
+    """A GETSTATUS position of 0x09 or 0x0A decodes to the unlatch states."""
+    lock = _make_lock()
+
+    result = lock._parse_state(bytes.fromhex(frame_hex))
+
+    assert result is not None
+    assert list(result) == [expected]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected", "diagnostic_logged"),
+    [
+        (0x09, LockStatus.UNLATCHING, False),
+        (0x0A, LockStatus.UNLATCHED, False),
+        (0x08, LockStatus.UNKNOWN, True),
+    ],
+    ids=["unlatching", "unlatched", "still_unmapped"],
+)
+def test_parse_lock_status_decodes_the_unlatch_states(
+    value: int,
+    expected: LockStatus,
+    diagnostic_logged: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """_parse_lock_status decodes 0x09 and 0x0A without logging; 0x08 still logs."""
+    lock = _make_lock()
+
+    with caplog.at_level("INFO", logger="yalexs_ble.lock"):
+        assert lock._parse_lock_status(value) is expected
+
+    assert ("Unrecognized lock_status_str" in caplog.text) is diagnostic_logged
+
+
 def test_parse_success_op_response_with_0200_trailer_is_no_update(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1492,13 +1535,15 @@ async def _drive_operation(
     ack: bytes,
     before_ack: bytes | None = None,
     before_response: bytes | None = None,
-) -> None:
+) -> list[str]:
     """Run a force_* method, feeding its ack then op-response through notify.
 
-    Optional before_* frames must leave the stage they precede armed.
+    Returns the write-success callback and the fed frames in order. Optional
+    before_* frames must leave the stage they precede armed.
     """
     session = lock.session
     assert session is not None
+    events: list[str] = []
 
     async def feed() -> None:
         await _spin_until(lambda: session._ack_future is not None)
@@ -1507,16 +1552,21 @@ async def _drive_operation(
             assert session._ack_future is not None, "taken for the acknowledgment"
             await asyncio.sleep(0)
         session._notify(0, bytearray(ack))
-        assert session._ack_future is None, "the acknowledgement was not matched"
+        assert session._ack_future is None, "the acknowledgment was not matched"
+        events.append("ack")
         await asyncio.sleep(0)
         if before_response is not None:
             session._notify(0, bytearray(before_response))
             assert session._notify_future is not None, "taken for the op-response"
         session._notify(0, bytearray(_op_response_frame(opcode)))
+        events.append("op_response")
 
     feeder = asyncio.create_task(feed())
-    await getattr(lock, op_attr)()
+    await getattr(lock, op_attr)(
+        write_success_callback=lambda: events.append("write_success")
+    )
     await feeder
+    return events
 
 
 def test_parse_operation_ack_reports_no_state(
@@ -1550,9 +1600,10 @@ def test_parse_operation_ack_reports_no_state(
 async def test_force_operations_complete_on_ack_then_op_response(
     op_attr: str, opcode: int, ack: bytes
 ) -> None:
-    """Each force_* completes only on its own ack, then its 0xBB op-response."""
+    """Each force_* completes on its own ack then op-response, after write-success."""
     lock = _make_connected_lock_with_session()
-    await _drive_operation(lock, op_attr, opcode, ack)
+    events = await _drive_operation(lock, op_attr, opcode, ack)
+    assert events == ["write_success", "ack", "op_response"]
 
 
 @pytest.mark.asyncio
