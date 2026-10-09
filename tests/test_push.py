@@ -224,6 +224,9 @@ def _lock_info(model: str) -> LockInfo:
         ("Yale Linus L2", False),
         # Regional/firmware suffixes must still match the family.
         ("SL-103-EU", False),
+        ("Yale Linus L2 X", False),
+        # A longer model number is a different model, not a variant.
+        ("SL-1030", True),
         ("ASL-03", True),
         ("MD-04I", True),
         ("", True),
@@ -239,6 +242,7 @@ def test_battery_reporting(model: str, reporting: bool) -> None:
         ("ASL-02", False),
         ("ASL-01", False),
         ("ASL-01-XX", False),
+        ("ASL-010", True),
         ("ASL-03", True),
         # An unknown model is assumed to have no door sense.
         ("", False),

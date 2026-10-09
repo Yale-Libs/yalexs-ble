@@ -28,9 +28,8 @@ MODEL_NUMBER_CHARACTERISTIC = "00002a24-0000-1000-8000-00805f9b34fb"
 SERIAL_NUMBER_CHARACTERISTIC = "00002a25-0000-1000-8000-00805f9b34fb"
 FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 
-# Model tables are matched by prefix against the Model Number characteristic,
-# which varies by region and firmware (e.g. "SL-103" and "Yale Linus L2" are
-# both the Linus L2).
+# The Model Number characteristic carries regional and firmware suffixes
+# such as "SL-103-EU", so the tables match an entry or a suffixed variant.
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
 
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these exclusions
@@ -262,7 +261,11 @@ class LockInfo:
         return not self._model_in(NO_BATTERY_SUPPORT_MODELS)
 
     def _model_in(self, models: set[str]) -> bool:
-        return any(self.model.startswith(model) for model in models)
+        """True for a listed model or a suffixed variant of one, not a longer number."""
+        return any(
+            self.model == model or self.model.startswith((f"{model}-", f"{model} "))
+            for model in models
+        )
 
 
 @dataclass
