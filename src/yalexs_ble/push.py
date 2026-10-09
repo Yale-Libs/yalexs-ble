@@ -1034,11 +1034,8 @@ class PushLock:
                 ),
             )
         except OperationFailedError:
-            # Backstop for the parser's JAMMED recorded for _finalize_operation.
-            self._operation_outcome = LockStatus.JAMMED
-            _LOGGER.debug(
-                "%s: %s reported failure; recording JAMMED", self.name, op_attr
-            )
+            # The failure op-response has already put JAMMED on the display.
+            _LOGGER.debug("%s: %s reported failure", self.name, op_attr)
             # The exchange completed, so the link is alive: move the timers.
             self._complete_operation(time.monotonic())
             raise
