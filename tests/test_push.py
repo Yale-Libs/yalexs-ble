@@ -2657,6 +2657,7 @@ async def test_a_cycle_that_changed_nothing_still_reports() -> None:
         auth=AuthState(successful=True),
         auto_lock=None,
         auto_lock_prev=None,
+        secure=LockStatus.UNLOCKED,
     )
     push_lock._seen_this_session.add(DoorStatus)
     push_lock._seen_this_session.add(BatteryState)
@@ -3423,8 +3424,12 @@ def _operational_push_lock(address: str = "aa:bb:cc:dd:ee:50") -> PushLock:
     return push_lock
 
 
-def _known_state(lock: LockStatus, door: DoorStatus = DoorStatus.CLOSED) -> LockState:
-    """A LockState holding the given lock and door statuses and nothing else."""
+def _known_state(
+    lock: LockStatus,
+    door: DoorStatus = DoorStatus.CLOSED,
+    secure: LockStatus = LockStatus.UNLOCKED,
+) -> LockState:
+    """A LockState holding the given lock, door, and secure statuses only."""
     return LockState(
         lock=lock,
         door=door,
@@ -3432,6 +3437,7 @@ def _known_state(lock: LockStatus, door: DoorStatus = DoorStatus.CLOSED) -> Lock
         auth=None,
         auto_lock=None,
         auto_lock_prev=None,
+        secure=secure,
     )
 
 
@@ -3464,6 +3470,280 @@ async def test_execute_lock_operation_success_stamps_complete_state(
 
     getattr(mock_lock, op_attr).assert_awaited_once()
     assert push_lock.lock_status == complete_state
+
+
+@pytest.mark.asyncio
+async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
+    """Securing an already-locked lock moves the secure lock and not the main."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:60")
+    emissions: list[tuple[LockStatus, LockStatus]] = []
+    push_lock.register_callback(
+        lambda ls, li, ci: emissions.append((ls.lock, ls.secure))
+    )
+
+    push_lock._update_any_state([LockStatus.LOCKED])
+    assert emissions == [(LockStatus.LOCKED, LockStatus.UNLOCKED)]
+
+    async def force_securemode(
+        write_success_callback: Callable[[], None],
+        result_callback: Callable[[bool], None],
+    ) -> None:
+        write_success_callback()
+        # A late settled push inside the window is refused.
+        push_lock._state_callback([LockStatus.LOCKED])
+        result_callback(True)
+
+    mock_lock = MagicMock()
+    mock_lock.force_securemode = force_securemode
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.securemode()
+
+    assert emissions == [
+        (LockStatus.LOCKED, LockStatus.UNLOCKED),
+        (LockStatus.LOCKED, LockStatus.LOCKING),
+        (LockStatus.SECUREMODE, LockStatus.LOCKED),
+    ]
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "operation", "op_attr", "expected"),
+    [
+        (
+            (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
+            "lock",
+            "force_lock",
+            [
+                (LockStatus.LOCKING, LockStatus.UNLOCKED),
+                (LockStatus.LOCKED, LockStatus.UNLOCKED),
+            ],
+        ),
+        (
+            (LockStatus.LOCKED, LockStatus.UNLOCKED),
+            "securemode",
+            "force_securemode",
+            [
+                (LockStatus.LOCKED, LockStatus.LOCKING),
+                (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            ],
+        ),
+        (
+            (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
+            "securemode",
+            "force_securemode",
+            [
+                (LockStatus.LOCKING, LockStatus.LOCKING),
+                (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            ],
+        ),
+        (
+            (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            "securemode",
+            "force_securemode",
+            [
+                (LockStatus.SECUREMODE, LockStatus.LOCKING),
+                (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            ],
+        ),
+        (
+            (LockStatus.LOCKED, LockStatus.UNLOCKED),
+            "unlock",
+            "force_unlock",
+            [
+                (LockStatus.UNLOCKING, LockStatus.UNLOCKED),
+                (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
+            ],
+        ),
+        (
+            (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            "unlock",
+            "force_unlock",
+            [
+                (LockStatus.UNLOCKING, LockStatus.UNLOCKING),
+                (LockStatus.UNLOCKED, LockStatus.UNLOCKED),
+            ],
+        ),
+    ],
+    ids=[
+        "lock_unlocked_to_locked",
+        "securemode_locked_to_secured",
+        "securemode_unlocked_to_secured",
+        "securemode_already_secured_moves_only_secure",
+        "unlock_locked_to_unlocked",
+        "unlock_secured_to_unlocked",
+    ],
+)
+async def test_secure_projection_invariant_table(
+    start: tuple[LockStatus, LockStatus],
+    operation: str,
+    op_attr: str,
+    expected: list[tuple[LockStatus, LockStatus]],
+) -> None:
+    """Each operation publishes the expected (main, secure) pairs."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:61")
+    push_lock._lock_state = _known_state(start[0], secure=start[1])
+    emissions: list[tuple[LockStatus, LockStatus]] = []
+    push_lock.register_callback(
+        lambda ls, li, ci: emissions.append((ls.lock, ls.secure))
+    )
+
+    async def force_operation(
+        write_success_callback: Callable[[], None],
+        result_callback: Callable[[bool], None],
+    ) -> None:
+        write_success_callback()
+        result_callback(True)
+
+    mock_lock = MagicMock()
+    setattr(mock_lock, op_attr, force_operation)
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(push_lock, "_schedule_future_update"),
+    ):
+        await getattr(push_lock, operation)()
+
+    assert emissions == expected
+    assert all(LockStatus.SECURING not in pair for pair in emissions)
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_settled_securemode_push_is_not_a_securing_transitional() -> None:
+    """A SECUREMODE push outside an operation is a settled secured position."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:63")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+
+    push_lock._state_callback([LockStatus.SECUREMODE])
+
+    assert push_lock.lock_status is LockStatus.SECUREMODE
+    assert push_lock.secure_status is LockStatus.LOCKED
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_a_stamped_plain_locking_reads_not_secured() -> None:
+    """A plain lock() out of Secured reads the secure lock as not secured."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:69")
+    push_lock._lock_state = _known_state(
+        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
+    )
+
+    push_lock._operation_write_success(LockStatus.LOCKING)
+
+    assert push_lock.lock_status is LockStatus.LOCKING
+    assert push_lock.secure_status is LockStatus.UNLOCKED
+
+
+@pytest.mark.asyncio
+async def test_the_forged_securing_is_not_a_position_the_lock_holds() -> None:
+    """A stamped SECURING must not suppress the follow-up status poll."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6a")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+
+    push_lock._update_any_state([LockStatus.SECURING], operation=True)
+
+    assert push_lock.secure_status is LockStatus.LOCKING
+    assert LockStatus not in push_lock._seen_this_session
+
+
+@pytest.mark.asyncio
+async def test_window_filter_refusal_leaves_the_secure_lock_alone() -> None:
+    """A status refused by the window filter never reaches the projection."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:64")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    with _patched_clock() as clock:
+        # As the operation sets them before its write.
+        push_lock._operation_issued_at = clock[0]
+        push_lock._operation_window_open = True
+        push_lock._operation_write_success(LockStatus.SECURING)
+    assert (push_lock.lock_status, push_lock.secure_status) == (
+        LockStatus.LOCKED,
+        LockStatus.LOCKING,
+    )
+
+    # A late settled push inside the window is refused.
+    push_lock._update_any_state([LockStatus.LOCKED])
+    assert (push_lock.lock_status, push_lock.secure_status) == (
+        LockStatus.LOCKED,
+        LockStatus.LOCKING,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retried_unlock_keeps_the_secure_transitional() -> None:
+    """A second write-success of a retried unlock keeps secure UNLOCKING."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:65")
+    push_lock._lock_state = _known_state(
+        LockStatus.SECUREMODE, secure=LockStatus.LOCKED
+    )
+
+    # Attempt 1 writes, then fails retryably.
+    push_lock._operation_write_success(LockStatus.UNLOCKING)
+    push_lock._close_operation_window()
+    assert push_lock.secure_status is LockStatus.UNLOCKING
+
+    # Attempt 2 writes and stamps the same pending state.
+    push_lock._operation_write_success(LockStatus.UNLOCKING)
+    assert (push_lock.lock_status, push_lock.secure_status) == (
+        LockStatus.UNLOCKING,
+        LockStatus.UNLOCKING,
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonretryable_securemode_after_write_stamps_unknown() -> None:
+    """A securemode that dies after its write settles the pair at UNKNOWN."""
+    exc = OperationIncompleteError("no op-response")
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:66")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+
+    mock_lock = MagicMock()
+
+    async def force_securemode(
+        write_success_callback: Callable[[], None],
+        result_callback: Callable[[bool], None],
+    ) -> None:
+        write_success_callback()
+        raise exc
+
+    mock_lock.force_securemode = force_securemode
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        pytest.raises(type(exc)),
+    ):
+        await push_lock.securemode()
+
+    assert push_lock._operation_window_open is False
+    assert push_lock.lock_status is LockStatus.UNKNOWN
+    assert push_lock.secure_status is LockStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secure", "expected_delay"),
+    [
+        (LockStatus.LOCKING, LOCK_STALE_STATE_DEBOUNCE_DELAY),
+        (LockStatus.UNLOCKED, KEEP_ALIVE_TIME),
+    ],
+    ids=["secure_transitional_polls_at_the_debounce", "settled_pair_keeps_alive"],
+)
+async def test_operation_exit_delay_follows_the_displayed_pair(
+    secure: LockStatus, expected_delay: float
+) -> None:
+    """The exit poll delay reads the pair, not the main lock alone."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:67")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED, secure=secure)
+
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
+        push_lock._finalize_operation()
+
+    schedule.assert_called_once_with(expected_delay)
 
 
 @pytest.mark.asyncio

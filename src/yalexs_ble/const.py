@@ -131,6 +131,9 @@ class LockStatus(Enum):
     UNLATCHING = 0x09
     UNLATCHED = 0x0A
     SECUREMODE = 0x0C
+    # Library-synthesized securing transitional, consumed by
+    # _project_lock_status; wider than a byte so no frame decodes to it.
+    SECURING = 0x100
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
@@ -193,6 +196,8 @@ class LockState:
     # Hold the previous auto lock state so that it can be restored if auto lock
     # is enabled
     auto_lock_prev: AutoLockState | None
+    # The secure lock, projected from the same status; never SECUREMODE.
+    secure: LockStatus = LockStatus.UNKNOWN
 
 
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
