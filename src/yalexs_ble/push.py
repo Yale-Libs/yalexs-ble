@@ -492,6 +492,10 @@ class PushLock:
 
         def unregister_activity_callback() -> None:
             self._activity_callbacks.remove(callback)
+            if not self._activity_callbacks:
+                # Prime again on the next registration so the backlog
+                # that built up meanwhile is not delivered as new.
+                self._activity_primed = False
 
         self._activity_callbacks.append(callback)
         return unregister_activity_callback

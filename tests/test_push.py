@@ -2923,6 +2923,25 @@ async def test_activity_unregister_stops_delivery_and_reads() -> None:
 
 
 @pytest.mark.asyncio
+async def test_activity_reregistering_primes_again() -> None:
+    """Registering after the last callback was removed discards the backlog."""
+    second = _unlock(2)
+    push_lock, mock_lock, received = _activity_push_lock([[], [_unlock(1)], [second]])
+    unregister = push_lock.register_activity_callback(lambda _: None)
+    await _run_update(push_lock, mock_lock)
+    push_lock._activity_callbacks.remove(received.append)
+    unregister()
+    assert push_lock._activity_primed is False
+    push_lock._update_any_state([LockStatus.UNLOCKED])
+    push_lock.register_activity_callback(received.append)
+    await _run_update(push_lock, mock_lock)
+    assert received == []
+    push_lock._update_any_state([LockStatus.LOCKED])
+    await _run_update(push_lock, mock_lock)
+    assert received == [second]
+
+
+@pytest.mark.asyncio
 async def test_activity_callback_exception_is_isolated(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
