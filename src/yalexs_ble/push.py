@@ -854,7 +854,6 @@ class PushLock:
         self._close_operation_window()
         if not self._running or not succeeded:
             return
-        self._operation_outcome = complete_state
         if (
             self._jam_takes_precedence()
             and self.lock_status in MANUAL_INTERVENTION_STATUSES
@@ -908,7 +907,11 @@ class PushLock:
             # the stop takes no precedence over its commands.
             self._last_jam_event_time = NEVER_TIME
             return
-        if precedence and self.lock_status in MANUAL_INTERVENTION_STATUSES:
+        if (
+            outcome is not None
+            and precedence
+            and self.lock_status in MANUAL_INTERVENTION_STATUSES
+        ):
             # The outcome yields to a jam or setup condition the lock reported
             # within the precedence time or during the command.
             _LOGGER.debug(
