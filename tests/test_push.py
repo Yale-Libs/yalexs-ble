@@ -1182,6 +1182,7 @@ async def test_disconnected_callback_schedules_reconnect_when_always_connected()
         always_connected=True,
     )
     push_lock._name = "Test Lock"
+    push_lock._running = True
     _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
 
     with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
@@ -2839,6 +2840,38 @@ async def test_auth_failures_below_the_latch_still_count_as_failed_updates() -> 
         assert push_lock.auth != AuthState(successful=False)
     finally:
         _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_lock_never_rearms_a_reconnect() -> None:
+    """The reconnect helper stands down once the lock is stopped."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:53")
+    push_lock._running = False
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
+        push_lock._schedule_reconnect()
+    schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_auth_retries_fail_an_operation_too() -> None:
+    """lock() raises after its auth retries run out instead of returning None."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:54", always_connected=False)
+    _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+    try:
+        with (
+            patch.object(
+                push_lock, "_ensure_connected", AsyncMock(side_effect=AuthError("x"))
+            ),
+            patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+            pytest.raises(DisconnectedError) as excinfo,
+        ):
+            await push_lock.lock()
+        assert isinstance(excinfo.value.__cause__, AuthError)
+        assert not _AUTH_FAILURE_HISTORY.should_raise(push_lock.address)
+    finally:
+        _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+        push_lock._cancel_future_update()
+        push_lock._cancel_disconnect_timer()
 
 
 @pytest.mark.asyncio
