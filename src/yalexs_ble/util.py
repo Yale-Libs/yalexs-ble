@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from asyncio import timeout as asyncio_timeout  # noqa: F401
 from dataclasses import dataclass
 
@@ -47,6 +48,29 @@ def _security_checksum(buffer: bytes | bytearray) -> int:
     val3 = _bytes_to_int(buffer[0x08:RESPONSE_FRAME_LEN])
 
     return (0 - (val1 + val2 + val3)) & 0xFFFFFFFF
+
+
+KEYCODE_PIN_BYTES = 7
+KEYCODE_MAX_DIGITS = KEYCODE_PIN_BYTES * 2
+
+
+def encode_keycode_pin(pin: str) -> bytes:
+    """Pack a keypad PIN as BCD, first digit in the high nibble, padded with 0xF."""
+    if not re.fullmatch(f"[0-9]{{1,{KEYCODE_MAX_DIGITS}}}", pin):
+        raise ValueError(f"PIN must be 1-{KEYCODE_MAX_DIGITS} digits (0-9): {pin!r}")
+    return bytes.fromhex(pin.ljust(KEYCODE_MAX_DIGITS, "f"))
+
+
+def decode_keycode_pin(data: bytes | bytearray) -> str | None:
+    """Unpack a BCD keypad PIN padded with 0xF; None for an empty slot.
+
+    Raises ValueError for a field that is not digits followed by padding.
+    """
+    field = data[:KEYCODE_PIN_BYTES].hex()
+    pin = field.rstrip("f")
+    if pin and not pin.isdigit():
+        raise ValueError(f"Malformed PIN field: {field}")
+    return pin or None
 
 
 def _copy(dest: bytearray, src: bytes, destLocation: int = 0) -> None:
