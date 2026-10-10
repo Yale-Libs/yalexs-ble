@@ -2967,6 +2967,17 @@ async def test_deferred_update_cancel_is_not_a_failure(connected: bool) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_cycle_that_yields_to_the_floor_leaves_the_backoff_alone() -> None:
+    """A cycle that yields to the floor records no outcome, so the backoff stands."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:f9")
+    push_lock._reconnect_backoff = 8.0
+    push_lock._earliest_update_time = time.monotonic() + 5.0
+    await push_lock._execute_deferred_update()
+    assert push_lock._reconnect_backoff == 8.0
+    push_lock._cancel_future_update()
+
+
+@pytest.mark.asyncio
 async def test_complete_operation_clears_backoff() -> None:
     """A completed operation proves the connection works."""
     push_lock = _backoff_lock("aa:bb:cc:dd:ee:46")
