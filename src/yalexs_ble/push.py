@@ -1971,11 +1971,12 @@ class PushLock:
         _LOGGER.debug("%s: Starting deferred update", self.name)
         failed = True
         cancelled = False
+        yielded = False
         try:
             async with self._operation_lock:
                 # Re-check: an operation may have run since the timer fired.
                 if self._wait_for_the_floor(time.monotonic()):
-                    failed = False  # nothing ran, so nothing to count
+                    yielded = True  # No update ran, so there is no outcome to record.
                     return
                 await self._locked_update()
             failed = False
@@ -2015,7 +2016,7 @@ class PushLock:
             self._set_update_state(wrapped_exc)
             _LOGGER.exception("%s: Unknown error updating", self.name)
         finally:
-            if not cancelled:
+            if not cancelled and not yielded:
                 self._record_update_outcome(failed)
             if not self.is_connected:
                 # The disconnect callback stood down while this update ran.
