@@ -1009,7 +1009,7 @@ class PushLock:
                 ex,
             )
             raise
-        _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        _LOGGER.debug("%s: Finished %s", self.name, op_attr)
         self._complete_operation(time.monotonic())
 
     @property
