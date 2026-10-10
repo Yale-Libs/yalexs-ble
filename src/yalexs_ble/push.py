@@ -155,13 +155,12 @@ POSITION_READINGS = frozenset(
     }
 )
 
-# Statuses while the motor runs; SECURING is never reported, securemode() stamps it.
+# Statuses the lock reports while the motor runs.
 TRANSITIONAL_READINGS = frozenset(
     {
         LockStatus.LOCKING,
         LockStatus.UNLOCKING,
         LockStatus.UNLATCHING,
-        LockStatus.SECURING,
     }
 )
 
@@ -1374,11 +1373,6 @@ class PushLock:
                 if lock_state.auth != state:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
-                if operation and state in TRANSITIONAL_READINGS:
-                    # The operation's own transitional means the motor is
-                    # starting, so the next poll is held off as for one the lock
-                    # reports.
-                    self._hold_update(LOCK_STALE_STATE_DEBOUNCE_DELAY)
                 # Every lock status the lock reports, repeats included, passes
                 # the admission filter.
                 admitted = (

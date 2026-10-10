@@ -3795,19 +3795,6 @@ async def test_retried_unlock_keeps_the_secure_transitional() -> None:
 
 
 @pytest.mark.asyncio
-async def test_securing_stamp_moves_the_poll_floor_at_write_success() -> None:
-    """The SECURING stamp arms the poll floor at write-success."""
-    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:68")
-    push_lock._lock_state = _known_state(LockStatus.LOCKED)
-    push_lock._earliest_update_time = NEVER_TIME
-
-    before = time.monotonic()
-    push_lock._operation_write_success(LockStatus.SECURING)
-
-    assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
-
-
-@pytest.mark.asyncio
 async def test_nonretryable_securemode_after_write_stamps_unknown() -> None:
     """A securemode that dies after its write settles the pair at UNKNOWN."""
     exc = OperationIncompleteError("no op-response")
@@ -4465,9 +4452,6 @@ async def test_a_stop_mid_operation_keeps_the_owed_poll_and_the_floor():
 
     async def _stop_then_fail(write_success_callback, result_callback):
         write_success_callback()
-        # The write-success stamp above set the floor; clear it so the
-        # exit's own stamp is what the assertion below sees.
-        push_lock._earliest_update_time = NEVER_TIME
         push_lock._running = False
         raise OperationIncompleteError("no op-response, and we were stopped")
 
@@ -7428,8 +7412,6 @@ async def test_a_cycle_due_mid_operation_keeps_the_operations_outcome() -> None:
         result_callback: Callable[[bool], None],
     ) -> None:
         write_success_callback()  # puts UNLATCHING on the display
-        # The command's own hold has already run out, mid-motion.
-        push_lock._earliest_update_time = time.monotonic() - 1.0
         await gate.wait()  # the motor is still running
         push_lock._op_response_callback()
         result_callback(True)
