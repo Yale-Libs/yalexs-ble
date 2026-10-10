@@ -29,6 +29,7 @@ from yalexs_ble.lock import ActivityLogOverrunError, Lock
 from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
     ACTIVITY_DRAIN_FAILURE_THRESHOLD,
+    ACTIVITY_DRAIN_MAX_OVERRUNS,
     ACTIVITY_PRIME_DELAY,
     APPLE_MFR_ID,
     AUTH_FAILURE_TO_START_REAUTH,
@@ -2976,14 +2977,14 @@ _OVERRUN = ActivityLogOverrunError("log did not end")
     [
         ([TimeoutError("slow")], ACTIVITY_DRAIN_FAILURE_THRESHOLD),
         ([_OVERRUN], 1),
-        ([_unlock(1), _OVERRUN], ACTIVITY_DRAIN_FAILURE_THRESHOLD),
+        ([_unlock(1), _OVERRUN], ACTIVITY_DRAIN_MAX_OVERRUNS),
     ],
-    ids=["timeout", "overrun-empty", "overrun-with-progress"],
+    ids=["timeout", "overrun-empty", "overrun-without-end"],
 )
 async def test_activity_drain_backs_off_after_repeated_failures(
     failed_drain: list[Any], strikes: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Enough failed drains warn once and pause; only an empty overrun counts fully."""
+    """Enough failed drains warn once and pause; an empty overrun counts fully."""
     activity = _unlock(205)
     push_lock, mock_lock, received = _activity_push_lock(
         [*([failed_drain] * strikes), [activity]]
@@ -3031,6 +3032,30 @@ async def test_operation_before_priming_reschedules_the_priming_update() -> None
     with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
         push_lock._complete_operation(time.monotonic())
     schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_activity_deep_backlog_continues_shortly_without_a_strike(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An overrun that read records is a deep log: no strike, a follow-up soon."""
+    first, second = _unlock(205), _unlock(200)
+    push_lock, mock_lock, received = _activity_push_lock(
+        [[first, _OVERRUN], [second]], primed=True
+    )
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+    ):
+        await _run_update(push_lock, mock_lock)
+    schedule.assert_called_once_with(ACTIVITY_PRIME_DELAY)
+    assert received == [first]
+    assert push_lock._activity_drain_pending is True
+    assert push_lock._activity_drain_failures == 0
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+    await _run_update(push_lock, mock_lock)
+    assert received == [first, second]
+    assert push_lock._activity_overruns == 0
 
 
 @pytest.mark.asyncio

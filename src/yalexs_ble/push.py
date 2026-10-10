@@ -160,6 +160,9 @@ ACTIVITY_DRAIN_FAILURE_BACKOFF = 3600
 # Delay before the first drain, so the first update is not held up by the
 # backlog and has freed the adapter slot before the lock is asked again.
 ACTIVITY_PRIME_DELAY = 10.0
+# Consecutive drains that read records but never reach the end marker before
+# the log counts as one that never ends rather than a deep backlog.
+ACTIVITY_DRAIN_MAX_OVERRUNS = 8
 
 # How long to wait for the 0xBB settings response after the READSETTING ack
 # before treating the read as unresolved. The ack completes the solicited wait;
@@ -349,7 +352,7 @@ class PushLock:
         ] = []
         self._activity_primed = False
         self._activity_drain_pending = False
-        self._activity_drain_failures = 0
+        self._activity_drain_failures = self._activity_overruns = 0
         self._earliest_activity_drain_time = NEVER_TIME
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
@@ -1342,17 +1345,26 @@ class PushLock:
             self._note_activity_drain_failure(err, records)
             return
         self._activity_drain_failures = 0
+        self._activity_overruns = 0
         self._activity_primed = True
 
     def _note_activity_drain_failure(self, err: Exception, records: int) -> None:
         """Count a failed drain; after enough in a row, leave the log alone a while."""
-        # Overrunning the cap with nothing read is the sign of a log that never
-        # ends; with records read it is a long backlog the next drain continues.
-        strikes = (
-            ACTIVITY_DRAIN_FAILURE_THRESHOLD
-            if isinstance(err, ActivityLogOverrunError) and not records
-            else 1
-        )
+        if isinstance(err, ActivityLogOverrunError):
+            self._activity_overruns += 1
+            if records and self._activity_overruns < ACTIVITY_DRAIN_MAX_OVERRUNS:
+                # A deep backlog, not a failure: carry on shortly.
+                _LOGGER.debug(
+                    "%s: Activity log is deeper than one drain, continuing shortly",
+                    self.name,
+                )
+                self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
+                return
+            # Nothing read, or no end after many chunks: a log that never ends.
+            self._activity_overruns = 0
+            strikes = ACTIVITY_DRAIN_FAILURE_THRESHOLD
+        else:
+            strikes = 1
         self._activity_drain_failures += strikes
         if self._activity_drain_failures < ACTIVITY_DRAIN_FAILURE_THRESHOLD:
             _LOGGER.debug(
