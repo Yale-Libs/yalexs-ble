@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import functools
 import logging
-import math
 import struct
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
@@ -79,10 +78,6 @@ KEEP_ALIVE_TIME = 25.0  # Lock will disconnect after 30 seconds of inactivity
 # cap. A state-changing advertisement still pulls an update earlier.
 RECONNECT_BACKOFF_TIME = 2.0
 MAX_RECONNECT_BACKOFF_TIME = 60.0
-# Bounds the exponent so 2**n cannot overflow before min() clamps it.
-MAX_RECONNECT_BACKOFF_DOUBLINGS = math.ceil(
-    math.log2(MAX_RECONNECT_BACKOFF_TIME / RECONNECT_BACKOFF_TIME)
-)
 
 # Number of seconds to wait after the first connection
 # to disconnect to free up the bluetooth adapter.
@@ -384,7 +379,7 @@ class PushLock:
         self._last_lock_operation_complete_time = self._last_operation_complete_time = (
             NEVER_TIME
         )
-        self._consecutive_update_failures = 0
+        self._reconnect_backoff = 0.0
         self._always_connected = always_connected
         self._slow_params_set = False
         # Earliest next battery poll attempt (cooldown)
@@ -564,40 +559,36 @@ class PushLock:
     def _disconnected_callback(self) -> None:
         """Handle a disconnect from the lock."""
         _LOGGER.debug("%s: Disconnected from lock callback", self.name)
-        if self._update_task is not None and not self._update_task.done():
-            # The running update owns the reconnect and backs off if it fails.
+        if self._update_in_flight():
+            # The running update re-arms the reconnect when it ends.
             return
+        self._schedule_reconnect()
+
+    def _update_in_flight(self) -> bool:
+        return self._update_task is not None and not self._update_task.done()
+
+    def _schedule_reconnect(self) -> None:
+        """Reconnect an always-connected lock, paced by the backoff."""
         if self._always_connected and not _AUTH_FAILURE_HISTORY.should_raise(
             self.address
         ):
-            _LOGGER.debug(
-                "%s: Scheduling reconnect from disconnected callback", self.name
-            )
-            self._keep_alive()
+            _LOGGER.debug("%s: Scheduling reconnect", self.name)
+            self._schedule_future_update_with_debounce(self._reconnect_backoff)
 
     def _keep_alive(self) -> None:
         """Keep the lock connection alive."""
         if not self._always_connected:
             return
         _LOGGER.debug("%s: Executing keep alive", self.name)
-        # Debounced so a backoff longer than KEEP_ALIVE_TIME is not pushed
-        # out on every tick.
-        self._schedule_future_update_with_debounce(self._reconnect_backoff_time())
+        if not self._update_in_flight():
+            # Debounced so a backoff longer than KEEP_ALIVE_TIME is not pushed
+            # out on every tick; a running update re-arms on its own exit.
+            self._schedule_future_update_with_debounce(self._reconnect_backoff)
         self._schedule_next_keep_alive(KEEP_ALIVE_TIME)
 
     def _clear_reconnect_backoff(self) -> None:
         """A completed update or operation proves the link; drop the backoff."""
-        self._consecutive_update_failures = 0
-
-    def _reconnect_backoff_time(self) -> float:
-        """Return how long to wait before the next reconnect attempt."""
-        if not (failures := self._consecutive_update_failures):
-            return 0.0
-        doublings = min(failures - 1, MAX_RECONNECT_BACKOFF_DOUBLINGS)
-        return min(
-            MAX_RECONNECT_BACKOFF_TIME,
-            RECONNECT_BACKOFF_TIME * 2**doublings,
-        )
+        self._reconnect_backoff = 0.0
 
     def _time_since_last_operation(self) -> float:
         """Return the time since the last operation."""
@@ -1605,6 +1596,7 @@ class PushLock:
         if self._running:
             raise RuntimeError("Already running")
         self._running = True
+        self._clear_reconnect_backoff()
         self._first_update_future = asyncio.get_running_loop().create_future()
         if device := await get_device(self.address):
             self.set_ble_device(device)
@@ -1615,8 +1607,6 @@ class PushLock:
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
-        # Do not carry the backoff into a later start().
-        self._clear_reconnect_backoff()
         self.background_task(self._execute_forced_disconnect("stopping"))
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:
@@ -1734,7 +1724,6 @@ class PushLock:
         try:
             await self._update()
             failed = False
-            self._clear_reconnect_backoff()
             self._set_update_state(None)
         except AuthError as ex:
             self._set_update_state(ex)
@@ -1772,15 +1761,15 @@ class PushLock:
             self._set_update_state(wrapped_exc)
             _LOGGER.exception("%s: Unknown error updating", self.name)
         if failed:
-            self._consecutive_update_failures += 1
-        if (
-            self._always_connected
-            and (failed or not self.is_connected)
-            and not _AUTH_FAILURE_HISTORY.should_raise(self.address)
-        ):
-            # The disconnect callback stands down while an update runs, so
-            # the update's exit owns the reconnect, paced by the backoff.
-            self._schedule_future_update_with_debounce(self._reconnect_backoff_time())
+            self._reconnect_backoff = min(
+                MAX_RECONNECT_BACKOFF_TIME,
+                self._reconnect_backoff * 2 or RECONNECT_BACKOFF_TIME,
+            )
+        else:
+            self._clear_reconnect_backoff()
+        if not self.is_connected:
+            # The disconnect callback stood down while this update ran.
+            self._schedule_reconnect()
 
 
 # The HomeKit state record inside the advertisement payload: acid, the global
