@@ -2790,6 +2790,9 @@ def _activity_push_lock(
     already primed and a lock status change has marked it for a drain.
     """
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:ff", always_connected=False)
+    received: list[LockActivity | DoorActivity] = []
+    # Registered before the lock is up, so no priming update is armed here.
+    push_lock.register_activity_callback(received.append)
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
     push_lock._advertisement_data = _advertisement({})
@@ -2806,8 +2809,6 @@ def _activity_push_lock(
 
     mock_lock = MagicMock()
     mock_lock.drain_lock_activity = MagicMock(side_effect=drain_lock_activity)
-    received: list[LockActivity | DoorActivity] = []
-    push_lock.register_activity_callback(received.append)
     if primed:
         push_lock._activity_primed = True
         push_lock._update_any_state([LockStatus.UNLOCKED])
@@ -3005,6 +3006,18 @@ async def test_activity_drain_backs_off_after_repeated_failures(
     assert drain.call_count == strikes + 1
     assert push_lock._activity_primed is True
     assert received == []
+
+
+@pytest.mark.asyncio
+async def test_registering_after_the_first_update_arms_the_priming_update() -> None:
+    """A callback registered on a lock already up primes soon, not on an event."""
+    push_lock, _, _ = _activity_push_lock([])
+    push_lock._activity_callbacks.clear()
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
+        push_lock.register_activity_callback(lambda _: None)
+        push_lock.register_activity_callback(lambda _: None)
+    schedule.assert_called_once_with(ACTIVITY_PRIME_DELAY)
+    assert push_lock._activity_primed is False
 
 
 @pytest.mark.asyncio

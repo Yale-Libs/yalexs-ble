@@ -507,6 +507,9 @@ class PushLock:
             # The first registration primes, so the backlog is not delivered as new.
             self._activity_primed = False
             self._activity_drain_pending = True
+            if self._running and self._lock_info is not None:
+                # Past the first update, so nothing else would prime soon.
+                self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
         self._activity_callbacks.append(callback)
 
         def unregister_activity_callback() -> None:
