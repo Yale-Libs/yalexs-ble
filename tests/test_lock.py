@@ -2179,7 +2179,7 @@ def test_operation_failed_error_survives_being_copied() -> None:
 def test_operation_errors_are_reachable_from_the_package_root(
     error_type: type[Exception],
 ) -> None:
-    """Each type a caller has to catch is exported from the package root."""
+    """UnlatchError and OperationFailedError are exported from the package root."""
     assert getattr(yalexs_ble, error_type.__name__) is error_type
     assert error_type.__name__ in yalexs_ble.__all__
 
@@ -2188,7 +2188,10 @@ def test_operation_errors_are_reachable_from_the_package_root(
 async def test_force_lock_failure_op_response_raises_operation_failed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A failure op-response raises OperationFailedError and logs at DEBUG."""
+    """A mechanical failure after write-success raises OperationFailedError.
+
+    The frame logs at DEBUG and the awaited opcode is cleared at the exit.
+    """
     lock = _make_connected_lock_with_session()
     session = lock.session
     assert session is not None
