@@ -4188,7 +4188,7 @@ async def test_unlatch_error_before_write_success_leaves_the_position_unknown():
 async def test_a_failed_unlatch_under_a_hold_displays_by_the_write(
     write_succeeds: bool, issued_after: float, expected: LockStatus
 ) -> None:
-    """A held jam survives an unlatch the lock never got, or one under precedence."""
+    """A held jam survives an unlatch with no write-success, or one under precedence."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:69")
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
 
@@ -5456,7 +5456,7 @@ async def test_a_new_operation_writes_through_a_live_jam_hold(
 async def test_the_locks_answer_releases_the_hold_when_the_write_then_fails(
     report: list[str], issued_after: float, displayed: LockStatus, hold_stands: bool
 ) -> None:
-    """The lock's answer releases a live hold when the write call then fails."""
+    """The answer releases the hold if the write fails and no jam takes precedence."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:75")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     lock, session, client = _lock_on_a_real_session(push_lock)
@@ -6404,7 +6404,7 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
 async def test_every_operation_exit_owes_the_status_poll(
     error: Exception | None, jam: bool, delay: float | None
 ) -> None:
-    """The exit schedules the status poll; the display and the link set its delay."""
+    """Every exit owes the status poll; under a live hold it schedules nothing."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:44")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
@@ -6709,7 +6709,6 @@ async def test_an_admitted_jam_arms_the_timer_and_the_holds_end_polls_the_lock()
     # The hold's timer is all the jam arms; no update cycle is armed.
     assert push_lock._cancel_deferred_update is None
 
-    # Fire the timer by hand past the deadline, cancelling the armed handle.
     push_lock._cancel_jam_hold_timer()
     with (
         patch("yalexs_ble.push.time.monotonic", return_value=1031.0),
@@ -6946,7 +6945,7 @@ def _carrier_defaults() -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_a_teardown_returns_every_cross_operation_carrier_to_its_initial_value():
-    """Nothing an operation or the watcher recorded survives into the next operation."""
+    """Cross-operation carriers return to default at a stopped exit and at a stop."""
     defaults = _carrier_defaults()
     carriers = {
         name: value
@@ -7003,7 +7002,6 @@ async def test_the_hold_does_not_keep_the_link_up_on_a_demand_lock():
 
     with patch("yalexs_ble.push.time.monotonic", return_value=1000.0):
         push_lock._update_any_state([LockStatus.JAMMED])
-    # Drop the resync the status change armed; it is not the subject here.
     push_lock._cancel_future_update()
 
     # A reading masked mid-hold schedules nothing into the deferred-update slot.
@@ -7076,13 +7074,11 @@ async def test_a_settle_after_the_deadline_clears_a_repeated_jam() -> None:
         push_lock._update_any_state([LockStatus.JAMMED])
         assert push_lock._jammed_hold_deadline == 1000.0 + JAMMED_HOLD_TIME
 
-    # Identical value: no display change and no new deadline.
     with patch("yalexs_ble.push.time.monotonic", return_value=1020.0):
         push_lock._update_any_state([LockStatus.JAMMED])
         assert push_lock.lock_status is LockStatus.JAMMED
         assert push_lock._jammed_hold_deadline == 1000.0 + JAMMED_HOLD_TIME
 
-    # Inside the hold the settle is refused.
     with patch("yalexs_ble.push.time.monotonic", return_value=1025.0):
         push_lock._update_any_state([LockStatus.LOCKED])
         assert push_lock.lock_status is LockStatus.JAMMED
@@ -7242,7 +7238,6 @@ async def test_a_setup_condition_arms_the_hold_and_pins_the_display(
     assert push_lock.lock_status is setup_condition
     assert push_lock._jammed_hold_deadline >= before + JAMMED_HOLD_TIME
 
-    # A plain position arriving inside the hold does not displace it.
     push_lock._state_callback([LockStatus.LOCKED])
     assert push_lock.lock_status is setup_condition
 

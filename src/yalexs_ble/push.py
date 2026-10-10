@@ -954,7 +954,11 @@ class PushLock:
         self._operation_window_open = False
 
     def _finalize_operation(self) -> None:
-        """Close the operation window, display the outcome, schedule the next poll."""
+        """Close the operation window, display the outcome, schedule the next poll.
+
+        A live hold polls at its own deadline, so under one the exit schedules
+        only the reconnect an always-connected lock owes.
+        """
         self._operation_in_flight = False
         # The op-response decided the display when it arrived; the exit
         # decides it only for an operation that ended without one.
@@ -1020,7 +1024,11 @@ class PushLock:
         self._jam_hold_timer: asyncio.TimerHandle | None = None
 
     def _arm_jam_hold(self, now: float) -> None:
-        """Set the hold deadline and arm the timer that ends the hold."""
+        """Set the hold deadline and arm the timer that ends the hold.
+
+        The two are written as a pair, so a live deadline always has a timer
+        coming to end it.
+        """
         self._jammed_hold_deadline = now + JAMMED_HOLD_TIME
         self._schedule_jam_hold_timer(JAMMED_HOLD_TIME)
 
@@ -1057,7 +1065,8 @@ class PushLock:
         """Decide the displayed lock status for an incoming value.
 
         Every incoming lock status, polled or pushed, must pass through
-        here. None refuses the value, so nothing from it is applied.
+        here. None refuses the value, so nothing from it is applied; current
+        is the status on display, which the hold reads.
         """
         now = time.monotonic()
         if incoming in MANUAL_INTERVENTION_STATUSES:
@@ -1086,7 +1095,7 @@ class PushLock:
                 self._arm_jam_hold(now)
             return incoming
         if current in MANUAL_INTERVENTION_STATUSES and now < self._jammed_hold_deadline:
-            # Polls after a jam report a position the mechanism is not in.
+            # Polls after a jam may report a position the mechanism is not in.
             _LOGGER.debug(
                 "%s: Holding %s, not accepting lock status %s",
                 self.name,
