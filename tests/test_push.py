@@ -7125,6 +7125,31 @@ async def test_admit_lock_status_poll_path_refuses_and_arms_on_transition() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "reading",
+    [LockStatus.LOCKING, LockStatus.UNLOCKING, LockStatus.UNLATCHING],
+    ids=["locking", "unlocking", "unlatching"],
+)
+async def test_a_transitional_reported_under_the_hold_is_refused(
+    reading: LockStatus,
+) -> None:
+    """A transitional reported while the hold runs is refused, as a position is."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:f2")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    with _patched_clock() as clock:
+        start = clock[0]
+        push_lock._update_any_state([LockStatus.JAMMED])
+        clock[0] = start + 10.0
+        push_lock._update_any_state([reading])
+        held_after_transitional = push_lock.lock_status
+        push_lock._update_any_state([LockStatus.UNLOCKED])
+    assert held_after_transitional is LockStatus.JAMMED
+    assert push_lock.lock_status is LockStatus.JAMMED
+    push_lock._cancel_jam_hold_timer()
+    push_lock._cancel_future_update()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("issued_after", "released", "displayed"),
     [(6.0, True, LockStatus.LOCKING), (3.0, False, LockStatus.JAMMED)],
     ids=["after-the-precedence-time", "within-the-precedence-time"],
