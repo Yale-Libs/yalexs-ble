@@ -491,12 +491,11 @@ class Lock:
             FIRMWARE_REVISION_CHARACTERISTIC,
         )
         results: dict[str, str] = {}
-        # A transient timeout here must not stand: an empty model reads as no
-        # door sense support, and the consumer caches the result. Retry once
-        # only; the probe runs inside the first update, which setup waits on,
-        # so the worst case has to stay bounded.
+        # Retried once: an empty model reads as no door sense, and the
+        # consumer caches the result.
         missing: set[str] = set()
         for attempt in range(1, LOCK_INFO_ATTEMPTS + 1):
+            timed_out = False
             try:
                 async with util.asyncio_timeout(LOCK_INFO_TIMEOUT):
                     for char_uuid in char_uuids:
@@ -527,21 +526,27 @@ class Lock:
                                 err,
                             )
             except TimeoutError:
-                if attempt == LOCK_INFO_ATTEMPTS:
-                    _LOGGER.warning(
-                        "%s: Timeout reading lock info, using %d partial results",
-                        self.name,
-                        len(results),
-                    )
-                else:
-                    _LOGGER.debug(
-                        "%s: Timeout reading lock info with %d partial results, "
-                        "retrying",
-                        self.name,
-                        len(results),
-                    )
-            else:
+                timed_out = True
+            model_known = (
+                MODEL_NUMBER_CHARACTERISTIC in results
+                or MODEL_NUMBER_CHARACTERISTIC in missing
+            )
+            if model_known and not timed_out:
                 break
+            if attempt == LOCK_INFO_ATTEMPTS:
+                _LOGGER.warning(
+                    "%s: Lock info incomplete after %d attempts, using %d partial "
+                    "results",
+                    self.name,
+                    attempt,
+                    len(results),
+                )
+            else:
+                _LOGGER.debug(
+                    "%s: Lock info incomplete with %d partial results, retrying",
+                    self.name,
+                    len(results),
+                )
         # Use the BLE address as fallback serial to keep devices unique
         # in Home Assistant when the characteristic read fails.
         serial_fallback = self.ble_device_callback().address

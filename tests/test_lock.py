@@ -774,11 +774,7 @@ async def test_lock_info_timeout() -> None:
 
 @pytest.mark.asyncio
 async def test_lock_info_timeout_retries_once_then_succeeds() -> None:
-    """A transient timeout on the first pass is retried and recovers.
-
-    An empty model reads as no door sense support and the consumer caches
-    the result, so a single slow read must not stand.
-    """
+    """A transient timeout on the first pass is retried and recovers."""
     lock, mock_client = _make_lock_with_mock_client()
     original_read = mock_client.read_gatt_char
     calls = 0
@@ -801,6 +797,26 @@ async def test_lock_info_timeout_retries_once_then_succeeds() -> None:
         serial="12345",
         firmware="2.0.0",
     )
+
+
+@pytest.mark.asyncio
+async def test_lock_info_model_read_error_is_retried() -> None:
+    """A model read that fails outright, not only one that hangs, gets the retry."""
+    lock, mock_client = _make_lock_with_mock_client()
+    original_read = mock_client.read_gatt_char
+    calls = 0
+
+    async def fail_first_call(char: MagicMock) -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise BleakError("Operation already in progress")
+        return await original_read(char)
+
+    mock_client.read_gatt_char = fail_first_call
+    info = await lock.lock_info()
+    assert info.model == "ASL-03"
+    assert calls == 4
 
 
 @pytest.mark.asyncio
@@ -865,8 +881,7 @@ async def test_lock_info_timeout_on_both_attempts_falls_back(
     warnings = [
         record
         for record in caplog.records
-        if record.levelname == "WARNING"
-        and "Timeout reading lock info" in record.message
+        if record.levelname == "WARNING" and "Lock info incomplete" in record.message
     ]
     assert len(warnings) == 1
 
