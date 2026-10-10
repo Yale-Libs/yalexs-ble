@@ -38,6 +38,7 @@ from .const import (
     LockState,
     LockStateValue,
     LockStatus,
+    OperationError,
 )
 from .lock import ActivityLogOverrunError, Lock
 from .session import (
@@ -119,6 +120,9 @@ SLOW_TIMEOUT = 600  # 6000ms (spec minimum here is (1 + 16) * 30ms * 2 = 1020ms)
 
 # How long to wait to query the lock after an operation to make sure its not jammed
 POST_OPERATION_SYNC_TIME = 10.00
+
+# How long to wait before re-checking while an operation holds the lock.
+OPERATION_IN_PROGRESS_DEFER_SECONDS = 1.0
 
 # How long to wait if we get an update storm from the lock
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
@@ -796,9 +800,11 @@ class PushLock:
         try:
             lock = await self._ensure_connected()
             self._cancel_future_update()
-            await getattr(lock, op_attr)()
+            result = await getattr(lock, op_attr)()
         except Exception as ex:
             self._update_any_state([LockStatus.UNKNOWN])
+            # Anchor the stale-state debounce on failures too.
+            self._last_lock_operation_complete_time = time.monotonic()
             # The retry_bluetooth_connection_error wrapper calls
             # _async_handle_disconnected for RETRY_EXCEPTIONS /
             # RETRY_BACKOFF_EXCEPTIONS only; AuthError, BleakNotFoundError and
@@ -809,8 +815,12 @@ class PushLock:
                 ex,
             )
             raise
-        self._update_any_state([complete_state])
-        _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        if result == OperationError.COMM_SUCCESS:
+            self._update_any_state([complete_state])
+            _LOGGER.debug("%s: Finished %s", self.name, complete_state)
+        else:
+            # The failure op-response already published JAMMED; it stays on display.
+            _LOGGER.debug("%s: %s reported failure 0x%02X", self.name, op_attr, result)
         now = time.monotonic()
         self._last_lock_operation_complete_time = now
         self._complete_operation(now)
@@ -1706,6 +1716,17 @@ class PushLock:
         ) < LOCK_STALE_STATE_DEBOUNCE_DELAY:
             _LOGGER.debug("%s: Rescheduling update to avoid stale state", self.name)
             self._schedule_future_update_with_debounce(seconds_time_lock_op)
+            return
+        if self._operation_lock.locked():
+            # The debounce ignores a still-running operation; a cycle queued
+            # now would read stale state the moment it ends.
+            _LOGGER.debug(
+                "%s: Rescheduling update until the operation lock is released",
+                self.name,
+            )
+            self._schedule_future_update_with_debounce(
+                OPERATION_IN_PROGRESS_DEFER_SECONDS
+            )
             return
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 

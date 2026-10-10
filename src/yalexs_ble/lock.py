@@ -45,9 +45,11 @@ from .const import (
 )
 from .secure_session import SecureSession
 from .session import (
+    OPERATION_RESPONSE_TIMEOUT,
     AuthError,
     DisconnectedError,
     KeycodeError,
+    OperationProgress,
     ResponseError,
     Session,
     YaleXSBLEError,
@@ -60,6 +62,9 @@ LOCK_INFO_ATTEMPTS = 2
 
 # Upper bound on the records read in one drain of the activity log
 MAX_ACTIVITY_RECORDS = 32
+
+# Operation byte (byte[4]) that makes a Lock command securemode.
+SECUREMODE_OPERATION_BYTE = 0x04
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -275,11 +280,6 @@ class Lock:
         self._lock_info = info
         self.client: BleakClientWithServiceCache | None = None
         self._state_callback = state_callback
-        # byte[15] of the most recent op-response: 0x00 success, non-zero =
-        # OperationError enum value (MECH_* = jam). None until the first op.
-        # Retained so a follow-up can expose the failure reason as a
-        # diagnostic.
-        self._last_op_error: int | None = None
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
@@ -379,7 +379,6 @@ class Lock:
                 and len(state) > RESULT_BYTE
             ):
                 result = state[RESULT_BYTE]
-                self._last_op_error = result
                 if result != OperationError.COMM_SUCCESS:
                     error = VALUE_TO_OPERATION_ERROR.get(result)
                     _LOGGER.warning(
@@ -406,10 +405,8 @@ class Lock:
                 if state[4] == SettingType.AUTOLOCK.value:
                     return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
-            if state[1] == Commands.UNLOCK.value:
-                return [LockStatus.UNLOCKED]
-            if state[1] == Commands.LOCK.value:
-                return [LockStatus.LOCKED]
+            if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
+                return ()  # Operation ack; state arrives in the 0xBB op-response
             if state[1] in (
                 Commands.READSETTING.value,
                 Commands.WRITESETTING.value,
@@ -558,36 +555,42 @@ class Lock:
         )
         return self._lock_info
 
-    @raise_if_not_connected
-    async def force_securemode(self) -> None:
-        """Force the lock into securemode."""
-        _LOGGER.debug("%s: Securing", self.name)
+    async def _execute_operation(
+        self, opcode: int, operation_byte: int, command_name: str
+    ) -> int:
+        """Run a mechanical operation; return the result code the lock reported."""
         assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_operation_command(Commands.LOCK, 0x04),
-            "force_securemode",
+        _LOGGER.debug("%s: Executing %s", self.name, command_name)
+        response = await self.session.execute_operation(
+            self.session.build_operation_command(opcode, operation_byte),
+            command_name,
+            ack_matcher=_ack_matcher(opcode, operation_byte),
+            response_matcher=_operation_response_matcher(opcode),
+            response_timeout=OPERATION_RESPONSE_TIMEOUT,
+            progress=OperationProgress(),
         )
-        _LOGGER.debug("%s: Finished securemode", self.name)
+        result = response[RESULT_BYTE]
+        _LOGGER.debug(
+            "%s: Finished %s (result 0x%02X)", self.name, command_name, result
+        )
+        return result
 
     @raise_if_not_connected
-    async def force_lock(self) -> None:
-        """Force the lock to lock."""
-        _LOGGER.debug("%s: Locking", self.name)
-        assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.LOCK), "force_lock"
+    async def force_securemode(self) -> int:
+        """Force the lock into securemode; returns the lock's result code."""
+        return await self._execute_operation(
+            Commands.LOCK, SECUREMODE_OPERATION_BYTE, "force_securemode"
         )
-        _LOGGER.debug("%s: Finished locking", self.name)
 
     @raise_if_not_connected
-    async def force_unlock(self) -> None:
-        """Force the lock to unlock."""
-        _LOGGER.debug("%s: Unlocking", self.name)
-        assert self.session is not None  # nosec
-        await self.session.execute(
-            self.session.build_command(Commands.UNLOCK), "force_unlock"
-        )
-        _LOGGER.debug("%s: Finished unlocking", self.name)
+    async def force_lock(self) -> int:
+        """Force the lock to lock; returns the lock's result code."""
+        return await self._execute_operation(Commands.LOCK, 0x00, "force_lock")
+
+    @raise_if_not_connected
+    async def force_unlock(self) -> int:
+        """Force the lock to unlock; returns the lock's result code."""
+        return await self._execute_operation(Commands.UNLOCK, 0x00, "force_unlock")
 
     @raise_if_not_connected
     async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:

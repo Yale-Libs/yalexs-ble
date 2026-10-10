@@ -25,6 +25,7 @@ from yalexs_ble.const import (
     LockOperationSource,
     LockState,
     LockStatus,
+    OperationError,
 )
 from yalexs_ble.lock import ActivityLogOverrunError, Lock
 from yalexs_ble.push import (
@@ -43,8 +44,10 @@ from yalexs_ble.push import (
     BATTERY_TIMEOUT_COOLDOWN,
     DEFAULT_ATTEMPTS,
     HAP_FIRST_BYTE,
+    LOCK_STALE_STATE_DEBOUNCE_DELAY,
     NEVER_TIME,
     NO_BATTERY_SUPPORT_MODELS,
+    OPERATION_IN_PROGRESS_DEFER_SECONDS,
     RECONNECT_BACKOFF_TIME,
     SLOW_LATENCY,
     SLOW_MAX_INTERVAL,
@@ -59,6 +62,7 @@ from yalexs_ble.session import (
     AuthError,
     DisconnectedError,
     KeycodeError,
+    OperationIncompleteError,
     ResponseError,
 )
 
@@ -3389,3 +3393,96 @@ async def test_activity_priming_failure_retries_priming() -> None:
     await _run_update(push_lock, mock_lock)
     assert received == []
     assert push_lock._activity_primed is True
+
+
+# ---------------------------------------------------------------------------
+# Lock operations completed by their own op-response
+# ---------------------------------------------------------------------------
+
+
+def _operational_push_lock(address: str = "aa:bb:cc:dd:ee:50") -> PushLock:
+    """A running lock with lock_info and advertisement data, ready to operate."""
+    push_lock = _named_push_lock(address, always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+    return push_lock
+
+
+async def _run_lock(push_lock: PushLock, force_lock: AsyncMock) -> None:
+    """Run push_lock.lock() against a mock Lock whose force_lock is given."""
+    mock_lock = MagicMock(force_lock=force_lock)
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        await push_lock.lock()
+    force_lock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_lock_operation_success_stamps_complete_state() -> None:
+    """A force_* that reports success advances the state to the completed status."""
+    push_lock = _operational_push_lock()
+    await _run_lock(push_lock, AsyncMock(return_value=OperationError.COMM_SUCCESS))
+    assert push_lock.lock_status == LockStatus.LOCKED
+
+
+@pytest.mark.asyncio
+async def test_a_reported_operation_failure_leaves_jammed_on_display(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failure op-response's JAMMED stays on display and is logged as a failure."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:37")
+
+    async def _force_lock_jams() -> int:
+        # The parser publishes JAMMED from the op-response before force_* returns.
+        push_lock._state_callback([LockStatus.JAMMED])
+        return OperationError.MECH_POSITION
+
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        await _run_lock(push_lock, AsyncMock(side_effect=_force_lock_jams))
+    assert push_lock.lock_status == LockStatus.JAMMED
+    assert "force_lock reported failure 0x1F" in caplog.text
+    assert "Finished" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_failed_operation_anchors_the_stale_state_debounce() -> None:
+    """A failed force_* holds the next cycle off as a completed one does."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
+    with pytest.raises(OperationIncompleteError):
+        await _run_lock(
+            push_lock, AsyncMock(side_effect=OperationIncompleteError("no op-response"))
+        )
+    assert push_lock.lock_status == LockStatus.UNKNOWN
+
+    with patch.object(
+        push_lock, "_schedule_future_update_with_debounce"
+    ) as mock_reschedule:
+        push_lock._deferred_update()
+
+    assert push_lock._update_task is None
+    (delay,) = mock_reschedule.call_args.args
+    assert delay < LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+@pytest.mark.asyncio
+async def test_deferred_update_backs_off_while_an_operation_holds_the_lock() -> None:
+    """A cycle falling due mid-operation backs off rather than queueing."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:38")
+    # The previous operation's anchor is old enough that the debounce passes.
+    push_lock._last_lock_operation_complete_time = (
+        time.monotonic() - LOCK_STALE_STATE_DEBOUNCE_DELAY - 1
+    )
+
+    await push_lock._operation_lock.acquire()
+    try:
+        with patch.object(
+            push_lock, "_schedule_future_update_with_debounce"
+        ) as mock_reschedule:
+            push_lock._deferred_update()
+    finally:
+        push_lock._operation_lock.release()
+
+    assert push_lock._update_task is None
+    mock_reschedule.assert_called_once_with(OPERATION_IN_PROGRESS_DEFER_SECONDS)
