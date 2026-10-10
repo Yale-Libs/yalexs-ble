@@ -3489,7 +3489,7 @@ async def test_execute_lock_operation_success_stamps_complete_state(
 async def test_a_failure_op_response_displays_jammed_inside_the_window(
     method: str, op_attr: str, transitional: LockStatus
 ) -> None:
-    """A mid-window failure JAMMED is applied after the window and the error raised."""
+    """A failure JAMMED fed inside the window is displayed and the error is raised."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:2b")
     events: list[LockStatus] = []
 
