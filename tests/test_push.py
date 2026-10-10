@@ -4043,7 +4043,7 @@ async def test_nonretryable_after_write_stamps_unknown(exc, op_attr, operation):
 
 @pytest.mark.asyncio
 async def test_unlatch_error_before_write_success_leaves_the_position_unknown():
-    """An UnlatchError with no window open leaves the position unknown."""
+    """An UnlatchError before write-success closes the window and leaves UNKNOWN."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
 

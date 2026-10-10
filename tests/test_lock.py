@@ -1633,7 +1633,7 @@ def test_parse_operation_ack_reports_no_state(
 async def test_force_operations_complete_on_ack_then_op_response(
     op_attr: str, opcode: int, ack: bytes
 ) -> None:
-    """Each force_* completes on its own ack then op-response, after write-success."""
+    """Each force_* sees write-success, matches its ack, and completes on the result."""
     lock = _make_connected_lock_with_session()
     events = await _drive_operation(lock, op_attr, opcode, ack)
     assert events == ["write_success", "ack", "result True", "op_response"]
@@ -1756,7 +1756,7 @@ async def test_public_unlatch_wrapper_runs_force_unlatch() -> None:
         await lock.unlatch()
     await feeder
 
-    # A wrapper wired to force_unlock would build through build_command instead.
+    # A wrapper wired to force_unlock would build with operation byte 0x00.
     built.assert_called_once_with(Commands.UNLOCK, UNLATCH_OPERATION_BYTE)
 
 
@@ -1807,7 +1807,7 @@ async def test_force_unlatch_passes_its_own_op_response_budget(
 
 @pytest.mark.asyncio
 async def test_every_operation_runs_with_its_op_response_budget() -> None:
-    """Only the unlatch runs with its own op-response budget."""
+    """Each force_* reaches _execute_operation with its op-response budget."""
     lock = _make_lock()
     lock.session = MagicMock()
     lock.secure_session = MagicMock()
@@ -1952,7 +1952,6 @@ async def test_force_unlatch_failure_after_write_converts_to_unlatch_error() -> 
     lock._execute_operation = _fail  # type: ignore[method-assign]
     with pytest.raises(UnlatchError) as excinfo:
         await lock.force_unlatch()
-    # The originating error is preserved as the cause.
     assert isinstance(excinfo.value.__cause__, TimeoutError)
 
 
@@ -1981,7 +1980,6 @@ async def test_force_unlatch_errored_write_converts_to_unlatch_error() -> None:
     lock._execute_operation = _fail  # type: ignore[method-assign]
     with pytest.raises(UnlatchError) as excinfo:
         await lock.force_unlatch()
-    # The originating error is preserved as the cause.
     assert isinstance(excinfo.value.__cause__, BleakError)
 
 
