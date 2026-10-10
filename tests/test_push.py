@@ -5432,7 +5432,7 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
     ],
     ids=["success", "no-result", "jam-ends-the-ladder"],
 )
-async def test_every_operation_exit_schedules_the_status_poll(
+async def test_every_operation_exit_owes_the_status_poll(
     error: Exception | None, jam: bool, delay: float
 ) -> None:
     """The exit schedules the status poll; the display and the link set its delay."""
