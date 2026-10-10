@@ -1225,8 +1225,6 @@ class PushLock:
 
     async def _set_auto_lock_or_warn(self, mode: AutoLockMode, duration: int) -> None:
         """Set auto lock, surfacing a write the lock never confirmed."""
-        if duration not in self.auto_lock_durations:
-            raise ValueError(f"Invalid auto lock duration: {duration}")
         try:
             await self._set_auto_lock(mode, duration)
         except TimeoutError as err:
@@ -1239,10 +1237,6 @@ class PushLock:
             raise TimeoutError(
                 f"{self.name}: Lock did not confirm the auto lock setting write"
             ) from err
-        finally:
-            if self._running:
-                # Carries any poll the attempts cancelled and reads the new value back.
-                self._schedule_future_update_with_debounce(0)
 
     @retry_bluetooth_connection_error(attempts=AUTO_LOCK_WRITE_ATTEMPTS)
     async def _set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
@@ -1251,6 +1245,9 @@ class PushLock:
             raise RuntimeError(
                 f"{self.name}: Set auto lock operation not possible because not running"
             )
+        # Duration validation
+        if duration not in self.auto_lock_durations:
+            raise ValueError(f"Invalid auto lock duration: {duration}")
         # Unlike lock/unlock/securemode, this path does not optimistically mutate
         # _lock_state.auto_lock, so there is no prior value to restore on failure.
         # Notify callbacks or the next poll surface the authoritative state.
