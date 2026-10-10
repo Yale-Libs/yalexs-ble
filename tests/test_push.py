@@ -4644,7 +4644,7 @@ async def test_a_retryable_failure_under_precedence_ends_the_attempts(
         with pytest.raises(OperationIncompleteError) as raised:
             await push_lock.lock()
 
-    assert attempts == 1  # the command was written once, and not again
+    assert attempts == 1
     assert push_lock.lock_status == LockStatus.JAMMED
     assert push_lock._operation_window_open is False
     assert repr(error) in str(raised.value)
@@ -7429,8 +7429,7 @@ async def test_a_cycle_due_mid_operation_keeps_the_operations_outcome() -> None:
                 break
         assert push_lock._operation_lock.locked()
 
-        # The keep-alive falls due mid-operation: _keep_alive schedules the
-        # update, and _deferred_update is where it lands.
+        # A cycle falling due mid-operation calls _deferred_update.
         push_lock._deferred_update()
         assert push_lock._update_task is None
         handle = push_lock._cancel_deferred_update
@@ -7442,7 +7441,6 @@ async def test_a_cycle_due_mid_operation_keeps_the_operations_outcome() -> None:
         gate.set()
         await op
 
-    # The operation's own outcome is what the display carries.
     assert push_lock.lock_status == LockStatus.UNLATCHED
     handle = push_lock._cancel_deferred_update
     assert handle is not None

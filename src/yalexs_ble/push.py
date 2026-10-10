@@ -1079,8 +1079,9 @@ class PushLock:
         """Decide the displayed lock status for an incoming value.
 
         Every incoming lock status, polled or pushed, must pass through
-        here. None refuses the value, so nothing from it is applied. A
-        transitional value holds the next poll off before any of that.
+        here. None refuses the value, so nothing from it is applied; current
+        is the status on display, which the hold reads. A transitional value
+        holds the next poll off before any of that.
         """
         if incoming in TRANSITIONAL_READINGS:
             # A lock polled mid-motion answers with the position it is leaving.
