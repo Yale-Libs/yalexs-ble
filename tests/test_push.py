@@ -3523,6 +3523,15 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
             ],
         ),
         (
+            (LockStatus.SECUREMODE, LockStatus.LOCKED),
+            "lock",
+            "force_lock",
+            [
+                (LockStatus.LOCKING, LockStatus.UNLOCKED),
+                (LockStatus.LOCKED, LockStatus.UNLOCKED),
+            ],
+        ),
+        (
             (LockStatus.LOCKED, LockStatus.UNLOCKED),
             "securemode",
             "force_securemode",
@@ -3570,6 +3579,7 @@ async def test_securemode_forges_securing_and_neither_lock_flaps() -> None:
     ],
     ids=[
         "lock_unlocked_to_locked",
+        "lock_secured_to_locked",
         "securemode_locked_to_secured",
         "securemode_unlocked_to_secured",
         "securemode_already_secured_moves_only_secure",
