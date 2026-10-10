@@ -1184,12 +1184,10 @@ async def test_disconnected_callback_schedules_reconnect_when_always_connected()
     push_lock._name = "Test Lock"
     _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
 
-    with patch.object(
-        push_lock, "_schedule_future_update_with_debounce"
-    ) as mock_keep_alive:
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
         push_lock._disconnected_callback()
 
-    mock_keep_alive.assert_called_once()
+    schedule.assert_called_once_with(0.0)
 
 
 @pytest.mark.asyncio
@@ -1208,9 +1206,9 @@ async def test_disconnected_callback_skips_reconnect_after_auth_failures() -> No
     try:
         with patch.object(
             push_lock, "_schedule_future_update_with_debounce"
-        ) as mock_keep_alive:
+        ) as schedule:
             push_lock._disconnected_callback()
-        mock_keep_alive.assert_not_called()
+        schedule.assert_not_called()
     finally:
         _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
 
@@ -1226,12 +1224,10 @@ async def test_disconnected_callback_noop_when_not_always_connected() -> None:
     )
     push_lock._name = "Test Lock"
 
-    with patch.object(
-        push_lock, "_schedule_future_update_with_debounce"
-    ) as mock_keep_alive:
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
         push_lock._disconnected_callback()
 
-    mock_keep_alive.assert_not_called()
+    schedule.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2822,6 +2818,30 @@ async def test_every_update_failure_counts_and_paces_the_reconnect(
 
 
 @pytest.mark.asyncio
+async def test_auth_failures_below_the_latch_still_count_as_failed_updates() -> None:
+    """Exhausted auth retries below the re-auth latch fail the update and pace it."""
+    push_lock = _backoff_lock("aa:bb:cc:dd:ee:52")
+    _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+    try:
+        with (
+            patch.object(
+                push_lock, "_ensure_connected", AsyncMock(side_effect=AuthError("x"))
+            ),
+            patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+            patch.object(
+                push_lock, "_schedule_future_update_with_debounce"
+            ) as schedule,
+        ):
+            await push_lock._execute_deferred_update()
+        assert push_lock._reconnect_backoff == RECONNECT_BACKOFF_TIME
+        schedule.assert_called_once_with(RECONNECT_BACKOFF_TIME)
+        assert not _AUTH_FAILURE_HISTORY.should_raise(push_lock.address)
+        assert push_lock.auth != AuthState(successful=False)
+    finally:
+        _AUTH_FAILURE_HISTORY.auth_success(push_lock.address)
+
+
+@pytest.mark.asyncio
 async def test_a_failed_update_does_not_reconnect_when_not_always_connected() -> None:
     """Only an always-connected lock reconnects on its own after a failure."""
     push_lock = _backoff_lock("aa:bb:cc:dd:ee:4f", always_connected=False)
@@ -2889,11 +2909,13 @@ async def test_deferred_update_success_clears_backoff(
     assert schedule.call_args_list == scheduled
 
 
+@pytest.mark.parametrize("connected", [True, False])
 @pytest.mark.asyncio
-async def test_deferred_update_cancel_is_not_a_failure() -> None:
-    """Cancelling an update is this library's doing, so it does not count."""
+async def test_deferred_update_cancel_is_not_a_failure(connected: bool) -> None:
+    """A cancel does not count, but a link lost under it still gets its reconnect."""
     push_lock = _backoff_lock("aa:bb:cc:dd:ee:45")
     push_lock._reconnect_backoff = 4.0
+    push_lock._client = MagicMock(is_connected=connected)
     with (
         patch.object(push_lock, "_update", side_effect=asyncio.CancelledError),
         patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
@@ -2901,7 +2923,7 @@ async def test_deferred_update_cancel_is_not_a_failure() -> None:
     ):
         await push_lock._execute_deferred_update()
     assert push_lock._reconnect_backoff == 4.0
-    schedule.assert_not_called()
+    assert schedule.call_args_list == ([] if connected else [call(4.0)])
 
 
 @pytest.mark.asyncio

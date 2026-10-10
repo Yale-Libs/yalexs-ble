@@ -253,11 +253,13 @@ def retry_bluetooth_connection_error(
     ) -> Any:
         _LOGGER.debug("%s: Starting retry loop", self.name)
         max_attempts = attempts - 1
+        auth_error: AuthError | None = None
 
         for attempt in range(attempts):
             try:
                 return await func(self, *args, **kwargs)
-            except AuthError:
+            except AuthError as err:
+                auth_error = err
                 _AUTH_FAILURE_HISTORY.auth_failed(self.address)
                 if _AUTH_FAILURE_HISTORY.should_raise(self.address):
                     # If the bluetooth connection drops in the middle of authentication
@@ -309,7 +311,9 @@ def retry_bluetooth_connection_error(
                 )
                 if backoff:
                     await asyncio.sleep(backoff)
-        return None
+        # Below the re-auth latch an auth failure is read as a link dropped
+        # mid-authentication, so the exhausted attempts fail as a disconnect.
+        raise DisconnectedError(str(auth_error)) from auth_error
 
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
@@ -317,7 +321,7 @@ def retry_bluetooth_connection_error(
 class PushLock:
     """A lock with push updates."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         local_name: str | None = None,
         address: str | None = None,
@@ -376,9 +380,8 @@ class PushLock:
         self._next_disconnect_delay = idle_disconnect_delay
         self._first_update_future: asyncio.Future[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
-        self._last_lock_operation_complete_time = self._last_operation_complete_time = (
-            NEVER_TIME
-        )
+        self._last_lock_operation_complete_time = NEVER_TIME
+        self._last_operation_complete_time = NEVER_TIME
         self._reconnect_backoff = 0.0
         self._always_connected = always_connected
         self._slow_params_set = False
@@ -1721,6 +1724,7 @@ class PushLock:
             return
         _LOGGER.debug("%s: Starting deferred update", self.name)
         failed = True
+        cancelled = False
         try:
             await self._update()
             failed = False
@@ -1732,8 +1736,7 @@ class PushLock:
                 self.name,
             )
         except asyncio.CancelledError:
-            # This library giving up, not the lock failing; the re-raise
-            # skips the failure accounting below.
+            cancelled = True  # this library giving up, not the lock failing
             self._set_update_state(RuntimeError("Update was canceled"))
             _LOGGER.debug("%s: In-progress update canceled", self.name)
             raise
@@ -1760,16 +1763,22 @@ class PushLock:
             wrapped_exc.__cause__ = ex
             self._set_update_state(wrapped_exc)
             _LOGGER.exception("%s: Unknown error updating", self.name)
-        if failed:
-            self._reconnect_backoff = min(
-                MAX_RECONNECT_BACKOFF_TIME,
-                self._reconnect_backoff * 2 or RECONNECT_BACKOFF_TIME,
-            )
-        else:
+        finally:
+            if not cancelled:
+                self._record_update_outcome(failed)
+            if not self.is_connected:
+                # The disconnect callback stood down while this update ran.
+                self._schedule_reconnect()
+
+    def _record_update_outcome(self, failed: bool) -> None:
+        """Double the reconnect backoff on a failed update; clear it on success."""
+        if not failed:
             self._clear_reconnect_backoff()
-        if not self.is_connected:
-            # The disconnect callback stood down while this update ran.
-            self._schedule_reconnect()
+            return
+        self._reconnect_backoff = min(
+            MAX_RECONNECT_BACKOFF_TIME,
+            self._reconnect_backoff * 2 or RECONNECT_BACKOFF_TIME,
+        )
 
 
 # The HomeKit state record inside the advertisement payload: acid, the global
