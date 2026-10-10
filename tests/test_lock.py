@@ -239,7 +239,7 @@ def test_parse_getstatus_staticposition() -> None:
     ids=["unlatching", "unlatched"],
 )
 def test_parse_getstatus_unlatch_states(frame_hex: str, expected: LockStatus) -> None:
-    """A GETSTATUS position of 0x09 or 0x0A decodes to the unlatch states."""
+    """A GETSTATUS lock state of 0x09 or 0x0A decodes to the unlatch states."""
     lock = _make_lock()
 
     result = lock._parse_state(bytes.fromhex(frame_hex))
