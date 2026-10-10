@@ -2966,21 +2966,26 @@ async def test_activity_records_before_a_failure_are_delivered(
     assert push_lock._activity_drain_failures == 0
 
 
+_OVERRUN = ActivityLogOverrunError("log did not end")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error", "strikes"),
+    ("failed_drain", "strikes"),
     [
-        (TimeoutError("slow"), ACTIVITY_DRAIN_FAILURE_THRESHOLD),
-        (ActivityLogOverrunError("never ends"), 1),
+        ([TimeoutError("slow")], ACTIVITY_DRAIN_FAILURE_THRESHOLD),
+        ([_OVERRUN], 1),
+        ([_unlock(1), _OVERRUN], ACTIVITY_DRAIN_FAILURE_THRESHOLD),
     ],
+    ids=["timeout", "overrun-empty", "overrun-with-progress"],
 )
 async def test_activity_drain_backs_off_after_repeated_failures(
-    error: Exception, strikes: int, caplog: pytest.LogCaptureFixture
+    failed_drain: list[Any], strikes: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Enough failed drains warn once and pause the drain; an overrun counts fully."""
+    """Enough failed drains warn once and pause; only an empty overrun counts fully."""
     activity = _unlock(205)
     push_lock, mock_lock, received = _activity_push_lock(
-        [*([[error]] * strikes), [activity]]
+        [*([failed_drain] * strikes), [activity]]
     )
     drain = mock_lock.drain_lock_activity
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
@@ -3000,6 +3005,19 @@ async def test_activity_drain_backs_off_after_repeated_failures(
     assert drain.call_count == strikes + 1
     assert push_lock._activity_primed is True
     assert received == []
+
+
+@pytest.mark.asyncio
+async def test_operation_before_priming_reschedules_the_priming_update() -> None:
+    """An operation cancels pending updates, so it re-arms the priming one."""
+    push_lock, _, _ = _activity_push_lock([])
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
+        push_lock._complete_operation(time.monotonic())
+    schedule.assert_called_once_with(ACTIVITY_PRIME_DELAY)
+    push_lock._activity_primed = True
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule:
+        push_lock._complete_operation(time.monotonic())
+    schedule.assert_not_called()
 
 
 @pytest.mark.asyncio

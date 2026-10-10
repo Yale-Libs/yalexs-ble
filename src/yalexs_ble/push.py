@@ -917,6 +917,9 @@ class PushLock:
     def _complete_operation(self, now: float) -> None:
         """Mark an operation as complete and reset timers."""
         self._last_operation_complete_time = now
+        if self._activity_callbacks and not self._activity_primed:
+            # The operation cancelled any pending update, the priming one included.
+            self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
         self._reset_disconnect_timer()
         self._reschedule_next_keep_alive()
 
@@ -1323,25 +1326,28 @@ class PushLock:
         """
         # Consumed before the await so a change during the drain is kept.
         self._activity_drain_pending = False
+        records = 0
         try:
             async for activity in lock.drain_lock_activity():
+                records += 1
                 if self._activity_primed:
                     self._callback_activity(activity)
         except BaseException as err:
             self._activity_drain_pending = True
             if not isinstance(err, (BleakError, TimeoutError, ResponseError)):
                 raise
-            self._note_activity_drain_failure(err)
+            self._note_activity_drain_failure(err, records)
             return
         self._activity_drain_failures = 0
         self._activity_primed = True
 
-    def _note_activity_drain_failure(self, err: Exception) -> None:
+    def _note_activity_drain_failure(self, err: Exception, records: int) -> None:
         """Count a failed drain; after enough in a row, leave the log alone a while."""
-        # A log that did not end within the cap is a stronger sign than a timeout.
+        # Overrunning the cap with nothing read is the sign of a log that never
+        # ends; with records read it is a long backlog the next drain continues.
         strikes = (
             ACTIVITY_DRAIN_FAILURE_THRESHOLD
-            if isinstance(err, ActivityLogOverrunError)
+            if isinstance(err, ActivityLogOverrunError) and not records
             else 1
         )
         self._activity_drain_failures += strikes
