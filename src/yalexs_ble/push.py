@@ -572,8 +572,10 @@ class PushLock:
 
     def _schedule_reconnect(self) -> None:
         """Reconnect an always-connected lock, paced by the backoff."""
-        if self._always_connected and not _AUTH_FAILURE_HISTORY.should_raise(
-            self.address
+        if (
+            self._running
+            and self._always_connected
+            and not _AUTH_FAILURE_HISTORY.should_raise(self.address)
         ):
             _LOGGER.debug("%s: Scheduling reconnect", self.name)
             self._schedule_future_update_with_debounce(self._reconnect_backoff)
