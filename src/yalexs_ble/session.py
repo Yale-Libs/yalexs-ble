@@ -39,6 +39,10 @@ ACK_TIMEOUT = 8.0
 # Whole-operation budget, command write to op-response.
 OPERATION_RESPONSE_TIMEOUT = 12.0
 
+# The unlatch's op-response budget; the dwell after the latch pull is not
+# part of it.
+UNLATCH_OPERATION_RESPONSE_TIMEOUT = 12.0
+
 
 class YaleXSBLEError(Exception):
     """Base class for YaleXSBLE errors."""
@@ -76,6 +80,25 @@ class BluetoothError(YaleXSBLEError):
 
 class OperationIncompleteError(YaleXSBLEError):
     """The lock took the command but its op-response never arrived; not retryable."""
+
+
+class OperationFailedError(YaleXSBLEError):
+    """The lock reported that an operation failed; not retryable.
+
+    Re-driving a failed mechanism is not a recovery.
+    """
+
+    def __init__(self, message: str, result: int) -> None:
+        super().__init__(message)
+        self.result = result
+
+    def __reduce__(self) -> tuple[type[OperationFailedError], tuple[str, int]]:
+        # self.args holds only the message, so the default rebuild would fail.
+        return (self.__class__, (str(self), self.result))
+
+
+class UnlatchError(YaleXSBLEError):
+    """An unlatch failed after its write; a re-send could open the door again."""
 
 
 @dataclass
@@ -420,10 +443,11 @@ class Session:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         """Write a mechanical command, then wait for its acknowledgment
         (ACK_TIMEOUT) and op-response (response_timeout), both timed from the
-        write.
+        write. With wait_for_ack False the acknowledgment wait is skipped.
         """
         if not self.client.is_connected:
             raise BleakError("disconnected")
@@ -462,32 +486,40 @@ class Session:
                         self.name,
                         command_name,
                     )
-            _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
-            ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
-            done, _ = await asyncio.wait(
-                (ack_future, result_future),
-                timeout=max(ack_remaining, 0),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if result_future in done:
-                # The op-response supersedes the acknowledgment; a stale
-                # same-opcode op-response can land here (_completed logs it).
-                return self._completed(result_future.result(), progress, command_name)
-            if ack_future not in done:
-                raise TimeoutError(
-                    f"{self.name}: No acknowledgment to {command_name} within "
-                    f"{ACK_TIMEOUT}s of the command being issued"
+            if wait_for_ack:
+                _LOGGER.debug("%s: Waiting for acknowledgment", self.name)
+                ack_remaining = ACK_TIMEOUT - (monotonic() - attempt_start)
+                done, _ = await asyncio.wait(
+                    (ack_future, result_future),
+                    timeout=max(ack_remaining, 0),
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+                if result_future in done:
+                    # The op-response supersedes the acknowledgment; a stale
+                    # same-opcode op-response can land here (_completed logs it).
+                    return self._completed(
+                        result_future.result(), progress, command_name
+                    )
+                if ack_future not in done:
+                    raise TimeoutError(
+                        f"{self.name}: No acknowledgment to {command_name} "
+                        f"within {ACK_TIMEOUT}s of the command being issued"
+                    )
             _LOGGER.debug("%s: Waiting for the op-response", self.name)
             result_remaining = response_timeout - (monotonic() - attempt_start)
             # asyncio.wait never cancels the future, so a same-turn arrival
             # still reads as done.
             await asyncio.wait((result_future,), timeout=max(result_remaining, 0))
             if not result_future.done():
+                never_acknowledged = (
+                    ""
+                    if progress.acknowledged
+                    else "; the command was never acknowledged"
+                )
                 raise OperationIncompleteError(
-                    f"{self.name}: {command_name} was acknowledged but no "
-                    f"op-response arrived within {response_timeout}s of the "
-                    "command being issued"
+                    f"{self.name}: No op-response to {command_name} arrived "
+                    f"within {response_timeout}s of the command being issued"
+                    f"{never_acknowledged}"
                 )
             result = result_future.result()
         finally:
@@ -623,12 +655,16 @@ class Session:
         response_timeout: float,
         progress: OperationProgress,
         write_success_callback: Callable[[], None] | None = None,
+        wait_for_ack: bool = True,
     ) -> bytes:
         """Run a mechanical operation with the staged wait.
 
         A failure after the acknowledgment raises OperationIncompleteError; one
         before it is raised as execute() would, for the caller to retry.
-        response_timeout must exceed ACK_TIMEOUT.
+        response_timeout bounds the whole operation and must exceed ACK_TIMEOUT.
+        wait_for_ack=False skips the acknowledgment wait, for a caller that must
+        never re-send, so a dropped acknowledgment cannot end an operation whose
+        result could still arrive.
         """
         if progress.write_attempted or progress.acknowledged or progress.result:
             # A reused record would report a previous attempt's frames as this one's.
@@ -645,6 +681,7 @@ class Session:
                     response_timeout,
                     progress,
                     write_success_callback,
+                    wait_for_ack,
                 )
         except OperationIncompleteError:
             raise
