@@ -83,7 +83,11 @@ class OperationIncompleteError(YaleXSBLEError):
 
 
 class UnlatchError(YaleXSBLEError):
-    """An unlatch failed after its write; a re-send could open the door again."""
+    """An unlatch failed once its write was attempted; not retryable.
+
+    The command may have reached the lock, and a repeated unlatch opens the
+    door again.
+    """
 
 
 @dataclass
@@ -445,9 +449,12 @@ class Session:
         result_callback: Callable[[bytes], None] | None = None,
         wait_for_ack: bool = True,
     ) -> bytes:
-        """Write a mechanical command, then wait for its acknowledgment
-        (ACK_TIMEOUT) and op-response (response_timeout), both timed from the
-        write. With wait_for_ack False the acknowledgment wait is skipped.
+        """Write a mechanical command, then wait for its acknowledgment and
+        op-response, both timed from the write.
+
+        ACK_TIMEOUT bounds the write and the acknowledgment, response_timeout
+        the op-response. With wait_for_ack False the acknowledgment wait is
+        skipped; the write keeps its ACK_TIMEOUT bound either way.
         """
         if not self.client.is_connected:
             raise BleakError("disconnected")
@@ -660,18 +667,14 @@ class Session:
         result_callback: Callable[[bytes], None] | None = None,
         wait_for_ack: bool = True,
     ) -> bytes:
-        """Run a mechanical operation with the staged wait.
+        """Run a mechanical operation with the staged wait and return its op-response.
 
-        A failure after the acknowledgment raises OperationIncompleteError; one
-        before it is raised as execute() would, for the caller to retry.
-        response_timeout bounds the whole operation and must exceed ACK_TIMEOUT.
-        wait_for_ack=False skips the acknowledgment wait, for a caller that must
-        never re-send, so a dropped acknowledgment cannot end an operation whose
-        result could still arrive.
-
-        write_success_callback runs when the write succeeds; result_callback
-        runs with the op-response as that frame is handled, before the wait
-        resolves.
+        An op-response recorded before a failure is returned; a failure after the
+        acknowledgment, or an op-response wait that runs to response_timeout,
+        raises OperationIncompleteError; any other failure is raised as execute()
+        would, for the caller to retry. response_timeout must exceed ACK_TIMEOUT.
+        result_callback runs with the op-response as that frame is handled,
+        before the wait resolves.
         """
         if progress.write_attempted or progress.acknowledged or progress.result:
             # A reused record would report a previous attempt's frames as this one's.

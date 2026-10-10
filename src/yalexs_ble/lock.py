@@ -67,7 +67,6 @@ LOCK_INFO_ATTEMPTS = 2
 MAX_ACTIVITY_RECORDS = 32
 
 
-# byte[4] of a Lock command: 0x04 turns the plain lock into securemode.
 # Operation byte that makes an Unlock command an unlatch (retract the latch).
 UNLATCH_OPERATION_BYTE = 0x0A
 # Operation byte (byte[4]) that makes a Lock command securemode.
@@ -249,7 +248,8 @@ def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
 def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
     """Match the 0xBB result frame for opcode; the floor admits the result byte.
 
-    The operation byte is 0x00 for every variant, so it is not matched.
+    The operation byte is not matched: a securemode command carries 0x04 there
+    and its op-response carries 0x00.
     """
 
     def _matches(data: bytes) -> bool:
@@ -655,8 +655,10 @@ class Lock:
     ) -> int:
         """Retract the latch (momentary open); returns the lock's result code.
 
-        A repeated unlatch opens the door again, so once the write was
-        attempted any failure converts to the non-retryable UnlatchError.
+        The op-response answers the latch pull, so returning does not mean the
+        unlatch cycle has finished. A repeated unlatch opens the door again, so
+        once the write was attempted any failure but OperationIncompleteError
+        converts to the non-retryable UnlatchError.
         """
         progress = OperationProgress()
         try:
@@ -673,7 +675,8 @@ class Lock:
         except OperationIncompleteError:
             raise  # already non-retryable
         except Exception as err:
-            # Broad on purpose: cancellation is a BaseException and passes.
+            # Broad on purpose: AuthError converts too, as the retry decorator
+            # would re-send on it; cancellation is a BaseException and passes.
             if progress.write_attempted:
                 raise UnlatchError(
                     f"{self.name}: Unlatch failed after the command write was "
