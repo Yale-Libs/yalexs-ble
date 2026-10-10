@@ -3424,7 +3424,7 @@ def _operational_push_lock(address: str = "aa:bb:cc:dd:ee:50") -> PushLock:
 
 
 def _known_state(lock: LockStatus, door: DoorStatus = DoorStatus.CLOSED) -> LockState:
-    """A settled cycle state, so an operation starts from a known position."""
+    """A LockState holding the given lock and door statuses and nothing else."""
     return LockState(
         lock=lock,
         door=door,
@@ -3635,17 +3635,17 @@ async def test_lock_stamps_transitional_only_at_write_success():
 
 @pytest.mark.asyncio
 async def test_window_filters_foreign_settle_until_close():
-    """A lock status is dropped while the window is open and admitted after."""
+    """A position is dropped while the window is open and admitted after."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
     push_lock._operation_window_open = True
     push_lock._update_any_state([LockStatus.LOCKED])
-    assert push_lock.lock_status == LockStatus.UNLOCKED  # dropped mid-window
+    assert push_lock.lock_status == LockStatus.UNLOCKED
 
     push_lock._close_operation_window()
     push_lock._update_any_state([LockStatus.LOCKED])
-    assert push_lock.lock_status == LockStatus.LOCKED  # admitted after close
+    assert push_lock.lock_status == LockStatus.LOCKED
 
 
 @pytest.mark.asyncio
@@ -3657,8 +3657,8 @@ async def test_window_admits_the_door_member():
 
     push_lock._update_any_state([DoorStatus.OPENED, LockStatus.LOCKED])
 
-    assert push_lock.door_status == DoorStatus.OPENED  # door applied
-    assert push_lock.lock_status == LockStatus.UNLOCKED  # lock filtered
+    assert push_lock.door_status == DoorStatus.OPENED
+    assert push_lock.lock_status == LockStatus.UNLOCKED
 
 
 @pytest.mark.asyncio
@@ -3791,7 +3791,7 @@ async def test_cancelled_queued_operation_leaves_the_window_alone():
 
 @pytest.mark.asyncio
 async def test_retry_restamps_at_write_success_without_unknown():
-    """A retry after write-success re-stamps the transitional, never UNKNOWN."""
+    """A retry after write-success keeps LOCKING on display and emits no UNKNOWN."""
     push_lock = _operational_push_lock()
     events: list[LockStatus] = []
 
@@ -3823,7 +3823,7 @@ async def test_retry_restamps_at_write_success_without_unknown():
     ):
         await push_lock.lock()
 
-    assert attempts == 2  # first attempt was retried
+    assert attempts == 2
     assert after_each_hook == [
         (LockStatus.LOCKING, True),
         (LockStatus.LOCKING, True),
@@ -3885,7 +3885,7 @@ async def test_a_settled_status_between_attempts_reaches_the_display():
 
 @pytest.mark.asyncio
 async def test_a_failure_before_any_write_replaces_a_reported_transitional():
-    """A failure before any write stamps UNKNOWN over a reported transitional."""
+    """A non-retryable failure with no write-success leaves UNKNOWN on the display."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.UNLOCKING)
 
@@ -4100,7 +4100,7 @@ async def test_jam_inside_the_window_replaces_the_unknown_of_a_lost_result() -> 
 async def test_a_retryable_failure_under_precedence_ends_the_attempts(
     jam_before_the_issue: bool,
 ) -> None:
-    """A retryable failure after a jam was reported does not re-send."""
+    """A retryable failure within the precedence time of a jam does not re-send."""
     push_lock = _operational_push_lock()
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     attempts = 0
@@ -4128,7 +4128,7 @@ async def test_a_retryable_failure_under_precedence_ends_the_attempts(
         with pytest.raises(OperationIncompleteError):
             await push_lock.lock()
 
-    assert attempts == 1  # the command was written once, and not again
+    assert attempts == 1
     assert push_lock.lock_status == LockStatus.JAMMED
     assert push_lock._operation_window_open is False
     push_lock._cancel_future_update()
@@ -4867,7 +4867,7 @@ async def test_a_failure_over_a_position_admitted_after_a_jam_is_not_retried() -
 
 @pytest.mark.asyncio
 async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
-    """A second operation queued on the operation lock stamps nothing."""
+    """An operation queued behind another emits no transitional until it runs."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3a")
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
@@ -5280,7 +5280,7 @@ async def test_cancelled_operation_leaves_the_status_poll_armed() -> None:
 
 @pytest.mark.asyncio
 async def test_a_refused_reading_leaves_the_status_poll_owed() -> None:
-    """A reading the window refuses does not mark LockStatus as seen."""
+    """A refusal over a transitional leaves LockStatus out of _seen_this_session."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6c")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
@@ -5291,7 +5291,7 @@ async def test_a_refused_reading_leaves_the_status_poll_owed() -> None:
         push_lock._operation_write_success(LockStatus.UNLOCKING)
         push_lock._update_any_state([LockStatus.UNLOCKED])
 
-    assert push_lock.lock_status is LockStatus.UNLOCKING  # the reading was refused
+    assert push_lock.lock_status is LockStatus.UNLOCKING
     assert LockStatus not in push_lock._seen_this_session
     push_lock._cancel_disconnect_timer()
 
@@ -5435,7 +5435,7 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
 async def test_every_operation_exit_schedules_the_status_poll(
     error: Exception | None, jam: bool, delay: float
 ) -> None:
-    """Every operation exit schedules the status poll, its delay set by the outcome."""
+    """The exit schedules the status poll; the display and the link set its delay."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:44")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
 
@@ -5500,7 +5500,7 @@ async def test_the_operations_exit_replaces_a_cycle_armed_mid_operation() -> Non
         result_callback: Callable[[bool], None],
     ) -> None:
         write_success_callback()
-        # Stands in for a keep-alive falling due while the operation runs.
+        # Stands in for a cycle armed while the operation runs.
         push_lock._schedule_future_update(0)
         armed_mid_operation.append(push_lock._cancel_deferred_update)
         result_callback(True)

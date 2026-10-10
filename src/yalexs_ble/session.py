@@ -75,7 +75,7 @@ class BluetoothError(YaleXSBLEError):
 
 
 class OperationIncompleteError(YaleXSBLEError):
-    """The lock took the command but its op-response never arrived; not retryable."""
+    """The operation ended without its op-response and was not retried."""
 
 
 @dataclass

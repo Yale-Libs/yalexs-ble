@@ -131,8 +131,9 @@ OPERATION_IN_PROGRESS_DEFER_SECONDS = 1.0
 # How long to wait if we get an update storm from the lock
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 
-# Statuses that report a position the lock is holding. Any other status must
-# stay out of _seen_this_session so the follow-up lock_status() poll runs.
+# Statuses that report a position the lock is holding; the setup conditions
+# qualify because they end only by hand. Any other status must stay out of
+# _seen_this_session so the follow-up lock_status() poll runs.
 POSITION_READINGS = frozenset(
     {
         LockStatus.LOCKED,
@@ -406,7 +407,7 @@ class PushLock:
         # The next cycle reads lock_status() even if _seen_this_session would
         # skip it, since that reading may be the one to replace.
         self._force_lock_status_poll = False
-        # No update cycle reads the lock before this, so no read lands while
+        # Every scheduled cycle is held to this, so none reads the lock while
         # the reported state is still settling.
         self._earliest_update_time = NEVER_TIME
         self._last_operation_complete_time = NEVER_TIME
@@ -541,8 +542,7 @@ class PushLock:
     ) -> Callable[[], None]:
         """Register a callback for each new lock activity record.
 
-        Records are read after a lock or door status change; a door-only
-        change is read on the next cycle.
+        Records are read on the next update after a lock or door status change.
         """
         if not self._activity_callbacks:
             # The first registration primes, so the backlog is not delivered as new.
@@ -1938,7 +1938,7 @@ class PushLock:
             self._schedule_future_update_with_debounce(UPDATE_IN_PROGRESS_DEFER_SECONDS)
             return
         if self._wait_for_the_floor(now):
-            # The floor moved after this cycle was armed.
+            # The floor holds; _wait_for_the_floor re-armed the cycle for it.
             return
         if self._operation_lock.locked():
             # The cycle is re-armed rather than created, so no task sits on the
