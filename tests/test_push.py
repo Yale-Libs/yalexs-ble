@@ -4,6 +4,7 @@ import struct
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -3468,6 +3469,314 @@ async def test_push_lock_keycode_requires_running() -> None:
     push_lock._running = False
     with pytest.raises(RuntimeError, match="not running"):
         await push_lock.get_keycode(1)
+
+
+def _unhurried_timeout(_seconds: float) -> Any:
+    """A util.asyncio_timeout whose deadline outlasts the test's idle delay."""
+    return asyncio.timeout(0.3)
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_timeout_keeps_the_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    push_lock = PushLock(
+        address="aa:bb:cc:dd:ee:31",
+        key="0800200c9a66",
+        key_index=1,
+        always_connected=False,
+        idle_disconnect_delay=0.05,
+    )
+    push_lock._name = "Test Lock"
+    push_lock._running = True
+    lock, _session, client = _lock_on_a_real_session(push_lock)
+    client.write_gatt_char = AsyncMock()
+
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        patch.object(
+            push_lock, "_async_handle_disconnected", new_callable=AsyncMock
+        ) as handle_disconnected,
+        patch.object(
+            push_lock, "_execute_timed_disconnect", new_callable=AsyncMock
+        ) as timed_disconnect,
+        patch.object(
+            push_lock,
+            "_disconnect_with_timer",
+            wraps=push_lock._disconnect_with_timer,
+        ) as idle_timer,
+        patch("yalexs_ble.util.asyncio_timeout", _unhurried_timeout),
+        pytest.raises(TimeoutError, match="did not answer set_keycode") as raised,
+    ):
+        push_lock._reset_disconnect_timer()
+        await push_lock.set_keycode(1, "135790")
+
+    assert isinstance(raised.value.__cause__, TimeoutError)
+    assert push_lock.auth is None
+    assert push_lock._last_operation_complete_time == NEVER_TIME
+    assert idle_timer.call_count >= 1
+    timed_disconnect.assert_not_called()
+    handle_disconnected.assert_not_called()
+    assert client.write_gatt_char.await_count == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert (
+        "set_keycode failed: TimeoutError: Test Lock: lock did not answer"
+        in warnings[0].getMessage()
+    )
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_connect_timeout_is_retried() -> None:
+    push_lock, lock = _keycode_push_lock()
+    ensure_connected = AsyncMock(side_effect=[TimeoutError(), lock])
+
+    with (
+        patch.object(push_lock, "_ensure_connected", ensure_connected),
+        patch.object(
+            push_lock, "_async_handle_disconnected", new_callable=AsyncMock
+        ) as handle_disconnected,
+    ):
+        assert await push_lock.get_keycode(200) == "135790"
+
+    assert ensure_connected.await_count == 2
+    handle_disconnected.assert_awaited_once()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_leaves_a_scheduled_update_armed() -> None:
+    push_lock, lock = _keycode_push_lock()
+    push_lock._schedule_future_update(60)
+    scheduled = push_lock._cancel_deferred_update
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        await push_lock.get_keycode(200)
+        await push_lock.set_keycode(200, "135790")
+        await push_lock.clear_keycode(200)
+
+    assert scheduled is not None
+    assert push_lock._cancel_deferred_update is scheduled
+    assert not scheduled.cancelled()
+    push_lock._cancel_future_update()
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slot", [0, 0x10000])
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [("get_keycode", ()), ("set_keycode", ("135790",)), ("clear_keycode", ())],
+)
+async def test_push_lock_keycode_refuses_a_bad_slot_without_connecting(
+    name: str, args: tuple[str, ...], slot: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    push_lock, lock = _keycode_push_lock()
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(
+            push_lock, "_ensure_connected", AsyncMock(return_value=lock)
+        ) as ensure_connected,
+        pytest.raises(ValueError, match="slot out of range"),
+    ):
+        await getattr(push_lock, name)(slot, *args)
+
+    ensure_connected.assert_not_awaited()
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin", ["", "12a4", "1" * 15])
+async def test_push_lock_keycode_refuses_a_bad_pin_without_connecting(
+    pin: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    push_lock, lock = _keycode_push_lock()
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(
+            push_lock, "_ensure_connected", AsyncMock(return_value=lock)
+        ) as ensure_connected,
+        pytest.raises(ValueError, match="PIN must be"),
+    ):
+        await push_lock.set_keycode(1, pin)
+
+    ensure_connected.assert_not_awaited()
+    lock.set_keycode.assert_not_awaited()
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_that_answered_clears_the_reauth_count() -> None:
+    push_lock, lock = _keycode_push_lock()
+    for _ in range(AUTH_FAILURE_TO_START_REAUTH):
+        _AUTH_FAILURE_HISTORY.auth_failed(push_lock.address)
+    assert _AUTH_FAILURE_HISTORY.should_raise(push_lock.address) is True
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        await push_lock.get_keycode(200)
+
+    assert _AUTH_FAILURE_HISTORY.should_raise(push_lock.address) is False
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_late_answer_is_taken_by_the_next_clear() -> None:
+    """Known limit: a Clear's answer is matched by opcode alone."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:33", always_connected=False)
+    push_lock._running = True
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    # A Clear result frame: slot 7 at the command's slot offset, KEYCODE_EXISTING_KEY.
+    late = _with_checksum("bb280000ffffffffffffff07000000060000")
+    writes = 0
+
+    async def write_gatt_char(*_: object) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            session._notify(0, bytearray(late))
+
+    client.write_gatt_char = write_gatt_char
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        patch("yalexs_ble.util.asyncio_timeout", lambda _: asyncio.timeout(0.05)),
+    ):
+        with pytest.raises(TimeoutError, match="did not answer clear_keycode"):
+            await push_lock.clear_keycode(7)
+        # With no command waiting the late answer is dropped.
+        session._notify(0, bytearray(late))
+        with pytest.raises(TimeoutError, match="did not answer clear_keycode"):
+            await push_lock.clear_keycode(8)
+        with pytest.raises(KeycodeError, match="KEYCODE_EXISTING_KEY"):
+            await push_lock.clear_keycode(9)
+
+    assert writes == 3
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_checksum_failure_warning_omits_the_frame(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:35", always_connected=False)
+    push_lock._running = True
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    corrupt = _with_checksum("bb390000c800135790ffffffff0000000000")
+    corrupt[-1] ^= 0x01
+    client.write_gatt_char = AsyncMock(
+        side_effect=_write_delivering(session, [corrupt])
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
+        pytest.raises(ResponseError, match=corrupt.hex()),
+    ):
+        await push_lock.get_keycode(200)
+
+    warnings = [r for r in caplog.records if r.name == "yalexs_ble.push"]
+    assert [r.getMessage() for r in warnings] == [
+        "Test Lock: get_keycode failed: ResponseError"
+    ]
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
+
+
+def _latched_keycode_push_lock() -> tuple[PushLock, MagicMock, list[AuthState | None]]:
+    """A keycode PushLock at the re-auth latch whose callback records auth."""
+    push_lock, lock = _keycode_push_lock()
+    for _ in range(AUTH_FAILURE_TO_START_REAUTH):
+        _AUTH_FAILURE_HISTORY.auth_failed(push_lock.address)
+    push_lock._lock_state = replace(
+        push_lock._get_current_state(), auth=AuthState(successful=False)
+    )
+    published: list[AuthState | None] = []
+    push_lock.register_callback(lambda state, info, conn: published.append(state.auth))
+    return push_lock, lock, published
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_that_answered_publishes_auth_success() -> None:
+    push_lock, lock, published = _latched_keycode_push_lock()
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._advertisement_data = _advertisement({})
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        await push_lock.get_keycode(200)
+
+    assert published == [AuthState(successful=True)]
+    assert _AUTH_FAILURE_HISTORY.should_raise(push_lock.address) is False
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_stores_auth_success_without_a_callback() -> None:
+    push_lock, lock = _keycode_push_lock()
+    assert push_lock._lock_info is None
+    assert push_lock.connection_info is None
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        await push_lock.get_keycode(200)
+
+    assert push_lock.lock_state is not None
+    assert push_lock.lock_state.auth == AuthState(successful=True)
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lock_info", "advertisement"),
+    [(None, _advertisement({})), (TEST_LOCK_INFO, None)],
+)
+async def test_push_lock_keycode_clears_the_count_alone_if_it_cannot_publish(
+    lock_info: LockInfo | None, advertisement: AdvertisementData | None
+) -> None:
+    push_lock, lock, published = _latched_keycode_push_lock()
+    push_lock._lock_info = lock_info
+    push_lock._advertisement_data = advertisement
+    held = push_lock._lock_state
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        assert await push_lock.get_keycode(200) == "135790"
+
+    assert published == []
+    assert push_lock._lock_state is held
+    assert _AUTH_FAILURE_HISTORY.should_raise(push_lock.address) is False
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_failure_logs_one_warning_without_the_pin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:32", always_connected=False)
+    push_lock._running = True
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    malformed = _with_checksum("bb390000c800135790eeeeeeee0000000000")
+    client.write_gatt_char = AsyncMock(
+        side_effect=_write_delivering(session, [malformed])
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        pytest.raises(ValueError, match="Malformed PIN field"),
+    ):
+        await push_lock.get_keycode(200)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "get_keycode" in warnings[0].getMessage()
+    assert "135790" not in warnings[0].getMessage()
+    push_lock._running = False
+    push_lock._cancel_disconnect_timer()
 
 
 def _activity_push_lock(

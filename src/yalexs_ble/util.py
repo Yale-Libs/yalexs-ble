@@ -69,7 +69,7 @@ def decode_keycode_pin(data: bytes | bytearray) -> str | None:
     field = data[:KEYCODE_PIN_BYTES].hex()
     pin = field.rstrip("f")
     if pin and not pin.isdigit():
-        raise ValueError(f"Malformed PIN field: {field}")
+        raise ValueError("Malformed PIN field")
     return pin or None
 
 
