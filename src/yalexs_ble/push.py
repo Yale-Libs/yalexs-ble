@@ -6,7 +6,7 @@ import functools
 import logging
 import struct
 import time
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import replace
 from typing import Any, TypeVar, cast
 
@@ -31,13 +31,15 @@ from .const import (
     AutoLockState,
     BatteryState,
     ConnectionInfo,
+    DoorActivity,
     DoorStatus,
+    LockActivity,
     LockInfo,
     LockState,
     LockStateValue,
     LockStatus,
 )
-from .lock import Lock
+from .lock import ActivityLogOverrunError, Lock
 from .session import (
     AuthError,
     BluetoothError,
@@ -54,6 +56,7 @@ _LOGGER = logging.getLogger(__name__)
 _ADV_LOGGER = logging.getLogger("yalexs_ble_adv")
 
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
+_T = TypeVar("_T")
 
 # A monotonic timestamp ~one day in the past, used as a "never happened /
 # no deadline" sentinel. Makes no assumption about the clock's epoch.
@@ -149,6 +152,17 @@ AUTO_LOCK_READ_FAILURE_BACKOFF = 86400
 # the signal the lock does not support the setting; a success resets the count.
 # Ack timeouts and response timeouts both count toward this one threshold.
 AUTO_LOCK_READ_FAILURE_THRESHOLD = 3
+
+# Consecutive failed activity drains before the drain is left alone for a
+# while; a lock whose log never ends would otherwise cost 32 reads per update.
+ACTIVITY_DRAIN_FAILURE_THRESHOLD = 3
+ACTIVITY_DRAIN_FAILURE_BACKOFF = 3600
+# Delay before the first drain, so the first update is not held up by the
+# backlog and has freed the adapter slot before the lock is asked again.
+ACTIVITY_PRIME_DELAY = 10.0
+# Consecutive drains that read records but never reach the end marker before
+# the log counts as one that never ends rather than a deep backlog.
+ACTIVITY_DRAIN_MAX_OVERRUNS = 8
 
 # How long to wait for the 0xBB settings response after the READSETTING ack
 # before treating the read as unresolved. The ack completes the solicited wait;
@@ -333,6 +347,13 @@ class PushLock:
         self._callbacks: list[
             Callable[[LockState, LockInfo, ConnectionInfo], None]
         ] = []
+        self._activity_callbacks: list[
+            Callable[[LockActivity | DoorActivity], None]
+        ] = []
+        self._activity_primed = False
+        self._activity_drain_pending = False
+        self._activity_drain_failures = self._activity_overruns = 0
+        self._earliest_activity_drain_time = NEVER_TIME
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
@@ -476,6 +497,28 @@ class PushLock:
 
         self._callbacks.append(callback)
         return unregister_callback
+
+    def register_activity_callback(
+        self, callback: Callable[[LockActivity | DoorActivity], None]
+    ) -> Callable[[], None]:
+        """Register a callback for each new lock activity record.
+
+        Records are read after a lock or door status change; a door-only
+        change is read on the next cycle.
+        """
+        if not self._activity_callbacks:
+            # The first registration primes, so the backlog is not delivered as new.
+            self._activity_primed = False
+            self._activity_drain_pending = True
+            if self._running and self._lock_info is not None:
+                # Past the first update, so nothing else would prime soon.
+                self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
+        self._activity_callbacks.append(callback)
+
+        def unregister_activity_callback() -> None:
+            self._activity_callbacks.remove(callback)
+
+        return unregister_activity_callback
 
     def set_lock_key(self, key: str, slot: int) -> None:
         """Set the lock key."""
@@ -842,9 +885,47 @@ class PushLock:
             raise
         self._complete_operation(time.monotonic())
 
+    async def get_keycode(self, slot: int) -> str | None:
+        """Read the PIN in a keypad slot; None if the slot is empty."""
+        return await self._run_on_lock(
+            "get_keycode", lambda lock: lock.get_keycode(slot)
+        )
+
+    async def set_keycode(self, slot: int, pin: str) -> None:
+        """Program a PIN into a keypad slot.
+
+        The slot is cleared first, so a failure leaves it empty.
+        """
+        await self._run_on_lock("set_keycode", lambda lock: lock.set_keycode(slot, pin))
+
+    async def clear_keycode(self, slot: int) -> None:
+        """Clear a keypad slot."""
+        await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
+
+    @operation_lock
+    @retry_bluetooth_connection_error
+    async def _run_on_lock(
+        self, name: str, operation: Callable[[Lock], Awaitable[_T]]
+    ) -> _T:
+        """Run an operation on the connected lock under the operation lock."""
+        if not self._running:
+            raise RuntimeError(f"{self.name}: {name} not possible because not running")
+        try:
+            lock = await self._ensure_connected()
+            self._cancel_future_update()
+            result = await operation(lock)
+        except Exception as ex:
+            _LOGGER.debug("%s: Failed to execute %s due to %s", self.name, name, ex)
+            raise
+        self._complete_operation(time.monotonic())
+        return result
+
     def _complete_operation(self, now: float) -> None:
         """Mark an operation as complete and reset timers."""
         self._last_operation_complete_time = now
+        if self._activity_callbacks and not self._activity_primed:
+            # The operation cancelled any pending update, the priming one included.
+            self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
         self._reset_disconnect_timer()
         self._reschedule_next_keep_alive()
 
@@ -899,9 +980,11 @@ class PushLock:
                             state,
                         )
                     changes["lock"] = state
+                    self._activity_drain_pending = True
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
+                    self._activity_drain_pending = True
             elif isinstance(state, BatteryState):
                 if lock_state.battery != state:
                     changes["battery"] = state
@@ -1189,7 +1272,9 @@ class PushLock:
         # However, we always want to poll lock
         # state to keep the connection alive if we are always connected.
         if LockStatus not in self._seen_this_session or (
-            not made_request and self._always_connected
+            not made_request
+            and self._always_connected
+            and not self._activity_drain_due()
         ):
             made_request = True
             await lock.lock_status()
@@ -1200,6 +1285,9 @@ class PushLock:
         current = self._get_current_state()
         # Notify consumers that the update is complete, even if nothing changed.
         self._callback_state(current)
+
+        if await self._poll_activity(lock, first_update=not has_lock_info):
+            made_request = True
 
         if not has_lock_info:
             # On first update free up the connection
@@ -1218,6 +1306,99 @@ class PushLock:
             self._last_operation_complete_time = time.monotonic()
             self._reschedule_next_keep_alive()
 
+    def _activity_drain_due(self) -> bool:
+        """True when a registered consumer is owed a drain and no backoff holds it."""
+        return bool(
+            self._activity_callbacks
+            and self._activity_drain_pending
+            and time.monotonic() >= self._earliest_activity_drain_time
+        )
+
+    async def _poll_activity(self, lock: Lock, *, first_update: bool) -> bool:
+        """Drain the activity log if one is due; True if the lock was asked."""
+        if not self._activity_drain_due():
+            return False
+        if first_update:
+            self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
+            return False
+        await self._drain_activity(lock)
+        return True
+
+    async def _drain_activity(self, lock: Lock) -> None:
+        """Read the lock's activity log and deliver the records.
+
+        The first drain only primes, discarding the backlog. An incomplete
+        drain stays pending; records already read are delivered regardless.
+        """
+        # Consumed before the await so a change during the drain is kept.
+        self._activity_drain_pending = False
+        records = 0
+        try:
+            async for activity in lock.drain_lock_activity():
+                records += 1
+                if self._activity_primed:
+                    self._callback_activity(activity)
+        except BaseException as err:
+            self._activity_drain_pending = True
+            if not isinstance(err, (BleakError, TimeoutError, ResponseError)):
+                raise
+            self._note_activity_drain_failure(err, records)
+            return
+        self._activity_drain_failures = 0
+        self._activity_overruns = 0
+        if not self._activity_primed:
+            _LOGGER.debug(
+                "%s: Primed the activity log, discarding %d backlog records",
+                self.name,
+                records,
+            )
+        self._activity_primed = True
+
+    def _note_activity_drain_failure(self, err: Exception, records: int) -> None:
+        """Count a failed drain; after enough in a row, leave the log alone a while."""
+        if isinstance(err, ActivityLogOverrunError):
+            self._activity_overruns += 1
+            if records and self._activity_overruns < ACTIVITY_DRAIN_MAX_OVERRUNS:
+                # A deep backlog, not a failure: carry on shortly.
+                _LOGGER.debug(
+                    "%s: Activity log is deeper than one drain, continuing shortly",
+                    self.name,
+                )
+                self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
+                return
+            # Nothing read, or no end after many chunks: a log that never ends.
+            self._activity_overruns = 0
+            strikes = ACTIVITY_DRAIN_FAILURE_THRESHOLD
+        else:
+            strikes = 1
+        self._activity_drain_failures += strikes
+        if self._activity_drain_failures < ACTIVITY_DRAIN_FAILURE_THRESHOLD:
+            _LOGGER.debug(
+                "%s: Reading lock activity failed (%s), will retry on next update.",
+                self.name,
+                err,
+            )
+            return
+        self._activity_drain_failures = 0
+        self._earliest_activity_drain_time = (
+            time.monotonic() + ACTIVITY_DRAIN_FAILURE_BACKOFF
+        )
+        _LOGGER.warning(
+            "%s: Reading lock activity keeps failing (%s); "
+            "not trying again for %d seconds",
+            self.name,
+            err,
+            ACTIVITY_DRAIN_FAILURE_BACKOFF,
+        )
+
+    def _callback_activity(self, activity: LockActivity | DoorActivity) -> None:
+        """Call the activity callbacks."""
+        for callback in self._activity_callbacks:
+            try:
+                callback(activity)
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("%s: Error calling activity callback", self.name)
+
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""
         if self._slow_params_set:
@@ -1235,7 +1416,7 @@ class PushLock:
             )
         else:
             self._slow_params_set = True
-            _LOGGER.debug("%s: Set slow connection parameters", self.name)
+            _LOGGER.debug("%s: Requested slow connection parameters", self.name)
 
     def _callback_state(self, lock_state: LockState) -> None:
         """Call the callbacks."""

@@ -59,14 +59,14 @@ pythonista = ["bleak-pythonista (>=0.1.1)"]
 
 [[package]]
 name = "bleak-retry-connector"
-version = "4.6.3"
+version = "4.7.1"
 description = "A connector for Bleak Clients that handles transient connection failures"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "bleak_retry_connector-4.6.3-py3-none-any.whl", hash = "sha256:d6bf724245d62667edf30b1fdb423a364eaf0a46825a2b7183b46eebc0f934b3"},
-    {file = "bleak_retry_connector-4.6.3.tar.gz", hash = "sha256:c2fa859bc8b645b8eecde6dfefc49662765d4f43f0b0e2a18a50034660073201"},
+    {file = "bleak_retry_connector-4.7.1-py3-none-any.whl", hash = "sha256:75b4cb3f69955123121d860348d2c43da638a0f3211f2cb6197d717edbd6f47f"},
+    {file = "bleak_retry_connector-4.7.1.tar.gz", hash = "sha256:9a5b07d2d7c5a9809b1769492d956604a7403870693be92754259d9eed5c177e"},
 ]
 
 [package.dependencies]
@@ -1128,4 +1128,4 @@ all = ["winrt-Windows.Foundation.Collections[all] (>=3.2.1.0,<3.3.0.0)", "winrt-
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.15"
-content-hash = "a9dc9e956f2915f49087e3b25b3a7a72294f42a2e2ddc6811598e8864e8a5081"
+content-hash = "9cf123607f0ae388d2362dd20d3eecff2fce91fb9618a772dce365c581f57114"
