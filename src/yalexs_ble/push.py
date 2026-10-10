@@ -825,8 +825,7 @@ class PushLock:
         try:
             await self._execute_lock_operation(op_attr, pending_state, complete_state)
         except Exception:
-            if self._operation_outcome is None:
-                self._operation_outcome = LockStatus.UNKNOWN
+            self._operation_outcome = LockStatus.UNKNOWN
             raise
         finally:
             self._finalize_operation()

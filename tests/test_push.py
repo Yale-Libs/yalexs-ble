@@ -3651,32 +3651,6 @@ async def test_window_admits_the_door_member():
 
 
 @pytest.mark.asyncio
-async def test_a_recorded_outcome_stands_when_the_operation_fails() -> None:
-    """A failure stamps UNKNOWN only when no outcome was recorded."""
-    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6b")
-    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
-
-    async def force_lock(
-        write_success_callback: Callable[[], None],
-        result_callback: Callable[[bool], None],
-    ) -> None:
-        write_success_callback()
-        push_lock._operation_outcome = LockStatus.LOCKED
-        raise OperationIncompleteError("no op-response")
-
-    mock_lock = MagicMock()
-    mock_lock.force_lock = force_lock
-
-    with (
-        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
-        pytest.raises(OperationIncompleteError),
-    ):
-        await push_lock.lock()
-
-    assert push_lock.lock_status is LockStatus.LOCKED
-
-
-@pytest.mark.asyncio
 async def test_early_error_before_write_leaves_no_window_and_stamps_unknown():
     """A retryable failure before the write closes the window and displays UNKNOWN."""
     push_lock = _operational_push_lock()
