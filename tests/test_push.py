@@ -3757,6 +3757,40 @@ async def test_operation_exit_delay_follows_the_displayed_pair(
 
 
 @pytest.mark.asyncio
+async def test_a_cancelled_securemode_keeps_the_pair_and_polls_at_the_debounce():
+    """A securemode cancelled mid-motion keeps the pair and polls at the debounce."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:6b")
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    pairs: list[tuple[LockStatus, LockStatus]] = []
+    push_lock.register_callback(lambda ls, li, ci: pairs.append((ls.lock, ls.secure)))
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    ack = _with_checksum("aa0b00000400000000000000000000000200")
+    client.write_gatt_char = AsyncMock(
+        side_effect=_write_returning_first(session, [ack])
+    )
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        patch.object(push_lock, "_schedule_future_update_with_debounce") as schedule,
+    ):
+        op = asyncio.create_task(push_lock.securemode())
+        # Let the acknowledgment be handled and the op-response wait begin.
+        for _ in range(50):
+            await asyncio.sleep(0)
+        op.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await op
+
+    assert pairs == [(LockStatus.LOCKED, LockStatus.LOCKING)]
+    assert (push_lock.lock_status, push_lock.secure_status) == (
+        LockStatus.LOCKED,
+        LockStatus.LOCKING,
+    )
+    schedule.assert_called_once_with(LOCK_STALE_STATE_DEBOUNCE_DELAY)
+    push_lock._cancel_disconnect_timer()
+
+
+@pytest.mark.asyncio
 async def test_deferred_update_defers_inside_the_stale_state_window() -> None:
     """An update inside the floor is re-armed for its remainder, starting no task."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:51")
