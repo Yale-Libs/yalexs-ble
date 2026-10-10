@@ -343,17 +343,18 @@ def _project_lock_status(
 ) -> tuple[LockStatus, LockStatus]:
     """Project the reported status onto the (main, secure) lock pair.
 
-    Only a reported SECUREMODE marks the secure lock secured.
+    For compatibility the main lock keeps SECUREMODE as its settled secured
+    position, and only a reported SECUREMODE marks the secure lock secured.
     """
     if reported is LockStatus.SECURING:
-        # An already-locked main lock stays put while securing.
         if main in (LockStatus.LOCKED, LockStatus.SECUREMODE):
             return main, LockStatus.LOCKING
         return LockStatus.LOCKING, LockStatus.LOCKING
     if reported is LockStatus.SECUREMODE:
         return LockStatus.SECUREMODE, LockStatus.LOCKED
     if reported is LockStatus.LOCKING:
-        # A plain lock(): the main lock is moving, the secure lock is not.
+        # A reported LOCKING never animates the secure lock; the wire has no
+        # securing value, so only a reported SECUREMODE secures it.
         return reported, LockStatus.UNLOCKED
     if reported in (LockStatus.UNLOCKING, LockStatus.UNLATCHING):
         # Already UNLOCKING covers a retried unlock's second stamp.
@@ -362,7 +363,7 @@ def _project_lock_status(
         return reported, LockStatus.UNLOCKED
     if reported in (LockStatus.LOCKED, LockStatus.UNLOCKED, LockStatus.UNLATCHED):
         return reported, LockStatus.UNLOCKED
-    # Faults of the whole lock apply to both channels.
+    # A jam, a setup condition, or an unknown position applies to both channels.
     return reported, reported
 
 
@@ -1244,7 +1245,8 @@ class PushLock:
                 # the admission filter.
                 admitted = state if operation else self._admit_lock_status(state)
                 if admitted not in POSITION_READINGS:
-                    # An unsettled display must not suppress the follow-up poll.
+                    # A refused reading, or one that is not a position, must not
+                    # suppress the follow-up poll.
                     self._seen_this_session.discard(type(state))
                 if admitted is None:
                     continue
