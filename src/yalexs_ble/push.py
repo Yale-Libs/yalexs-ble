@@ -1346,6 +1346,12 @@ class PushLock:
             return
         self._activity_drain_failures = 0
         self._activity_overruns = 0
+        if not self._activity_primed:
+            _LOGGER.debug(
+                "%s: Primed the activity log, discarding %d backlog records",
+                self.name,
+                records,
+            )
         self._activity_primed = True
 
     def _note_activity_drain_failure(self, err: Exception, records: int) -> None:

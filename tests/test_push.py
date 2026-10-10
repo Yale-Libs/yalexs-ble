@@ -2828,11 +2828,15 @@ def _unlock(slot: int) -> LockActivity:
 
 
 @pytest.mark.asyncio
-async def test_activity_first_update_primes_without_delivering() -> None:
-    """The first drain discards the backlog; later updates read nothing."""
-    push_lock, mock_lock, received = _activity_push_lock([[_unlock(1)]])
-    await _run_update(push_lock, mock_lock)
+async def test_activity_first_update_primes_without_delivering(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The first drain discards the backlog, saying so; later updates read nothing."""
+    push_lock, mock_lock, received = _activity_push_lock([[_unlock(1), _unlock(2)]])
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        await _run_update(push_lock, mock_lock)
     assert received == []
+    assert "discarding 2 backlog records" in caplog.text
     assert mock_lock.drain_lock_activity.call_count == 1
     await _run_update(push_lock, mock_lock)
     assert mock_lock.drain_lock_activity.call_count == 1
