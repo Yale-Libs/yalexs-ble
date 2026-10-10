@@ -28,7 +28,16 @@ MODEL_NUMBER_CHARACTERISTIC = "00002a24-0000-1000-8000-00805f9b34fb"
 SERIAL_NUMBER_CHARACTERISTIC = "00002a25-0000-1000-8000-00805f9b34fb"
 FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 
+# The Model Number characteristic carries regional and firmware suffixes
+# such as "SL-103-EU", so the tables match an entry or a suffixed variant.
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
+
+# With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these exclusions
+NO_BATTERY_SUPPORT_MODELS = {
+    "SL-103",  # Linus L2
+    "CERES",  # Smart code handle
+    "Yale Linus L2",  # Linus L2 Nordic
+}
 
 
 # Slot reported for unlocks with the keypad master (programming) code, which
@@ -244,11 +253,18 @@ class LockInfo:
     @property
     def door_sense(self) -> bool:
         """Check if the lock has door sense support."""
-        return bool(
-            self.model
-            and not any(
-                self.model.startswith(old_model) for old_model in NO_DOOR_SENSE_MODELS
-            )
+        return bool(self.model) and not self._model_in(NO_DOOR_SENSE_MODELS)
+
+    @property
+    def battery_reporting(self) -> bool:
+        """Check if the lock answers battery status requests."""
+        return not self._model_in(NO_BATTERY_SUPPORT_MODELS)
+
+    def _model_in(self, models: set[str]) -> bool:
+        """True for a listed model or a suffixed variant of one, not a longer number."""
+        return any(
+            self.model == model or self.model.startswith((f"{model}-", f"{model} "))
+            for model in models
         )
 
 

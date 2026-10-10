@@ -183,14 +183,6 @@ AUTO_LOCK_READ_RESPONSE_TIMEOUT = 10
 # lock that never confirms it should fail fast and report to the user.
 AUTO_LOCK_WRITE_ATTEMPTS = 2
 
-# With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these
-# exclusions
-NO_BATTERY_SUPPORT_MODELS = {
-    "SL-103",  # Linus L2
-    "CERES",  # Smart code handle
-    "Yale Linus L2",  # Linus L2 Nordic
-}
-
 AUTO_LOCK_DEFAULT_DURATION = 90
 
 # Statuses reported during calibration (0x01) and polarity discovery (0x06),
@@ -1081,7 +1073,7 @@ class PushLock:
         Returns True if the lock was asked, whether or not it answered.
         """
         assert self._lock_info is not None  # nosec
-        if self._lock_info.model in NO_BATTERY_SUPPORT_MODELS:
+        if not self._lock_info.battery_reporting:
             _LOGGER.debug(
                 "%s: Needs battery workaround model %s",
                 self.name,
