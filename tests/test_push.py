@@ -5993,6 +5993,7 @@ async def test_every_operation_exit_owes_the_status_poll(
         if isinstance(error, OperationFailedError):
             # The parser emits JAMMED before the session resolves the waiter.
             push_lock._state_callback([LockStatus.JAMMED])
+            result_callback(False)
         if error is not None:
             raise error
         result_callback(True)
