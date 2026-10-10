@@ -131,19 +131,14 @@ OPERATION_IN_PROGRESS_DEFER_SECONDS = 1.0
 # How long to wait if we get an update storm from the lock
 UPDATE_IN_PROGRESS_DEFER_SECONDS = DISCONNECT_DELAY - 1
 
-# Statuses that report a position the lock is holding; the setup conditions
+# Statuses that report a position the lock is holding; the attention statuses
 # qualify because they end only by hand. Any other status must stay out of
 # _seen_this_session so the follow-up lock_status() poll runs.
-POSITION_READINGS = frozenset(
-    {
-        LockStatus.LOCKED,
-        LockStatus.UNLOCKED,
-        LockStatus.SECUREMODE,
-        LockStatus.JAMMED,
-        LockStatus.UNKNOWN_01,
-        LockStatus.UNKNOWN_06,
-    }
-)
+POSITION_READINGS = MANUAL_INTERVENTION_STATUSES | {
+    LockStatus.LOCKED,
+    LockStatus.UNLOCKED,
+    LockStatus.SECUREMODE,
+}
 
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError, DisconnectedError)
 
@@ -841,52 +836,49 @@ class PushLock:
             >= self._operation_issued_at - JAMMED_PRECEDENCE_TIME
         )
 
+    def _attention_holds_display(self, state: LockStatus) -> bool:
+        """Whether a jam or setup condition that takes precedence is still on display.
+
+        Logs the state it keeps off the display.
+        """
+        if not (
+            self._jam_takes_precedence()
+            and self.lock_status in MANUAL_INTERVENTION_STATUSES
+        ):
+            return False
+        _LOGGER.debug(
+            "%s: %s not applied; a status needing attention takes precedence",
+            self.name,
+            state,
+        )
+        return True
+
     def _operation_result(self, complete_state: LockStatus, succeeded: bool) -> None:
         """Close the operation window and display the command's end state.
 
         Runs as the op-response frame is handled. A failure op-response has
         already put JAMMED on the display, so only a success updates it, unless
-        the watcher is stopped or a reported jam or setup condition takes
-        precedence and is still on display.
+        the watcher is stopped or an attention status holds the display.
         """
         self._operation_answered = True
         self._close_operation_window()
         if not self._running or not succeeded:
             return
-        if (
-            self._jam_takes_precedence()
-            and self.lock_status in MANUAL_INTERVENTION_STATUSES
-        ):
-            _LOGGER.debug(
-                "%s: %s not applied; a status needing attention takes precedence",
-                self.name,
-                complete_state,
-            )
+        if self._attention_holds_display(complete_state):
             return
         self._update_any_state([complete_state], operation=True)
 
     def _operation_write_success(self, pending_state: LockStatus) -> None:
         """Display the operation's transitional state.
 
-        Skipped once the op-response has been handled, and while a reported jam
-        or setup condition takes precedence and is still on display.
+        Skipped once the op-response has been handled, and while an attention
+        status holds the display.
         """
-        if self._operation_answered:
+        if self._operation_answered or self._attention_holds_display(pending_state):
             return
-        if not (
-            self._jam_takes_precedence()
-            and self.lock_status in MANUAL_INTERVENTION_STATUSES
-        ):
-            self._update_any_state([pending_state], operation=True)
-        else:
-            _LOGGER.debug(
-                "%s: %s not stamped; a status needing attention takes precedence",
-                self.name,
-                pending_state,
-            )
+        self._update_any_state([pending_state], operation=True)
 
     def _close_operation_window(self) -> None:
-        """Close the operation window."""
         self._operation_window_open = False
 
     def _finalize_operation(self) -> None:
@@ -895,7 +887,6 @@ class PushLock:
         # The op-response decided the display when it arrived; the exit
         # decides it only for an operation that ended without one.
         outcome = None if self._operation_answered else self._operation_outcome
-        precedence = self._jam_takes_precedence()
         self._close_operation_window()
         # Set before the stop check so a restarted watcher inherits them.
         self._force_lock_status_poll = True
@@ -906,20 +897,7 @@ class PushLock:
             # the stop takes no precedence over its commands.
             self._last_jam_event_time = NEVER_TIME
             return
-        if (
-            outcome is not None
-            and precedence
-            and self.lock_status in MANUAL_INTERVENTION_STATUSES
-        ):
-            # The outcome yields to a jam or setup condition the lock reported
-            # within the precedence time or during the command.
-            _LOGGER.debug(
-                "%s: %s not applied; a status needing attention takes precedence",
-                self.name,
-                outcome,
-            )
-            outcome = None
-        if outcome is not None:
+        if outcome is not None and not self._attention_holds_display(outcome):
             self._update_any_state([outcome], operation=True)
         # The exit owns the next poll; drop any cycle armed during the operation.
         self._cancel_future_update()
@@ -936,14 +914,9 @@ class PushLock:
     def _admit_lock_status(
         self, incoming: LockStatus, current: LockStatus
     ) -> LockStatus:
-        """Decide the displayed lock status for an incoming value.
-
-        Every incoming lock status, polled or pushed, must pass through
-        here.
-        """
-        now = time.monotonic()
+        """Decide the displayed lock status for a value the lock reported."""
         if incoming in MANUAL_INTERVENTION_STATUSES:
-            self._last_jam_event_time = now
+            self._last_jam_event_time = time.monotonic()
         if self._operation_window_open and incoming not in MANUAL_INTERVENTION_STATUSES:
             # The operation applies its own outcome, which says nothing about a
             # jam or setup condition, so those pass, as do door and battery
@@ -1204,8 +1177,7 @@ class PushLock:
                 if lock_state.auth != state:
                     changes["auth"] = state
             elif isinstance(state, LockStatus):
-                # Every lock status the lock reports, repeats included, passes
-                # the admission filter.
+                # Every reported lock status, repeats included, is admitted here.
                 admitted = (
                     state
                     if operation
@@ -1938,7 +1910,6 @@ class PushLock:
             self._schedule_future_update_with_debounce(UPDATE_IN_PROGRESS_DEFER_SECONDS)
             return
         if self._wait_for_the_floor(now):
-            # The floor holds; _wait_for_the_floor re-armed the cycle for it.
             return
         if self._operation_lock.locked():
             # The cycle is re-armed rather than created, so no task sits on the

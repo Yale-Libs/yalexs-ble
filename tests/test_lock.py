@@ -1535,11 +1535,13 @@ async def _drive_operation(
     ack: bytes,
     before_ack: bytes | None = None,
     before_response: bytes | None = None,
+    result: int = OperationError.COMM_SUCCESS,
 ) -> list[str]:
     """Run a force_* method, feeding its ack then op-response through notify.
 
     Returns the order of the write-success and result callbacks and the fed
-    frames. Optional before_* frames must leave the stage they precede armed.
+    frames. Optional before_* frames must leave the stage they precede armed;
+    result is the op-response's result byte.
     """
     session = lock.session
     assert session is not None
@@ -1558,7 +1560,7 @@ async def _drive_operation(
         if before_response is not None:
             session._notify(0, bytearray(before_response))
             assert session._notify_future is not None, "taken for the op-response"
-        session._notify(0, bytearray(_op_response_frame(opcode)))
+        session._notify(0, bytearray(_op_response_frame(opcode, result)))
         events.append("op_response")
 
     feeder = asyncio.create_task(feed())
@@ -1618,23 +1620,10 @@ async def test_the_result_callback_is_told_whether_the_op_response_reported_succ
 ) -> None:
     """The result byte of the op-response decides what the result callback is told."""
     lock = _make_connected_lock_with_session()
-    session = lock.session
-    assert session is not None
-    reported: list[bool] = []
-
-    async def feed() -> None:
-        await _spin_until(lambda: session._ack_future is not None)
-        session._notify(
-            0, bytearray(bytes.fromhex("aa0b00490000000000000000000000000200"))
-        )
-        await asyncio.sleep(0)
-        session._notify(0, bytearray(_op_response_frame(Commands.LOCK, result)))
-
-    feeder = asyncio.create_task(feed())
-    await lock.force_lock(result_callback=reported.append)
-    await feeder
-
-    assert reported == [succeeded]
+    events = await _drive_operation(
+        lock, "force_lock", Commands.LOCK, LOCK_ACK, result=result
+    )
+    assert f"result {succeeded}" in events
 
 
 @pytest.mark.asyncio
