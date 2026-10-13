@@ -1336,8 +1336,11 @@ class PushLock:
     ) -> _T:
         """Run a command that moves no motor and return its result.
 
-        A failure of any kind is logged once at warning and raised.
+        A lock that is not running when called is refused with no warning. A
+        failure after that is logged once at warning and raised.
         """
+        if not self._running:
+            raise RuntimeError(f"{self.name}: {name} not possible because not running")
         try:
             outcome = await self._attempt_on_lock(name, operation)
             if isinstance(outcome, TimeoutError):
@@ -1362,6 +1365,8 @@ class PushLock:
         A raised TimeoutError is in the retry decorator's set, which would
         reconnect and send the command again.
         """
+        # A lock stopped while its command was in flight is not reconnected to
+        # send the command again.
         if not self._running:
             raise RuntimeError(f"{self.name}: {name} not possible because not running")
         lock = await self._ensure_connected()

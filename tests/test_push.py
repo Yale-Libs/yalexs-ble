@@ -3464,11 +3464,48 @@ async def test_push_lock_keycode_error_propagates_without_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_push_lock_keycode_requires_running() -> None:
+async def test_push_lock_keycode_requires_running(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     push_lock, _ = _keycode_push_lock()
     push_lock._running = False
-    with pytest.raises(RuntimeError, match="not running"):
+    with (
+        caplog.at_level(logging.INFO, logger="yalexs_ble.push"),
+        patch.object(
+            push_lock, "_ensure_connected", new_callable=AsyncMock
+        ) as ensure_connected,
+        pytest.raises(RuntimeError, match="not running"),
+    ):
         await push_lock.get_keycode(1)
+    ensure_connected.assert_not_awaited()
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_stopped_in_flight_is_not_sent_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    push_lock, lock = _keycode_push_lock()
+
+    async def _stopped_in_flight(_slot: int) -> None:
+        push_lock._running = False
+        raise DisconnectedError("stopping")
+
+    lock.clear_keycode.side_effect = _stopped_in_flight
+    ensure_connected = AsyncMock(return_value=lock)
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", ensure_connected),
+        patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
+        pytest.raises(RuntimeError, match="not running"),
+    ):
+        await push_lock.clear_keycode(1)
+
+    ensure_connected.assert_awaited_once()
+    lock.clear_keycode.assert_awaited_once_with(1)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "clear_keycode failed: RuntimeError" in warnings[0].getMessage()
 
 
 def _unhurried_timeout(_seconds: float) -> Any:
