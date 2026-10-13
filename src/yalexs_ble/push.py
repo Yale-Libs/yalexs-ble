@@ -1319,7 +1319,7 @@ class PushLock:
     async def set_keycode(self, slot: int, pin: str) -> None:
         """Program a PIN into a keypad slot.
 
-        The slot is cleared first, so a KeycodeError from a later step leaves it empty.
+        The slot is cleared first, so any failure after the Clear can leave it empty.
         """
         _validate_keycode_slot(slot)
         encode_keycode_pin(pin)
