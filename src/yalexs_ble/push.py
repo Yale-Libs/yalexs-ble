@@ -1359,7 +1359,9 @@ class PushLock:
         """Run one attempt; a TimeoutError from the command's wait is returned."""
         # Not reconnected to resend after a stop.
         if not self._running:
-            raise RuntimeError(f"{self.name}: {name} not possible because not running")
+            raise RuntimeError(
+                f"{self.name}: stopped during {name}; its result is unknown"
+            )
         lock = await self._ensure_connected()
         try:
             result = await operation(lock)
@@ -1497,11 +1499,6 @@ class PushLock:
     def _record_auth_success(self) -> None:
         """Clear the auth failure count and publish AuthState(successful=True)."""
         _AUTH_FAILURE_HISTORY.auth_success(self.address)
-        if self._callbacks and (
-            self._lock_info is None or self.connection_info is None
-        ):
-            # _callback_state asserts both before it calls a callback.
-            return
         self._update_any_state([AuthState(successful=True)])
 
     async def update(self) -> None:
@@ -1919,9 +1916,10 @@ class PushLock:
         )
         if not self._callbacks:
             return
-        assert self._lock_info is not None  # nosec
         connection_info = self.connection_info
-        assert connection_info is not None  # nosec
+        if self._lock_info is None or connection_info is None:
+            # Kept for the first update, which publishes once its polls are done.
+            return
         for callback in self._callbacks:
             try:
                 callback(lock_state, self._lock_info, connection_info)

@@ -3500,7 +3500,7 @@ async def test_push_lock_keycode_stopped_in_flight_is_not_sent_again(
         caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
         patch.object(push_lock, "_ensure_connected", ensure_connected),
         patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
-        pytest.raises(RuntimeError, match="not running"),
+        pytest.raises(RuntimeError, match="stopped during clear_keycode"),
     ):
         await push_lock.clear_keycode(1)
 
@@ -3766,7 +3766,7 @@ async def test_push_lock_keycode_stores_auth_success_without_a_callback() -> Non
     ("lock_info", "advertisement"),
     [(None, _advertisement({})), (TEST_LOCK_INFO, None)],
 )
-async def test_push_lock_keycode_clears_the_count_alone_if_it_cannot_publish(
+async def test_push_lock_keycode_holds_auth_success_until_it_can_publish(
     lock_info: LockInfo | None, advertisement: AdvertisementData | None
 ) -> None:
     push_lock, lock, published = _latched_keycode_push_lock()
@@ -3777,7 +3777,15 @@ async def test_push_lock_keycode_clears_the_count_alone_if_it_cannot_publish(
         assert await push_lock.get_keycode(200) == "135790"
 
     assert published == []
+    assert push_lock.lock_state is not None
+    assert push_lock.lock_state.auth == AuthState(successful=True)
     assert _AUTH_FAILURE_HISTORY.should_raise(push_lock.address) is False
+
+    # Known on both counts, the stored state is published as it stands.
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._advertisement_data = _advertisement({})
+    push_lock._callback_state(push_lock._get_current_state())
+    assert published == [AuthState(successful=True)]
 
 
 @pytest.mark.asyncio
