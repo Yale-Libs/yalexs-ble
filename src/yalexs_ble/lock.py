@@ -222,7 +222,8 @@ def _keycode_response_matcher(
     return matches
 
 
-def _validate_keycode_slot(slot: int) -> None:
+def validate_keycode_slot(slot: int) -> None:
+    """Raise ValueError for a keypad slot outside the lock's range."""
     if not 1 <= slot <= KEYCODE_MAX_SLOT:
         raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
 
@@ -746,7 +747,7 @@ class Lock:
     @raise_if_not_connected
     async def get_keycode(self, slot: int) -> str | None:
         """Read the PIN in a keypad slot; None if the slot is empty."""
-        _validate_keycode_slot(slot)
+        validate_keycode_slot(slot)
         assert self.session is not None  # nosec
         cmd = self.session.build_command(Commands.KEYCODE_GET)
         cmd[0x04:0x06] = util._int_to_bytes(slot, 2)
@@ -756,7 +757,7 @@ class Lock:
     @raise_if_not_connected
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot without needing to know its PIN."""
-        _validate_keycode_slot(slot)
+        validate_keycode_slot(slot)
         blank = b"\xff" * util.KEYCODE_PIN_BYTES
         cmd = self._keycode_slot_command(Commands.KEYCODE_CLEAR, blank, slot)
         await self._send_keycode(cmd, "clear_keycode")
@@ -768,7 +769,7 @@ class Lock:
         The slot is cleared first, so a KeycodeError from a later step
         leaves the slot empty; the error names the step that failed.
         """
-        _validate_keycode_slot(slot)
+        validate_keycode_slot(slot)
         encoded = util.encode_keycode_pin(pin)
         assert self.session is not None  # nosec
         await self.clear_keycode(slot)

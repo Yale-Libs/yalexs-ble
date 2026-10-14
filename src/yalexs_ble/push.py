@@ -41,7 +41,7 @@ from .const import (
     LockStateValue,
     LockStatus,
 )
-from .lock import ActivityLogOverrunError, Lock, _validate_keycode_slot
+from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
 from .session import (
     AuthError,
     BluetoothError,
@@ -1311,7 +1311,7 @@ class PushLock:
 
     async def get_keycode(self, slot: int) -> str | None:
         """Read the PIN in a keypad slot; None if the slot is empty."""
-        _validate_keycode_slot(slot)
+        validate_keycode_slot(slot)
         return await self._run_on_lock(
             "get_keycode", lambda lock: lock.get_keycode(slot)
         )
@@ -1321,24 +1321,20 @@ class PushLock:
 
         The slot is cleared first, so any failure after the Clear can leave it empty.
         """
-        _validate_keycode_slot(slot)
+        validate_keycode_slot(slot)
         encode_keycode_pin(pin)
         await self._run_on_lock("set_keycode", lambda lock: lock.set_keycode(slot, pin))
 
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot."""
-        _validate_keycode_slot(slot)
+        validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
 
     @operation_lock
     async def _run_on_lock(
         self, name: str, operation: Callable[[Lock], Awaitable[_T]]
     ) -> _T:
-        """Run a command that moves no motor and return its result.
-
-        A lock that is not running when called is refused with no warning. A
-        failure after that is logged once at warning and raised.
-        """
+        """Run a command that moves no motor; a failure is logged once at warning."""
         if not self._running:
             raise RuntimeError(f"{self.name}: {name} not possible because not running")
         try:
@@ -1360,19 +1356,15 @@ class PushLock:
     async def _attempt_on_lock(
         self, name: str, operation: Callable[[Lock], Awaitable[_T]]
     ) -> _T | TimeoutError:
-        """Run one attempt and return a TimeoutError from the command's wait.
-
-        A raised TimeoutError is in the retry decorator's set, which would
-        reconnect and send the command again.
-        """
-        # A lock stopped while its command was in flight is not reconnected to
-        # send the command again.
+        """Run one attempt; a TimeoutError from the command's wait is returned."""
+        # Not reconnected to resend after a stop.
         if not self._running:
             raise RuntimeError(f"{self.name}: {name} not possible because not running")
         lock = await self._ensure_connected()
         try:
             result = await operation(lock)
         except TimeoutError as err:
+            # Raised, it would make the retry decorator reconnect and resend.
             return err
         self._record_auth_success()
         self._complete_operation(time.monotonic())
@@ -1503,11 +1495,7 @@ class PushLock:
         self._callback_state(replace(lock_state, **changes))
 
     def _record_auth_success(self) -> None:
-        """Clear the auth failure count and publish AuthState(successful=True).
-
-        Nothing is published while a callback is registered and the lock info or
-        connection info is unknown; a later call publishes it once both are known.
-        """
+        """Clear the auth failure count and publish AuthState(successful=True)."""
         _AUTH_FAILURE_HISTORY.auth_success(self.address)
         if self._callbacks and (
             self._lock_info is None or self.connection_info is None
