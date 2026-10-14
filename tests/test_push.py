@@ -1855,7 +1855,7 @@ async def test_auto_lock_read_backoff_survives_reconnect() -> None:
     # case-2 storm cannot restart.
     assert await push_lock._read_auto_lock_setting(client) is False
     mock_lock.auto_lock_status.assert_not_called()
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -1967,7 +1967,7 @@ async def test_auto_lock_read_timeout_does_not_propagate_out_of_update() -> None
     assert push_lock.lock_status == LockStatus.LOCKED
     assert push_lock._auto_lock_read_ack_failures == 1
     mock_lock.auto_lock_status.assert_awaited_once()
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -2185,7 +2185,7 @@ async def test_auto_lock_read_pending_survives_reconnect() -> None:
     assert push_lock._awaiting_auto_lock_response is True
     assert push_lock._auto_lock_response_deadline == deadline
     assert push_lock._auto_lock_read_response_failures == 1
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.parametrize("always_connected", [False, True])
@@ -2286,7 +2286,7 @@ async def test_auto_lock_read_response_backoff_survives_connect_on_demand(
         push_lock._earliest_auto_lock_read_time
         >= before + AUTO_LOCK_READ_FAILURE_BACKOFF
     )
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -2319,7 +2319,7 @@ async def test_auto_lock_read_ack_backoff_survives_connect_on_demand() -> None:
         push_lock._earliest_auto_lock_read_time
         >= before + AUTO_LOCK_READ_FAILURE_BACKOFF
     )
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -2387,7 +2387,7 @@ async def test_dead_lock_read_not_reached_earlier_read_propagates(
     assert push_lock._auto_lock_read_ack_failures == 0
     assert push_lock._auto_lock_read_response_failures == 0
     assert push_lock._awaiting_auto_lock_response is False
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -2673,7 +2673,7 @@ async def test_a_one_byte_advertisement_schedules_an_update_on_change(
     push_lock.update_advertisement(ble_device, _advertisement({mfr_id: b"\x01"}))
     assert push_lock._last_adv_value == 1
     assert _update_scheduled(push_lock)
-    push_lock._cancel_future_update()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.parametrize("mfr_id", [YALE_MFR_ID, ASSA_ABLOY_MFR_ID])
@@ -2747,7 +2747,7 @@ async def test_a_one_byte_value_is_read_ahead_of_a_cached_longer_payload(
 
     assert push_lock._last_adv_value == 1
     assert _update_scheduled(push_lock)
-    push_lock._cancel_future_update()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.parametrize(
@@ -2769,7 +2769,7 @@ async def test_an_empty_payload_does_not_hide_the_other_id(
 
     assert push_lock._last_adv_value == expected_value
     assert _update_scheduled(push_lock)
-    push_lock._cancel_future_update()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -2784,7 +2784,7 @@ async def test_the_yale_company_id_is_read_before_assa_abloy() -> None:
     )
 
     assert push_lock._last_adv_value == 1
-    push_lock._cancel_future_update()
+    _cancel_timers(push_lock)
 
 
 def _hap_payload(state_num: int) -> bytes:
@@ -3170,7 +3170,7 @@ async def test_a_cycle_that_yields_to_the_floor_leaves_the_backoff_alone() -> No
     push_lock._earliest_update_time = time.monotonic() + 5.0
     await push_lock._execute_deferred_update()
     assert push_lock._reconnect_backoff == 8.0
-    push_lock._cancel_future_update()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -3832,7 +3832,7 @@ async def test_secure_projection_invariant_table(
         await getattr(push_lock, operation)()
 
     assert emissions == expected
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -3845,7 +3845,7 @@ async def test_settled_securemode_push_is_not_a_securing_transitional() -> None:
 
     assert push_lock.lock_status is LockStatus.SECUREMODE
     assert push_lock.secure_status is LockStatus.LOCKED
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -3914,7 +3914,7 @@ async def test_a_cancelled_securemode_keeps_the_pair_and_polls_at_the_debounce()
         LockStatus.LOCKING,
     )
     schedule.assert_called_once_with(LOCK_STALE_STATE_DEBOUNCE_DELAY)
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -4395,7 +4395,7 @@ async def test_an_operation_settling_after_the_stop_arms_nothing():
     assert push_lock._cancel_deferred_update is None
     # The unknown position _finalize_operation would otherwise have applied.
     assert push_lock.lock_status == LockStatus.LOCKING
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -4420,7 +4420,7 @@ async def test_a_stop_mid_operation_keeps_the_owed_poll_and_the_floor():
 
     assert push_lock._force_lock_status_poll is True
     assert push_lock._earliest_update_time > time.monotonic()
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -4944,7 +4944,7 @@ async def test_a_failure_under_precedence_tears_the_link_down_before_the_exit() 
     client.disconnect.assert_awaited_once()
     scheduled.assert_called_once_with(LOCK_STALE_STATE_DEBOUNCE_DELAY)
     assert push_lock.lock_status == LockStatus.JAMMED
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -4987,7 +4987,7 @@ async def test_a_failure_under_precedence_drops_the_idle_timer_and_the_link() ->
     client.disconnect.assert_awaited_once()
     scheduled.assert_called_once_with(KEEP_ALIVE_TIME)
     assert push_lock.lock_status == LockStatus.JAMMED
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -5400,7 +5400,7 @@ async def test_an_op_response_after_a_stop_leaves_the_display_alone() -> None:
 
     assert window_after_the_op_response == [False]
     assert push_lock.lock_status is LockStatus.LOCKING
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -5680,7 +5680,7 @@ async def test_a_command_over_a_position_admitted_after_a_jam_shows_its_result(
 
     assert emissions == emitted
     scheduled.assert_called_once_with(poll_delay)
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -5718,7 +5718,7 @@ async def test_a_failure_over_a_position_admitted_after_a_jam_is_not_retried() -
     assert attempts == 1
     assert emissions == [LockStatus.LOCKING, LockStatus.UNKNOWN]
     scheduled.assert_called_once_with(LOCK_STALE_STATE_DEBOUNCE_DELAY)
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -5771,7 +5771,7 @@ async def test_queued_operation_emits_no_transitional_until_dequeued() -> None:
         LockStatus.LOCKING,
         LockStatus.LOCKED,
     ]
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -5830,7 +5830,7 @@ async def test_early_disconnect_retries_to_exhaustion_then_stamps_unknown() -> N
     assert emissions == [LockStatus.UNKNOWN]
     assert push_lock.lock_status is LockStatus.UNKNOWN
     assert push_lock._operation_window_open is False
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -5861,7 +5861,7 @@ async def test_operation_incomplete_after_write_success_stamps_unknown_once() ->
     assert emissions == [LockStatus.LOCKING, LockStatus.UNKNOWN]
     assert push_lock.lock_status is LockStatus.UNKNOWN
     assert push_lock._operation_window_open is False
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -5908,7 +5908,7 @@ async def test_a_retryable_failure_disconnects_before_the_retry() -> None:
         await push_lock.lock()
 
     assert order == ["attempt 1", "teardown", "backoff", "attempt 2"]
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6083,7 +6083,7 @@ async def test_failed_operation_leaves_the_status_poll_armed() -> None:
     final_state = push_lock._lock_state
     assert final_state is not None
     assert final_state.lock == LockStatus.LOCKED
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6130,7 +6130,7 @@ async def test_cancelled_operation_leaves_the_status_poll_armed() -> None:
     final_state = push_lock._lock_state
     assert final_state is not None
     assert final_state.lock == LockStatus.LOCKED
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6148,7 +6148,7 @@ async def test_a_refused_reading_leaves_the_status_poll_owed() -> None:
 
     assert push_lock.lock_status is LockStatus.UNLOCKING
     assert LockStatus not in push_lock._seen_this_session
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6186,7 +6186,7 @@ async def test_exhausted_retries_after_write_success_stamp_unknown() -> None:
     assert push_lock._operation_window_open is False
     assert LockStatus not in push_lock._seen_this_session
     assert push_lock._force_lock_status_poll is True
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6311,7 +6311,7 @@ async def test_the_operation_cancels_the_pending_update_on_the_way_in() -> None:
         await push_lock.lock()
 
     assert pending_at_connect == [False]
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6374,7 +6374,7 @@ async def test_every_operation_exit_owes_the_status_poll(
 
     assert push_lock._force_lock_status_poll is True
     scheduled.assert_called_once_with(delay)
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6393,7 +6393,7 @@ async def test_a_collapsed_schedule_still_waits_for_the_floor() -> None:
         < handle.when() - push_lock.loop.time()
         <= LOCK_STALE_STATE_DEBOUNCE_DELAY
     )
-    push_lock._cancel_future_update()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6430,7 +6430,7 @@ async def test_the_operations_exit_replaces_a_cycle_armed_mid_operation() -> Non
         KEEP_ALIVE_TIME - 1 < handle.when() - push_lock.loop.time() <= KEEP_ALIVE_TIME
     )
     mock_lock.lock_status.assert_not_awaited()
-    push_lock._cancel_future_update()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6501,7 +6501,7 @@ async def test_cancellation_polls_sooner_than_the_keep_alive() -> None:
 
     assert push_lock._force_lock_status_poll is True
     scheduled.assert_called_once_with(LOCK_STALE_STATE_DEBOUNCE_DELAY)
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6524,7 +6524,7 @@ async def test_force_lock_status_poll_reads_past_seen_this_session() -> None:
     mock_lock.lock_status.assert_awaited_once()
     assert push_lock.lock_status == LockStatus.LOCKED
     assert push_lock._force_lock_status_poll is False
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
@@ -6551,7 +6551,7 @@ async def test_a_failed_status_read_leaves_the_poll_obligation_armed() -> None:
     # Only the flag can be asking, so each attempt proves it was still set.
     assert mock_lock.lock_status.await_count == DEFAULT_ATTEMPTS
     assert push_lock._force_lock_status_poll is True
-    push_lock._cancel_disconnect_timer()
+    _cancel_timers(push_lock)
 
 
 @pytest.mark.asyncio
