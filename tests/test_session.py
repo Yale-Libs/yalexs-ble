@@ -134,57 +134,6 @@ async def test_the_answering_frame_reaches_the_callback_before_the_wait() -> Non
     assert armed_at_hand_off == [True]
 
 
-@pytest.mark.asyncio
-async def test_corrupt_frame_disarms_the_wait_and_the_command_is_retried() -> None:
-    """A frame that fails the checksum ends the wait, and the write is repeated.
-
-    The corrupt frame resolves the future with a ResponseError, so the matcher
-    must be cleared with it -- otherwise the retry re-arms the wait with the
-    previous command's matcher still in place. The staged operation wait skips
-    corrupt frames instead; this is the plain path, where re-writing a settings
-    command costs nothing.
-    """
-    received: list[bytes] = []
-    session = _make_session(received)
-    matcher = _settings_response_matcher(
-        Commands.READSETTING.value, SettingType.AUTOLOCK.value
-    )
-    frames = [CORRUPT_ANSWER, READ_ANSWER]
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        session._notify(0, bytearray(frames.pop(0)))
-
-    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session.execute(bytearray(18), "auto_lock_status", matcher)
-
-    assert result == READ_ANSWER
-    assert session.client.write_gatt_char.await_count == 2
-    # The corrupt frame was withheld from the state callback; only the valid
-    # one reached it, and only it answered.
-    assert received == [READ_ANSWER]
-
-
-@pytest.mark.asyncio
-async def test_corrupt_frame_on_every_attempt_raises_and_leaves_the_slot_empty() -> (
-    None
-):
-    """Three corrupt frames exhaust the retries and the error reaches the caller."""
-    received: list[bytes] = []
-    session = _make_session(received)
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        session._notify(0, bytearray(CORRUPT_ANSWER))
-
-    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-
-    with pytest.raises(ResponseError):
-        await session._locked_write(bytearray(18), "auto_lock_status")
-
-    assert session.client.write_gatt_char.await_count == 3
-    assert session._notify_future is None
-    assert session._notify_matcher is None
-
-
 def _short_timeout(_seconds: float) -> object:
     """Replacement for util.asyncio_timeout that expires almost immediately."""
     return asyncio.timeout(0.01)
@@ -421,14 +370,7 @@ async def test_an_unsolicited_invalid_frame_is_withheld_from_state(
 
 @pytest.mark.asyncio
 async def test_a_short_frame_ends_an_armed_wait_and_the_command_is_re_sent() -> None:
-    """A wrong-length frame reaches the waiter instead of costing it a timeout.
-
-    The checksum helper indexes 18 bytes unconditionally, so before the gate a
-    short frame raised IndexError out of the callback with the wait still
-    armed, and the caller paid the whole response timeout before it could try
-    again. The gate ends the wait with a ResponseError, so the command goes
-    out again straight away.
-    """
+    """A short frame fails the wait at once, and the command is written again."""
     received: list[bytes] = []
     session = _make_session(received)
     frames = [bytearray(9), bytearray(READ_ANSWER)]
@@ -561,6 +503,48 @@ async def test_a_secure_session_handshake_frame_still_answers_its_wait() -> None
     assert len(on_air) == RESPONSE_FRAME_LEN
     result = await session.execute(session.build_command(0x01), "KEY_EXCHANGE")
     assert result == bytes(answer)
+
+
+@pytest.mark.parametrize(
+    ("make_session", "mode"),
+    [
+        pytest.param(
+            lambda client: Session(client, "testlock", asyncio.Lock(), set()),
+            modes.CBC(bytes(0x10)),
+            id="cbc",
+        ),
+        pytest.param(
+            lambda client: SecureSession(client, "testlock", asyncio.Lock(), set(), 1),
+            modes.ECB(),  # nosec
+            id="secure-ecb",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_every_attempt_decrypts_at_the_lock_to_the_command(
+    make_session: Callable[[MagicMock], Session], mode: modes.Mode
+) -> None:
+    """A retried write decrypts at the lock to the command, as the first one does."""
+    client = MagicMock(is_connected=True)
+    session = make_session(client)
+    session.set_key(SESSION_KEY)
+    lock_decryptor = Cipher(algorithms.AES(SESSION_KEY), mode).decryptor()
+    command = session.build_command(Commands.GETSTATUS)
+    expected = bytearray(command)
+    session._write_checksum(expected)
+    at_the_lock: list[bytes] = []
+
+    async def deliver(_char: object, frame: bytes, _response: bool) -> None:
+        at_the_lock.append(lock_decryptor.update(frame[0x00:0x10]) + frame[0x10:])
+        # A short frame fails each attempt's wait, so all three attempts are written.
+        session._notify(0, bytearray(9))
+
+    client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    with pytest.raises(ResponseError):
+        await session.execute(command, "lock_status")
+
+    assert at_the_lock == [expected] * 3
 
 
 @pytest.mark.asyncio
@@ -726,6 +710,9 @@ async def test_execute_operation_happy_path() -> None:
 
     assert result == bytes(op_response)
     assert client.write_gatt_char.await_count == 1
+    frame = client.write_gatt_char.await_args.args[1]
+    lock_decryptor = Cipher(algorithms.AES(bytes(16)), modes.CBC(bytes(16))).decryptor()
+    assert lock_decryptor.update(frame[0x00:0x10]) + frame[0x10:] == command
     assert progress.write_attempted is True
     assert progress.acknowledged is True
     write_cb.assert_called_once()
@@ -1489,6 +1476,43 @@ async def test_cooldown_paces_a_command_behind_the_last_frame(
     assert slept == [pytest.approx(COOLDOWN_TIME - 0.2)]
 
 
+def _patch_session_clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
+    """Patch monotonic in session.py to return clock["now"], which starts at 1000.0."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: clock["now"])
+    return clock
+
+
+@pytest.mark.asyncio
+async def test_the_cooldown_debug_line_gives_the_seconds_left(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cooldown debug line gives the seconds left, and the wait sleeps for them."""
+    session, _ = _make_operation_session()
+    session.enable_cooldown()
+    clock = _patch_session_clock(monkeypatch)
+    # These values are exact in binary, and the gap differs from the seconds left,
+    # so the line shows which of the two it gives.
+    session._last_callback_time = clock["now"] - 0.0625
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+        clock["now"] += delay
+
+    monkeypatch.setattr("yalexs_ble.session.asyncio.sleep", fake_sleep)
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
+        await session._wait_for_cooldown()
+
+    remaining = COOLDOWN_TIME - 0.0625
+    assert [
+        (r.levelname, r.getMessage())
+        for r in caplog.records
+        if "for lock to settle" in r.getMessage()
+    ] == [("DEBUG", f"mylock: Waiting {remaining} for lock to settle")]
+    assert slept == [remaining]
+
+
 @pytest.mark.asyncio
 async def test_execute_operation_pays_the_cooldown_before_its_write(
     monkeypatch: pytest.MonkeyPatch,
@@ -1535,6 +1559,93 @@ async def test_execute_operation_pays_the_cooldown_before_its_write(
 
     assert result == bytes(op_response)
     assert slept == [pytest.approx(COOLDOWN_TIME - 0.2)]
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_frame_ends_the_wait_and_the_re_send_waits_out_the_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-send waits COOLDOWN_TIME after the last frame; a new frame restarts it."""
+    received: list[bytes] = []
+    session = _make_session(received)
+    session.enable_cooldown()
+    clock = _patch_session_clock(monkeypatch)
+    matcher = _settings_response_matcher(
+        Commands.READSETTING.value, SettingType.AUTOLOCK.value
+    )
+    frames = [CORRUPT_ANSWER, READ_ANSWER]
+    written_at: list[float] = []
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        written_at.append(clock["now"])
+        session._notify(0, bytearray(frames.pop(0)))
+
+    frame_during_pause = [READ_ACK]
+
+    async def fake_wait(_futures: object, timeout: float) -> None:
+        if frame_during_pause:
+            # A frame not answering the command arrives halfway through the pause.
+            clock["now"] += timeout / 2
+            session._notify(0, bytearray(frame_during_pause.pop()))
+        else:
+            clock["now"] += timeout
+
+    monkeypatch.setattr("yalexs_ble.session.asyncio.wait", fake_wait)
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    result = await session.execute(bytearray(18), "get_parameter", matcher)
+
+    assert result == READ_ANSWER
+    assert written_at == [1000.0, pytest.approx(1000.0 + 1.5 * COOLDOWN_TIME)]
+    # The corrupt frame was withheld from the state callback.
+    assert received == [READ_ACK, READ_ANSWER]
+
+
+@pytest.mark.asyncio
+async def test_an_answer_during_the_re_send_pause_is_taken_without_a_re_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The previous write's answer, arriving during the pause, ends it and is taken."""
+    received: list[bytes] = []
+    session = _make_session(received)
+    session.enable_cooldown()
+    # The clock stands still, so only the answer can end the pause.
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: 1000.0)
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(CORRUPT_ANSWER))
+        # The answer lands after the corrupt frame has ended the first wait.
+        session.loop.call_soon(session._notify, 0, bytearray(READ_ANSWER))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    async with asyncio.timeout(COOLDOWN_TIME / 2):
+        result = await session.execute(bytearray(18), "get_parameter")
+
+    assert result == READ_ANSWER
+    assert session.client.write_gatt_char.await_count == 1
+    assert received == [READ_ANSWER]
+
+
+@pytest.mark.asyncio
+async def test_a_frame_after_the_cooldown_cannot_answer_a_command_before_its_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first attempt is written without the re-send pause."""
+    session = _make_session([])
+    session.enable_cooldown()
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: 1000.0)
+    # A frame arrived after execute() had waited out its cooldown, while the command
+    # waited for the session lock, so the test calls _locked_write directly.
+    session._last_callback_time = 1000.0
+    session.client.write_gatt_char = AsyncMock(
+        side_effect=_write_delivering(session, [bytearray(READ_ANSWER)])
+    )
+    # A valid frame that a wait with no matcher would take arrives on the next turn.
+    session.loop.call_soon(session._notify, 0, bytearray(READ_ACK))
+    async with asyncio.timeout(COOLDOWN_TIME / 2):
+        result = await session._locked_write(bytearray(18), "get_parameter")
+
+    assert result == READ_ANSWER
+    assert session.client.write_gatt_char.await_count == 1
 
 
 # =========================================================================== #
