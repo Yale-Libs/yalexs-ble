@@ -154,6 +154,7 @@ class Session:
         self._first_request = True
         self._last_callback_time = -86400.0
         self._enable_cooldown = False
+        self._disconnect_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
 
     def set_key(self, key: bytes | bytearray) -> None:
@@ -382,7 +383,7 @@ class Session:
             future.set_result(decrypted_data)
 
     async def _write_command(self, command: bytearray, command_name: str) -> None:
-        """Encrypt the command and write it."""
+        """Encrypt the command and write it; a write that fails ends the link."""
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
         # Each write is encrypted afresh, a retry included, because on the plain
         # session the lock's CBC context advances with each frame it decrypts.
@@ -394,7 +395,31 @@ class Session:
             self.write_characteristic,
             frame.hex(),
         )
-        await self.client.write_gatt_char(self.write_characteristic, frame, True)
+        try:
+            await self.client.write_gatt_char(self.write_characteristic, frame, True)
+        except BaseException:
+            # The lock may not have received this frame, and on the plain session
+            # the next frame would then decrypt at the lock to other bytes.
+            if self.client.is_connected:
+                self._disconnect_task = self.loop.create_task(
+                    self._disconnect_after_failed_write()
+                )
+            raise
+
+    async def _disconnect_after_failed_write(self) -> None:
+        """Disconnect the client so the next connection starts a fresh cipher."""
+        _LOGGER.debug("%s: Disconnecting after a failed write", self.name)
+        try:
+            await self.client.disconnect()
+        except Exception:
+            _LOGGER.exception("%s: Disconnect after a failed write raised", self.name)
+
+    def _check_link_for_write(self) -> None:
+        """Raise BleakError if the link is down or a write on this session failed."""
+        if not self.client.is_connected:
+            raise BleakError("disconnected")
+        if self._disconnect_task is not None:
+            raise BleakError("disconnect started after a failed write")
 
     async def _locked_write(
         self,
@@ -402,8 +427,7 @@ class Session:
         command_name: str,
         response_matcher: Callable[[bytes], bool] | None = None,
     ) -> bytes:
-        if not self.client.is_connected:
-            raise BleakError("disconnected")
+        self._check_link_for_write()
 
         # The loop never exhausts: the last attempt re-raises, so the only
         # ways out are break and raise.
@@ -456,8 +480,7 @@ class Session:
         The acknowledgment deadline only serves a retry, so a command that is not
         retried after its write skips it and waits on the op-response alone.
         """
-        if not self.client.is_connected:
-            raise BleakError("disconnected")
+        self._check_link_for_write()
 
         attempt_start = monotonic()
         ack_future: asyncio.Future[bytes] = self.loop.create_future()

@@ -3699,6 +3699,28 @@ async def test_push_lock_keycode_timeout_keeps_the_connection(
 
 
 @pytest.mark.asyncio
+async def test_push_lock_keycode_write_that_hangs_ends_the_link() -> None:
+    """A keycode write that does not return ends the link and is not sent again."""
+    push_lock, lock, _session, client = _keycode_real_session("aa:bb:cc:dd:ee:36")
+
+    async def never_returns(*_args: object) -> None:
+        await asyncio.Event().wait()
+
+    client.write_gatt_char = AsyncMock(side_effect=never_returns)
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.05)),
+        pytest.raises(TimeoutError, match="did not answer get_keycode"),
+    ):
+        await push_lock.get_keycode(200)
+    await asyncio.sleep(0)
+
+    assert client.write_gatt_char.await_count == 1
+    client.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_push_lock_keycode_connect_timeout_is_retried() -> None:
     push_lock, lock = _keycode_push_lock()
     ensure_connected = AsyncMock(side_effect=[TimeoutError(), lock])
@@ -6144,7 +6166,7 @@ def _lock_on_a_real_session(push_lock: PushLock) -> tuple[Lock, Session, MagicMo
     """
     push_lock._ble_device = MagicMock()
     lock = push_lock._get_lock_instance()
-    client = MagicMock(is_connected=True)
+    client = MagicMock(is_connected=True, disconnect=AsyncMock())
     session = Session(
         client, push_lock.name, asyncio.Lock(), set(), lock._internal_state_callback
     )
@@ -6156,6 +6178,31 @@ def _lock_on_a_real_session(push_lock: PushLock) -> tuple[Lock, Session, MagicMo
     lock.session = session
     lock.secure_session = MagicMock()
     return lock, session, client
+
+
+@pytest.mark.asyncio
+async def test_a_failed_battery_write_leaves_the_next_command_a_fresh_connection() -> (
+    None
+):
+    """The battery poll swallows the failed write; the next command reconnects."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:f2")
+    lock, _, client = _lock_on_a_real_session(push_lock)
+    push_lock._client = lock
+
+    async def drop_the_link() -> None:
+        client.is_connected = False
+        lock.disconnected()
+
+    client.write_gatt_char = AsyncMock(side_effect=BleakError("write failed"))
+    client.disconnect = AsyncMock(side_effect=drop_the_link)
+    fresh = AsyncMock(is_connected=True)
+
+    with patch.object(push_lock, "_get_lock_instance", return_value=fresh):
+        await push_lock._locked_update()
+
+    assert client.write_gatt_char.await_count == 1
+    fresh.connect.assert_awaited_once()
+    fresh.lock_status.assert_awaited_once()
 
 
 def _write_delivering(

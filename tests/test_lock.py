@@ -1004,7 +1004,7 @@ def _connected_lock(
     between a poll and its matcher needs a real session rather than a mock.
     """
     lock = _make_lock(state_callback)
-    client = MagicMock(is_connected=True)
+    client = MagicMock(is_connected=True, disconnect=AsyncMock())
     session = Session(
         client, "mylock", asyncio.Lock(), set(), lock._internal_state_callback
     )
@@ -1640,6 +1640,7 @@ def _make_connected_lock_with_session(
     client = MagicMock()
     client.is_connected = True
     client.write_gatt_char = AsyncMock()
+    client.disconnect = AsyncMock()
     lock.client = client
     lock.secure_session = MagicMock()
     session = Session(
