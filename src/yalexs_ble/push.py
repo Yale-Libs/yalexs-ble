@@ -1918,7 +1918,7 @@ class PushLock:
             return
         connection_info = self.connection_info
         if self._lock_info is None or connection_info is None:
-            # Kept for the first update, which publishes once its polls are done.
+            # Kept until both are known; the debug line above shows which is not.
             return
         for callback in self._callbacks:
             try:
