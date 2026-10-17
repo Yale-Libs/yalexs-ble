@@ -141,6 +141,7 @@ class StatusType(IntEnum):
 
 class SettingType(IntEnum):
     AUTOLOCK = 0x28
+    PRIVACY_MODE = 0xBC
 
 
 class LockStatus(Enum):
@@ -155,6 +156,7 @@ class LockStatus(Enum):
     UNLATCHING = 0x09
     UNLATCHED = 0x0A
     SECUREMODE = 0x0C
+    PRIVACY_MODE = 0x10
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}

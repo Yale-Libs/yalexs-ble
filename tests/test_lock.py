@@ -1899,3 +1899,92 @@ def test_op_response_callback_fires_on_op_responses_not_acks() -> None:
     lock._parse_state(_op_response_frame(Commands.UNLOCK, OperationError.MECH_POSITION))
 
     assert op_calls == [1, 1]
+
+
+def _privacy_mode_response(cmd: int, value: int, error: int = 0) -> bytes:
+    """Build a valid 0xBB settings response frame for setting 0xBC (PRIVACY_MODE)."""
+    buf = bytearray(0x12)
+    buf[0x00] = 0xBB
+    buf[0x01] = cmd
+    buf[0x04] = SettingType.PRIVACY_MODE.value
+    buf[0x05] = error
+    buf[0x08:0x0C] = value.to_bytes(4, "little")
+    return _with_checksum(buf.hex())
+
+
+def _make_privacy_mode_lock(resp: bytes) -> tuple[Lock, MagicMock]:
+    """Create a connected Lock whose session returns resp from execute."""
+    session = MagicMock(wraps=_CommandCaptureSession())
+    session.execute = AsyncMock(return_value=resp)
+    return _lock_with_session(session), session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("raw_val", "expected"), [(1, True), (0, False)])
+async def test_get_privacy_mode(raw_val: int, expected: bool) -> None:
+    """get_privacy_mode reads setting 0xBC via READSETTING."""
+    resp = _privacy_mode_response(Commands.READSETTING.value, raw_val)
+    lock, session = _make_privacy_mode_lock(resp)
+
+    result = await lock.get_privacy_mode()
+    assert result is expected
+
+    call_args = session.execute.call_args[0]
+    sent_cmd: bytearray = call_args[0]
+    matcher = call_args[2]
+    assert sent_cmd[0x00] == 0xEE
+    assert sent_cmd[0x01] == Commands.READSETTING.value
+    assert sent_cmd[0x04] == SettingType.PRIVACY_MODE.value
+    assert matcher(resp) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("enabled", "raw_val"), [(True, 1), (False, 0)])
+async def test_set_privacy_mode(enabled: bool, raw_val: int) -> None:
+    """set_privacy_mode writes setting 0xBC via WRITESETTING."""
+    resp = _privacy_mode_response(Commands.WRITESETTING.value, raw_val)
+    lock, session = _make_privacy_mode_lock(resp)
+
+    await lock.set_privacy_mode(enabled)
+
+    call_args = session.execute.call_args[0]
+    sent_cmd: bytearray = call_args[0]
+    matcher = call_args[2]
+    assert sent_cmd[0x00] == 0xEE
+    assert sent_cmd[0x01] == Commands.WRITESETTING.value
+    assert sent_cmd[0x04] == SettingType.PRIVACY_MODE.value
+    assert int.from_bytes(sent_cmd[0x08:0x0C], "little") == raw_val
+    assert matcher(resp) is True
+
+
+@pytest.mark.asyncio
+async def test_set_privacy_mode_raises_on_error_or_value_mismatch() -> None:
+    """set_privacy_mode raises on error byte or value mismatch."""
+    err_resp = _privacy_mode_response(
+        Commands.WRITESETTING.value, 1, error=OperationError.INVALID_OPERATION
+    )
+    lock, session = _make_privacy_mode_lock(err_resp)
+    with pytest.raises(OperationFailedError):
+        await lock.set_privacy_mode(True)
+
+    session.execute = AsyncMock(
+        return_value=_privacy_mode_response(Commands.WRITESETTING.value, 0)
+    )
+    with pytest.raises(ResponseError, match="wrote 1 but lock reported 0"):
+        await lock.set_privacy_mode(True)
+
+
+def test_parse_state_recognizes_privacy_mode_status_and_setting_frames() -> None:
+    """_parse_state recognizes LockStatus.PRIVACY_MODE and setting 0xBC frames."""
+    lock = _make_lock()
+    assert lock._parse_lock_status(0x10) is LockStatus.PRIVACY_MODE
+    assert SettingType.PRIVACY_MODE == 0xBC
+    assert (
+        lock._parse_state(_privacy_mode_response(Commands.WRITESETTING.value, 1)) == ()
+    )
+    assert (
+        lock._parse_state(_privacy_mode_response(Commands.READSETTING.value, 0)) == ()
+    )
+    unknown_setting = bytearray(_privacy_mode_response(Commands.READSETTING.value, 0))
+    unknown_setting[0x04] = 0x99
+    assert lock._parse_state(_with_checksum(unknown_setting.hex())) is None
