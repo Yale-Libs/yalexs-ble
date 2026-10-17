@@ -428,6 +428,8 @@ class Lock:
             ):
                 if state[4] == SettingType.AUTOLOCK.value:
                     return [self._parse_auto_lock_state(state)]
+                if state[4] == SettingType.PRIVACY_MODE.value:
+                    return ()
         elif state[0] == 0xAA:
             if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
                 return ()  # Operation ack; state arrives in the 0xBB op-response
@@ -719,6 +721,50 @@ class Lock:
             ),
         )
         _LOGGER.debug("%s: Finished setting auto lock", self.name)
+
+    @raise_if_not_connected
+    async def get_privacy_mode(self) -> bool:
+        """Read whether privacy mode (setting 0xBC) is enabled."""
+        _LOGGER.debug("%s: Executing get_privacy_mode", self.name)
+        response = await self._execute_command(
+            Commands.READSETTING,
+            SettingType.PRIVACY_MODE,
+            "get_privacy_mode",
+            _settings_response_matcher(
+                Commands.READSETTING.value, SettingType.PRIVACY_MODE.value
+            ),
+        )
+        _LOGGER.debug("%s: Finished executing get_privacy_mode", self.name)
+        return util._bytes_to_int(response[0x08:0x0C]) == 1
+
+    @raise_if_not_connected
+    async def set_privacy_mode(self, enabled: bool) -> None:
+        """Enable or disable privacy mode (setting 0xBC)."""
+        _LOGGER.debug("%s: Setting privacy mode to %s", self.name, enabled)
+        assert self.session is not None  # nosec
+        target = 1 if enabled else 0
+        cmd = self.session.build_operation_command(
+            Commands.WRITESETTING, SettingType.PRIVACY_MODE
+        )
+        util._copy(cmd, util._int_to_bytes(target, 4), destLocation=0x08)
+        response = await self.session.execute(
+            cmd,
+            "set_privacy_mode",
+            _settings_response_matcher(
+                Commands.WRITESETTING.value, SettingType.PRIVACY_MODE.value
+            ),
+        )
+        if (error := response[0x05]) != OperationError.COMM_SUCCESS:
+            raise OperationFailedError(
+                "set_privacy_mode", VALUE_TO_OPERATION_ERROR.get(error, error)
+            )
+        actual = util._bytes_to_int(response[0x08:0x0C])
+        if actual != target:
+            raise ResponseError(
+                f"{self.name}: set_privacy_mode wrote {target} "
+                f"but lock reported {actual}"
+            )
+        _LOGGER.debug("%s: Finished setting privacy mode", self.name)
 
     async def _send_keycode(
         self, cmd: bytearray, command_name: str, slot: int | None = None

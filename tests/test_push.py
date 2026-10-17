@@ -7986,3 +7986,26 @@ async def test_an_op_response_the_lock_parses_holds_the_next_read_off():
     lock._parse_state(bytes(_with_checksum(_OP_RESPONSE_OK)))
 
     assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+@pytest.mark.asyncio
+async def test_push_lock_privacy_mode() -> None:
+    """PushLock delegates get/set_privacy_mode and clears seen LockStatus."""
+    push_lock, mock_lock = _keycode_push_lock()
+    mock_lock.get_privacy_mode = AsyncMock(return_value=True)
+    mock_lock.set_privacy_mode = AsyncMock(return_value=None)
+    push_lock._seen_this_session.add(LockStatus)
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        assert await push_lock.get_privacy_mode() is True
+        mock_lock.get_privacy_mode.assert_awaited_once_with()
+
+        await push_lock.set_privacy_mode(True)
+        mock_lock.set_privacy_mode.assert_awaited_once_with(True)
+        assert LockStatus not in push_lock._seen_this_session
+
+    push_lock._state_callback([LockStatus.PRIVACY_MODE])
+    assert push_lock.lock_status is LockStatus.PRIVACY_MODE
+    assert push_lock.secure_status is LockStatus.UNLOCKED
