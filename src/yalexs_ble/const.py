@@ -279,6 +279,189 @@ class OpCode(Enum):
         return cast(OpCode, cls._value2member_map_.setdefault(value, member))
 
 
+class LogType(IntEnum):
+    """The log_type at byte 4 of a GetLog reply, in Yale's numbering."""
+
+    LOCK_OPERATION = 0x00
+    KEYPAD_OPEN = 0x01
+    KEYPAD_WRONG_CODE = 0x02
+    CODE_ADDED = 0x03
+    KEYPAD_INFO = 0x04
+    CODE_DELETED = 0x05
+    ALL_CODES_DELETED = 0x06
+    CODE_OPERATION = 0x07
+    KEYPAD_CLOSE = 0x08
+    FACTORY_RESET = 0x09
+    CODE_ADDED_V2 = 0x0A
+    CODE_DELETED_V2 = 0x0B
+    CREDENTIAL_ADDED = 0x0C
+    CREDENTIAL_DELETED = 0x0D
+    CREDENTIAL_OPERATION = 0x0E
+    TAMPER = 0x0F
+    BCM_TEST = 0x10
+    ACCESSORY_EVENT = 0x11
+    HOMEKEY_OPERATION = 0x12
+    DPS_INFO = 0x13
+    BATTERY_INFO = 0x15
+    LOCAL_EVENT_NOTIFICATION = 0x16
+    PRODUCT_MESSAGE = 0x17
+    MATTER_MESSAGE = 0x18
+    DOOR_STATE_CHANGED = 0x20
+    DIALOG_REBOOT = 0x40
+    GET_LOG_ERROR = LOG_TYPE_GET_LOG_ERROR
+
+
+class LockCred(IntEnum):
+    """The credential type of a credential record."""
+
+    PIN = 0x00
+    RF = 0x01
+    FINGER = 0x02
+    FACE = 0x04
+    INSIDE_DOOR_PIN = 0x05
+    PALM = 0x06
+    ALIRO = 0x08
+    ALL = 0xFF
+
+
+class TamperType(IntEnum):
+    """The tamper type of a Tamper record."""
+
+    CLEAR = 0x00
+    TOO_MANY_AUTH_ERRORS = 0x01
+    FRONT_REMOVED = 0x02
+    DOOR_FORCED_OPEN = 0x03
+    HIGH_TEMPERATURE = 0x04
+    TOO_MANY_AUTH_ERRORS_PIN = 0x05
+    TOO_MANY_AUTH_ERRORS_PIN_CLEARED = 0x06
+    TOO_MANY_AUTH_ERRORS_RFID = 0x07
+    TOO_MANY_AUTH_ERRORS_RFID_CLEARED = 0x08
+    TOO_MANY_AUTH_ERRORS_FINGERPRINT = 0x09
+    TOO_MANY_AUTH_ERRORS_FINGERPRINT_CLEARED = 0x0A
+    TOO_MANY_AUTH_ERRORS_PALM = 0x0B
+    TOO_MANY_AUTH_ERRORS_PALM_CLEARED = 0x0C
+    TOO_MANY_AUTH_ERRORS_FACE_SCAN = 0x0D
+    TOO_MANY_AUTH_ERRORS_FACE_SCAN_CLEARED = 0x0E
+
+
+# Each table maps a value to the vendor's name for it; a value the vendor
+# does not name has no entry. A suffix names the brand whose app uses the
+# names.
+LOG_TYPE_NAMES_YALE: dict[int, str] = {
+    0x00: "LockOperation",
+    0x01: "KeypadOpen",
+    0x02: "KeypadWrongCode",
+    0x03: "CodeAdded",
+    0x04: "KeypadInfo",
+    0x05: "CodeDeleted",
+    0x06: "AllCodesDeleted",
+    0x07: "CodeOperation",
+    0x08: "KeypadClose",
+    0x09: "FactoryReset",
+    0x0A: "CodeAddedv2",
+    0x0B: "CodeDeletedv2",
+    0x0C: "CredentialAdded",
+    0x0D: "CredentialDeleted",
+    0x0E: "CredentialOperation",
+    0x0F: "Tamper",
+    0x10: "BCMTest",
+    0x11: "AccessoryEvent",
+    0x12: "HomekeyOperation",
+    0x13: "DPSInfo",
+    0x15: "BatteryInfo",
+    0x16: "LocalEventNotification",
+    0x17: "ProductMessage",
+    0x18: "MatterMessage",
+    0x20: "DoorStateChanged",
+    0x40: "DialogReboot",
+    0x80: "GetLogError",
+}
+
+OP_CODE_NAMES_YALE: dict[int, str] = {
+    0x00: "DoorStateChanged",
+    0x01: "DoorManualStateChange",
+    0x02: "KnockReceived",
+    0x03: "BluetoothReceived",
+    0x04: "Anomaly",
+    0x05: "AutoRelock",
+    0x06: "AutoRetry",
+    0x07: "OverTemp",
+    0x08: "BurnIn",
+    0x09: "HomeKit",
+    0x0A: "ZWave",
+    0x0B: "OneTouch",
+    0x0C: "InsideButton",
+    0x0E: "DoorSense",
+    0x0F: "LowBatAutoUnlock",
+    0x10: "EscapeUnlock",
+    0x11: "UWB",
+    0x12: "ExternalModuleOperation",
+    0x13: "ShabbatMode",
+    0x14: "ScheduledOperation",
+    0x15: "Matter",
+    0x17: "DoublePress",
+    0x18: "Aliro",
+    0xFF: "Undefined",
+}
+
+LOCK_STATE_NAMES_YALE: dict[int, str] = {
+    0x00: "Init",
+    0x01: "Calibrating",
+    0x02: "Unlocking",
+    0x03: "Unlocked",
+    0x04: "Locking",
+    0x05: "Locked",
+    0x06: "PolDiscovery",
+    0x07: "UnknownStaticPosition",
+    0x09: "Unlatching",
+    0x0A: "Unlatched",
+    0x0B: "Integrated_Other_System",
+    0x0C: "SecureMode",
+    0x0D: "Master code not set",
+    0x0E: "Default master code set",
+    0x0F: "Lock not handed",
+    0x10: "shabbatmode",
+    0x11: "InternalForcedLocked",
+}
+
+CREDENTIAL_TYPE_NAMES_YALE: dict[int, str] = {
+    0x00: "pin",
+    0x01: "rf",
+    0x02: "finger",
+    0x04: "face",
+    0x05: "inside_door_pin",
+    0x06: "palm",
+    0x08: "aliro",
+    0xFF: "All",
+}
+
+DOOR_STATE_NAMES: dict[int, str] = {
+    0x00: "Init",
+    0x01: "Closed",
+    0x02: "Ajar",
+    0x03: "Open",
+    0x04: "Unknown",
+}
+
+TAMPER_TYPE_NAMES_YALE: dict[int, str] = {
+    0x00: "TamperClear",
+    0x01: "TamperTooManyAuthErrors",
+    0x02: "TamperFrontRemoved",
+    0x03: "TamperDoorForcedOpen",
+    0x04: "TamperHighTemperature",
+    0x05: "TamperTooManyAuthErrorsPIN",
+    0x06: "TamperTooManyAuthErrorsPINCleared",
+    0x07: "TamperTooManyAuthErrorsRFID",
+    0x08: "TamperTooManyAuthErrorsRFIDCleared",
+    0x09: "TamperTooManyAuthErrorsFingerprint",
+    0x0A: "TamperTooManyAuthErrorsFingerprintCleared",
+    0x0B: "TamperTooManyAuthErrorsPalm",
+    0x0C: "TamperTooManyAuthErrorsPalmCleared",
+    0x0D: "TamperTooManyAuthErrorsFaceScan",
+    0x0E: "TamperTooManyAuthErrorsFaceScanCleared",
+}
+
+
 @dataclass
 class LockActivity:
     timestamp: datetime
