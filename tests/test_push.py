@@ -2774,6 +2774,96 @@ async def test_a_door_frame_reaches_the_display_through_the_real_decoder() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frame", "expected", "unrecognized_logged"),
+    [
+        # Built frames: a LOCK_ONLY status reply for each of the six, a DOOR_AND_LOCK
+        # status push, and a LOCK_ONLY reply that holds the unnamed 0x08.
+        (
+            "bb020000020000000b000000000000000000",
+            LockStatus.INTEGRATED_OTHER_SYSTEM,
+            False,
+        ),
+        (
+            "bb020000020000000d000000000000000000",
+            LockStatus.MASTER_CODE_NOT_SET,
+            False,
+        ),
+        (
+            "bb020000020000000e000000000000000000",
+            LockStatus.DEFAULT_MASTER_CODE_SET,
+            False,
+        ),
+        (
+            "bb020000020000000f000000000000000000",
+            LockStatus.LOCK_NOT_HANDED,
+            False,
+        ),
+        (
+            "bb0200000200000010000000000000000000",
+            LockStatus.SHABBAT_MODE,
+            False,
+        ),
+        (
+            "bb0200000200000011000000000000000000",
+            LockStatus.INTERNAL_FORCED_LOCKED,
+            False,
+        ),
+        ("bb0200002f0000000d010000000000000000", LockStatus.MASTER_CODE_NOT_SET, False),
+        ("bb0200000200000008000000000000000000", LockStatus.UNKNOWN, True),
+    ],
+    ids=[
+        "reply_0x0b",
+        "reply_0x0d",
+        "reply_0x0e",
+        "reply_0x0f",
+        "reply_0x10",
+        "reply_0x11",
+        "push_0x0d",
+        "reply_0x08",
+    ],
+)
+async def test_a_lock_state_outside_the_status_sets_shows_on_both_locks_and_is_polled(
+    caplog: pytest.LogCaptureFixture,
+    frame: str,
+    expected: LockStatus,
+    unrecognized_logged: bool,
+) -> None:
+    """A status outside every set shows on both locks and the next cycle polls."""
+    push_lock, lock = _real_decoder_pair("aa:bb:cc:dd:ee:d1")
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._running = True
+    push_lock._advertisement_data = _advertisement({})
+
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
+        lock._internal_state_callback(bytes(_with_checksum(frame)))
+
+    assert (push_lock.lock_status, push_lock.secure_status) == (expected, expected)
+    assert ("Unrecognized lock_status_str code" in caplog.text) is unrecognized_logged
+
+    push_lock._seen_this_session.update({DoorStatus, BatteryState, AutoLockState})
+    mock_lock = MagicMock()
+    mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    await _run_update(push_lock, mock_lock)
+
+    mock_lock.lock_status.assert_awaited_once()
+
+
+def test_lock_status_names_every_vendor_lock_state() -> None:
+    """LockStatus has a member for each named lock state and none for 0x08."""
+    added = {
+        "INTEGRATED_OTHER_SYSTEM": 0x0B,
+        "MASTER_CODE_NOT_SET": 0x0D,
+        "DEFAULT_MASTER_CODE_SET": 0x0E,
+        "LOCK_NOT_HANDED": 0x0F,
+        "SHABBAT_MODE": 0x10,
+        "INTERNAL_FORCED_LOCKED": 0x11,
+    }
+    assert {name: LockStatus[name].value for name in added} == added
+    assert {status.value for status in LockStatus} == set(range(0x12)) - {0x08}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reported", [LockStatus.UNKNOWN_01, LockStatus.UNKNOWN_06])
 async def test_update_does_not_reconnect_on_a_setup_condition(
     caplog: pytest.LogCaptureFixture,

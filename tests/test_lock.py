@@ -1447,6 +1447,31 @@ def test_op_code_refuses_a_value_that_is_not_an_int() -> None:
         OpCode("0x0D")
 
 
+@pytest.mark.parametrize(
+    ("frame", "status"),
+    [
+        # Built: the captured lock-button record with currentLockState 0x11.
+        (
+            _with_checksum("bb2d0056000b1100a0a176a3df14194a0200"),
+            LockStatus.INTERNAL_FORCED_LOCKED,
+        ),
+        # Built to the 0x0E layout: PIN credential, slot 7, lock state 0x0D, closed.
+        (
+            _with_checksum("bb2d00000e9aa176a30007001d0000000000"),
+            LockStatus.MASTER_CODE_NOT_SET,
+        ),
+    ],
+    ids=["lock-record", "credential-record"],
+)
+def test_a_record_with_one_of_the_six_lock_states_gives_the_member(
+    frame: bytes, status: LockStatus
+) -> None:
+    """A record whose lock state is one of the six gives that member in status."""
+    activity = _make_lock()._parse_lock_activity(frame)
+    assert isinstance(activity, LockActivity)
+    assert activity.status is status
+
+
 def test_op_code_holds_the_vendor_table() -> None:
     """OpCode holds the vendor's opCode table, with no member for 0x0D or 0x16."""
     assert {member.name: member.value for member in OpCode} == {
