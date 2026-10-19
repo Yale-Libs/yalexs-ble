@@ -68,7 +68,7 @@ profile = "black"
 known_first_party = ["yalexs_ble", "tests"]
 
 [tool.codespell]
-ignore-words-list = "yur"
+ignore-words-list = "yur,burnin"
 
 [tool.mypy]
 check_untyped_defs = true
