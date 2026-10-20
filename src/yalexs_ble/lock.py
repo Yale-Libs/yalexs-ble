@@ -5,7 +5,6 @@ import bisect
 import logging
 import os
 from collections.abc import AsyncGenerator, Callable, Iterable
-from datetime import datetime
 from typing import Any, TypeVar, cast
 
 from bleak import BleakError
@@ -31,14 +30,10 @@ from .const import (
     AutoLockState,
     BatteryState,
     Commands,
-    DoorActivity,
     DoorStatus,
-    LockActivity,
-    LockActivityType,
     LockInfo,
     LockStateValue,
     LockStatus,
-    OpCode,
     OperationError,
     SettingType,
     StatusType,
@@ -168,7 +163,7 @@ def _poll_response_matcher(
     type in byte[4] rather than a status type, so it matches on the opcode
     alone; an acknowledgment carries back the request's own byte[4], which is
     zero for that command and reads as a lock operation record, so requiring
-    the 0xBB frame keeps an acknowledgment out of that parser too.
+    the 0xBB frame keeps an acknowledgment from being returned as a record.
     auto_lock_status is a poll too, but it completes on its acknowledgment by
     design (see its docstring), so it is not typed here.
     """
@@ -983,75 +978,6 @@ class Lock:
         )
         _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
 
-    def _parse_unix_timestamp(self, timestamp_bytes: bytes) -> datetime:
-        """Parse the unix timestamp to datetime from the bytes."""
-        _LOGGER.debug(
-            "%s: Parsing unix timestamp: %s", self.name, timestamp_bytes.hex()
-        )
-        unix_timestamp = int.from_bytes(timestamp_bytes, byteorder="little")
-        _LOGGER.debug("%s: Parsed unix timestamp: %d", self.name, unix_timestamp)
-        return datetime.fromtimestamp(unix_timestamp)
-
-    def _parse_lock_activity(
-        self, response: bytes
-    ) -> DoorActivity | LockActivity | None:
-        """Parse the lock activity from the response."""
-        # We only know a subset of lock activities currently
-        # response[0x04] seems to be the activity type
-        # the rest of the response is data for the activity,
-        # format seems to be specific to each individual activity type
-        activity_type = response[0x04]
-        _LOGGER.debug("%s: Activity type: 0x%02X", self.name, activity_type)
-        if activity_type == LOG_TYPE_GET_LOG_ERROR:
-            _LOGGER.debug("%s: No activity", self.name)
-            return None
-
-        if activity_type == LockActivityType.DOOR.value:
-            # Timestamp is at 0x05-0x08
-            # Door status is at 0x09
-            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            door_status = self._parse_door_status(response[0x09])
-            return DoorActivity(timestamp, door_status)
-        if activity_type == LockActivityType.LOCK.value:
-            # Timestamp is at 0x08-0x0B
-            # Lock status is at 0x06
-            # The opCode is at 0x05
-            timestamp = self._parse_unix_timestamp(response[0x08:0x0C])
-            lock_status = self._parse_lock_status(response[0x06])
-
-            return LockActivity(
-                timestamp,
-                lock_status,
-                source=OpCode(response[0x05]),
-            )
-        if activity_type == LockActivityType.PIN.value:
-            # Timestamp is at 0x05-0x08
-            # Slot is at 0x0A
-            # Lock status seems to be at lower half of 0x0C
-            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            pin_slot = response[0x0A]
-            lock_status = self._parse_lock_status(response[0x0C] & 0x0F)
-
-            return LockActivity(
-                timestamp,
-                lock_status,
-                source=None,
-                slot=pin_slot,
-            )
-        if activity_type == LockActivityType.KEYPAD_UNLOCK.value:
-            # Timestamp is at 0x05-0x08
-            # Slot is a uint16 at 0x0E-0x0F; 0xFFEE is the keypad master code
-            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            slot = util._bytes_to_int(response[0x0E:0x10])
-            return LockActivity(
-                timestamp,
-                LockStatus.UNLOCKED,
-                source=None,
-                slot=slot,
-            )
-        _LOGGER.debug("%s: Unknown activity type: 0x%02X", self.name, activity_type)
-        return None
-
     @raise_if_not_connected
     async def get_log(self) -> bytes:
         """Pop the oldest record from the lock's activity log."""
@@ -1061,13 +987,6 @@ class Lock:
             "get_log",
             _GETLOG_MATCHER,
         )
-
-    @raise_if_not_connected
-    async def lock_activity(self) -> DoorActivity | LockActivity | None:
-        _LOGGER.debug("%s: Executing lock_activity", self.name)
-        response = await self.get_log()
-        _LOGGER.debug("%s: Finished executing lock_activity", self.name)
-        return self._parse_lock_activity(response)
 
     async def drain_lock_activity(self) -> AsyncGenerator[bytes]:
         """Yield each GetLog reply unchanged, ending after the GetLogError record.
