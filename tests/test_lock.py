@@ -1629,59 +1629,64 @@ def _activity_lock(frames: list[bytes | Exception]) -> tuple[Lock, AsyncMock]:
     return lock, write
 
 
-async def _drain(lock: Lock) -> list[DoorActivity | LockActivity]:
-    return [activity async for activity in lock.drain_lock_activity()]
+async def _drain(lock: Lock) -> list[bytes]:
+    return [reply async for reply in lock.drain_lock_activity()]
 
 
 @pytest.mark.asyncio
-async def test_drain_lock_activity_stops_at_the_end_marker() -> None:
-    """Records come back in order and the marker ends the drain."""
+async def test_drain_lock_activity_yields_every_reply_through_the_get_log_error() -> (
+    None
+):
+    """Every reply is yielded unchanged, whatever its type, the GetLogError last."""
     lock, write = _activity_lock(
-        [KEYPAD_UNLOCK_SLOT_205, KEYPAD_LOCK_BUTTON, END_OF_LOG, KEYPAD_UNLOCK_SLOT_200]
+        [
+            UNKNOWN_ACTIVITY,
+            KEYPAD_UNLOCK_SLOT_205,
+            KEYPAD_LOCK_BUTTON,
+            END_OF_LOG,
+            KEYPAD_UNLOCK_SLOT_200,
+        ]
     )
-    activities = await _drain(lock)
-    assert [(a.status, getattr(a, "slot", None)) for a in activities] == [
-        (LockStatus.UNLOCKED, 205),
-        (LockStatus.LOCKED, None),
+    assert await _drain(lock) == [
+        UNKNOWN_ACTIVITY,
+        KEYPAD_UNLOCK_SLOT_205,
+        KEYPAD_LOCK_BUTTON,
+        END_OF_LOG,
     ]
-    assert write.await_count == 3
+    assert write.await_count == 4
 
 
 @pytest.mark.asyncio
-async def test_drain_lock_activity_skips_unknown_types(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """An unparsable record is skipped at debug without ending the drain."""
-    lock, write = _activity_lock([UNKNOWN_ACTIVITY, KEYPAD_UNLOCK_SLOT_200, END_OF_LOG])
-    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.lock"):
-        activities = await _drain(lock)
-    assert len(activities) == 1
-    assert isinstance(activities[0], LockActivity)
-    assert activities[0].slot == 200
-    assert write.await_count == 3
-    record = next(r for r in caplog.records if "Unknown activity type" in r.message)
-    assert record.levelno == logging.DEBUG
+async def test_drain_lock_activity_sends_the_next_get_log_when_asked() -> None:
+    """A reply is yielded before the next GetLog is sent."""
+    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205, END_OF_LOG])
+    replies = lock.drain_lock_activity()
+    assert await anext(replies) == KEYPAD_UNLOCK_SLOT_205
+    assert write.await_count == 1
+    assert await anext(replies) == END_OF_LOG
+    assert write.await_count == 2
+    await replies.aclose()
 
 
 @pytest.mark.asyncio
 async def test_drain_lock_activity_yields_each_record_as_it_is_read() -> None:
     """Records read before a failure have already been yielded."""
     lock, _ = _activity_lock([KEYPAD_UNLOCK_SLOT_205, BleakError("gone")])
-    seen: list[DoorActivity | LockActivity] = []
+    seen: list[bytes] = []
     with pytest.raises(BleakError):
-        async for activity in lock.drain_lock_activity():
-            seen.append(activity)
-    assert [getattr(a, "slot", None) for a in seen] == [205]
+        async for reply in lock.drain_lock_activity():
+            seen.append(reply)
+    assert seen == [KEYPAD_UNLOCK_SLOT_205]
 
 
 @pytest.mark.asyncio
 async def test_drain_lock_activity_raises_past_the_cap() -> None:
     """Without an end marker the drain raises after max_records reads."""
     lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * (MAX_ACTIVITY_RECORDS + 5))
-    seen: list[DoorActivity | LockActivity] = []
+    seen: list[bytes] = []
     with pytest.raises(ResponseError, match=f"within {MAX_ACTIVITY_RECORDS} reads"):
-        async for activity in lock.drain_lock_activity():
-            seen.append(activity)
+        async for reply in lock.drain_lock_activity():
+            seen.append(reply)
     assert len(seen) == MAX_ACTIVITY_RECORDS
     assert write.await_count == MAX_ACTIVITY_RECORDS
 
@@ -1703,7 +1708,7 @@ async def test_a_get_log_error_record_ends_the_drain_and_reads_as_no_activity(
     assert "LOG_TYPE_GET_LOG_ERROR" in yalexs_ble.__all__
 
     lock, write = _activity_lock([END_OF_LOG, KEYPAD_UNLOCK_SLOT_205])
-    assert await _drain(lock) == []
+    assert await _drain(lock) == [END_OF_LOG]
     assert write.await_count == 1
 
     lock, _ = _activity_lock([END_OF_LOG])

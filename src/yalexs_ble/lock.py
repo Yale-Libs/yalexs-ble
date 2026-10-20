@@ -4,7 +4,7 @@ import asyncio
 import bisect
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable
 from datetime import datetime
 from typing import Any, TypeVar, cast
 
@@ -1069,22 +1069,21 @@ class Lock:
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
         return self._parse_lock_activity(response)
 
-    async def drain_lock_activity(self) -> AsyncIterator[DoorActivity | LockActivity]:
-        """Pop and yield records until the end marker; raise past the read cap.
+    async def drain_lock_activity(self) -> AsyncGenerator[bytes]:
+        """Yield each GetLog reply unchanged, ending after the GetLogError record.
 
-        Each read pops the lock's oldest record, so records are yielded as
-        they arrive. Unknown types are skipped.
+        The next GetLog is sent when the caller asks for the next reply. Raises
+        ActivityLogOverrunError past the read cap.
         """
         if not self.is_connected:
             raise DisconnectedError("Lock is not connected")
         _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
         for _ in range(MAX_ACTIVITY_RECORDS):
             response = await self.get_log()
+            yield response
             if response[0x04] == LOG_TYPE_GET_LOG_ERROR:
                 _LOGGER.debug("%s: Finished drain_lock_activity", self.name)
                 return
-            if (activity := self._parse_lock_activity(response)) is not None:
-                yield activity
         raise ActivityLogOverrunError(
             f"{self.name}: Activity log did not end within {MAX_ACTIVITY_RECORDS} reads"
         )
