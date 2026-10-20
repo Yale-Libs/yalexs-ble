@@ -10,15 +10,36 @@ from .const import (
     RESPONSE_FRAME_LEN,
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_STATUS,
+    AugustLockOperationSource,
+    AugustLogType,
+    BulkOperationType,
     Commands,
+    CredType,
     DoorStatus,
+    JamState,
     LockCred,
+    LockOperationCredType,
+    LockOperationStatus,
+    LockOperationType,
     LockStatus,
+    LogBrand,
     LogType,
+    MatterEventType,
+    MatterRegistrationStatus,
     OpCode,
+    OperatingMode,
+    OutOfScheduleType,
     TamperType,
 )
 from .util import _bytes_to_int, _named
+
+# August's app emits no fabricIndex for a BulkOperation whose fabric byte
+# is 0xFF.
+_NO_FABRIC_INDEX = 0xFF
+
+# LockOperationCredType is an IntFlag, which answers an unnamed value with a
+# pseudo-member and no ValueError, so _named cannot serve it.
+_LOCK_OPERATION_CRED_TYPES = {member.value: member for member in LockOperationCredType}
 
 
 def _u16(raw: bytes, offset: int) -> int:
@@ -222,12 +243,21 @@ class CodeAddedv2(LogRecord):
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
+        return cls._decode(raw, "016X")
+
+    @classmethod
+    def decode_decimal(cls, raw: bytes) -> Self:
+        """Build the record with the code in decimal, as August's app prints it."""
+        return cls._decode(raw, "d")
+
+    @classmethod
+    def _decode(cls, raw: bytes, code_format: str) -> Self:
         return cls(
             raw,
             raw[4],
             time_stamp=_u32(raw, 5),
             slot=_u16(raw, 9),
-            code=format(_bytes_to_int(raw[11:16]), "016X"),
+            code=format(_bytes_to_int(raw[11:16]), code_format),
         )
 
 
@@ -276,12 +306,18 @@ class _Credential(LogRecord):
 
 @dataclass(frozen=True)
 class CredentialAdded(_Credential):
-    """A CredentialAdded record (log_type 0x0C)."""
+    """A CredentialAdded record (log_type 0x0C).
+
+    August's app names it ExternalCredentialAdded.
+    """
 
 
 @dataclass(frozen=True)
 class CredentialDeleted(_Credential):
-    """A CredentialDeleted record (log_type 0x0D)."""
+    """A CredentialDeleted record (log_type 0x0D).
+
+    August's app names it ExternalCredentialDeleted.
+    """
 
 
 @dataclass(frozen=True)
@@ -500,6 +536,195 @@ class GetLogError(LogRecord):
         )
 
 
+@dataclass(frozen=True)
+class LockOperatingMode(LogRecord):
+    """A LockOperatingMode record (log_type 0x14 in August's numbering)."""
+
+    time_stamp: int
+    lock_op_mode: OperatingMode | int
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Self:
+        return cls(
+            raw,
+            raw[4],
+            time_stamp=_u32(raw, 5),
+            lock_op_mode=_named(OperatingMode, raw[9]),
+        )
+
+
+@dataclass(frozen=True)
+class LockDeadboltJam(LogRecord):
+    """A LockDeadboltJam record (log_type 0x16 in August's numbering)."""
+
+    time_stamp: int
+    battery_level: int
+    jam_state: JamState | int
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Self:
+        return cls(
+            raw,
+            raw[4],
+            time_stamp=_u32(raw, 5),
+            battery_level=_u16(raw, 9),
+            jam_state=_named(JamState, raw[11]),
+        )
+
+
+@dataclass(frozen=True)
+class InvalidCredentialEntry(LogRecord):
+    """An InvalidCredentialEntry record (log_type 0x17 in August's numbering)."""
+
+    time_stamp: int
+    cred_type: CredType | int
+    battery_level: int
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Self:
+        return cls(
+            raw,
+            raw[4],
+            time_stamp=_u32(raw, 5),
+            cred_type=_named(CredType, _u16(raw, 9)),
+            battery_level=_u16(raw, 11),
+        )
+
+
+@dataclass(frozen=True)
+class MatterEvent(LogRecord):
+    """A MatterEvent record (log_type 0x18 in August's numbering)."""
+
+    time_stamp: int
+    event_type: MatterEventType | int
+    fabric_index: int | None
+    fabric_vendor_id: int | None
+    # registration_status is None unless event_type is MatterEventType.REGISTRATION.
+    # MatterRegistrationStatus.OK is 0, so a truth test cannot tell it from None.
+    registration_status: MatterRegistrationStatus | int | None
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Self:
+        event_type = raw[9]
+        has_fabric = event_type in (
+            MatterEventType.FABRIC_ADDED,
+            MatterEventType.FABRIC_REMOVED,
+        )
+        is_registration = event_type == MatterEventType.REGISTRATION
+        return cls(
+            raw,
+            raw[4],
+            time_stamp=_u32(raw, 5),
+            event_type=_named(MatterEventType, event_type),
+            fabric_index=raw[10] if has_fabric else None,
+            fabric_vendor_id=_u16(raw, 11) if has_fabric else None,
+            registration_status=(
+                _named(MatterRegistrationStatus, raw[10]) if is_registration else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class LockOperationBlame(LogRecord):
+    """A LockOperationBlame record (log_type 0x19 in August's numbering)."""
+
+    time_stamp: int
+    op_type: LockOperationType | int
+    op_source: AugustLockOperationSource | int
+    op_lock_cred_types: LockOperationCredType | None
+    key_slot: int | None
+    node_id: int | None
+    user_slot: int | None
+    fabric_index: int | None
+    op_status: LockOperationStatus | int
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Self:
+        op_source = _named(AugustLockOperationSource, raw[10])
+        key_slot: int | None = None
+        node_id: int | None = None
+        user_slot: int | None = None
+        fabric_index: int | None = None
+        if op_source == AugustLockOperationSource.ZWAVE:
+            key_slot = _u16(raw, 12)
+            node_id = raw[14]
+        elif op_source != AugustLockOperationSource.MANUAL:
+            user_slot = _u16(raw, 12)
+            if op_source == AugustLockOperationSource.MATTER:
+                fabric_index = raw[14]
+        return cls(
+            raw,
+            raw[4],
+            time_stamp=_u32(raw, 5),
+            op_type=_named(LockOperationType, raw[9]),
+            op_source=op_source,
+            # Bit 0 of byte 11 names no credential type.
+            op_lock_cred_types=LockOperationCredType(raw[11] & 0xFE) or None,
+            key_slot=key_slot,
+            node_id=node_id,
+            user_slot=user_slot,
+            fabric_index=fabric_index,
+            op_status=_named(LockOperationStatus, raw[15]),
+        )
+
+
+@dataclass(frozen=True)
+class OutOfScheduleCredential(LogRecord):
+    """An OutOfScheduleCredential record (log_type 0x1D in August's numbering)."""
+
+    time_stamp: int
+    cred_type: CredType | int
+    battery_level: int
+    violation_type: OutOfScheduleType | int
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Self:
+        return cls(
+            raw,
+            raw[4],
+            time_stamp=_u32(raw, 5),
+            cred_type=_named(CredType, _u16(raw, 9)),
+            battery_level=_u16(raw, 11),
+            violation_type=_named(OutOfScheduleType, raw[13]),
+        )
+
+
+@dataclass(frozen=True)
+class BulkOperation(LogRecord):
+    """A BulkOperation record (log_type 0x1E in August's numbering)."""
+
+    time_stamp: int
+    bulk_op_type: BulkOperationType | int
+    fabric_index: int | None
+    lock_cred_type: LockOperationCredType | int | None
+    number_of_removed_users: int | None
+
+    @classmethod
+    def decode(cls, raw: bytes) -> Self:
+        bulk_op_type = raw[9]
+        fabric_index: int | None = None
+        lock_cred_type: LockOperationCredType | int | None = None
+        number_of_removed_users: int | None = None
+        if bulk_op_type == BulkOperationType.USERS_CLEAR:
+            fabric_index = raw[10]
+            number_of_removed_users = _u16(raw, 11)
+        elif bulk_op_type == BulkOperationType.CREDS_CLEAR:
+            lock_cred_type = _LOCK_OPERATION_CRED_TYPES.get(raw[10], raw[10])
+            fabric_index = raw[11]
+            number_of_removed_users = _u16(raw, 12)
+        if fabric_index == _NO_FABRIC_INDEX:
+            fabric_index = None
+        return cls(
+            raw,
+            raw[4],
+            time_stamp=_u32(raw, 5),
+            bulk_op_type=_named(BulkOperationType, bulk_op_type),
+            fabric_index=fabric_index,
+            lock_cred_type=lock_cred_type,
+            number_of_removed_users=number_of_removed_users,
+        )
+
+
 RecordDecoder = Callable[[bytes], LogRecord]
 
 YALE_LOG_RECORDS: Mapping[int, RecordDecoder] = {
@@ -531,11 +756,51 @@ YALE_LOG_RECORDS: Mapping[int, RecordDecoder] = {
     LogType.GET_LOG_ERROR: GetLogError.decode,
 }
 
+AUGUST_LOG_RECORDS: Mapping[int, RecordDecoder] = {
+    AugustLogType.LOCK_OPERATION: LockOperation.decode,
+    AugustLogType.KEYPAD_OPEN: KeypadOpen.decode,
+    AugustLogType.KEYPAD_WRONG_CODE: KeypadWrongCode.decode,
+    AugustLogType.CODE_ADDED: CodeAdded.decode,
+    AugustLogType.KEYPAD_INFO: KeypadInfo.decode,
+    AugustLogType.CODE_DELETED: CodeDeleted.decode,
+    AugustLogType.ALL_CODES_DELETED: AllCodesDeleted.decode,
+    AugustLogType.CODE_OPERATION: CodeOperation.decode,
+    AugustLogType.KEYPAD_CLOSE: KeypadClose.decode,
+    AugustLogType.FACTORY_RESET: FactoryReset.decode,
+    AugustLogType.CODE_ADDED_V2: CodeAddedv2.decode_decimal,
+    AugustLogType.CODE_DELETED_V2: CodeDeletedv2.decode,
+    AugustLogType.EXTERNAL_CREDENTIAL_ADDED: CredentialAdded.decode,
+    AugustLogType.EXTERNAL_CREDENTIAL_DELETED: CredentialDeleted.decode,
+    AugustLogType.CREDENTIAL_OPERATION: CredentialOperation.decode,
+    AugustLogType.TAMPER: Tamper.decode,
+    AugustLogType.BCM_TEST: BCMTest.decode,
+    AugustLogType.HOMEKEY_OPERATION: HomekeyOperation.decode,
+    AugustLogType.DPS_INFO: DPSInfo.decode,
+    AugustLogType.LOCK_OPERATING_MODE: LockOperatingMode.decode,
+    AugustLogType.LOCK_DEADBOLT_JAM: LockDeadboltJam.decode,
+    AugustLogType.INVALID_CREDENTIAL_ENTRY: InvalidCredentialEntry.decode,
+    AugustLogType.MATTER_EVENT: MatterEvent.decode,
+    AugustLogType.LOCK_OPERATION_BLAME: LockOperationBlame.decode,
+    AugustLogType.OUT_OF_SCHEDULE_CREDENTIAL: OutOfScheduleCredential.decode,
+    AugustLogType.BULK_OPERATION: BulkOperation.decode,
+    AugustLogType.DOOR_STATE_CHANGED: DoorStateChanged.decode,
+    AugustLogType.DIALOG_REBOOT: DialogReboot.decode,
+    AugustLogType.GET_LOG_ERROR: GetLogError.decode,
+}
 
-def parse_log_event_packet(response_packet: bytes) -> LogRecord:
+_LOG_RECORDS: Mapping[LogBrand, Mapping[int, RecordDecoder]] = {
+    LogBrand.YALE: YALE_LOG_RECORDS,
+    LogBrand.AUGUST: AUGUST_LOG_RECORDS,
+}
+
+
+def parse_log_event_packet(
+    response_packet: bytes, brand: LogBrand = LogBrand.YALE
+) -> LogRecord:
     """Decode a GetLog reply into its record, by the log_type at byte 4.
 
-    A log_type with no decoder gives a plain LogRecord.
+    brand selects Yale's or August's numbering. A log_type with no decoder in
+    that numbering gives a plain LogRecord.
     """
     response_packet = bytes(response_packet)
     if (
@@ -547,4 +812,5 @@ def parse_log_event_packet(response_packet: bytes) -> LogRecord:
             f"Not an activity log reply: {len(response_packet)} bytes "
             f"starting {response_packet[:2].hex()}"
         )
-    return YALE_LOG_RECORDS.get(response_packet[4], LogRecord.decode)(response_packet)
+    records = _LOG_RECORDS[brand]
+    return records.get(response_packet[4], LogRecord.decode)(response_packet)

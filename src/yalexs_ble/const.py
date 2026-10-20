@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum, IntEnum
+from enum import Enum, IntEnum, IntFlag
 from typing import TypedDict, cast
 
 COMMAND_SERVICE_UUID = "0000fe24-0000-1000-8000-00805f9b34fb"
@@ -279,6 +279,13 @@ class OpCode(Enum):
         return cast(OpCode, cls._value2member_map_.setdefault(value, member))
 
 
+class LogBrand(Enum):
+    """The brand whose numbering and names an activity log record follows."""
+
+    YALE = "yale"
+    AUGUST = "august"
+
+
 class LogType(IntEnum):
     """The log_type at byte 4 of a GetLog reply, in Yale's numbering."""
 
@@ -306,6 +313,42 @@ class LogType(IntEnum):
     LOCAL_EVENT_NOTIFICATION = 0x16
     PRODUCT_MESSAGE = 0x17
     MATTER_MESSAGE = 0x18
+    DOOR_STATE_CHANGED = 0x20
+    DIALOG_REBOOT = 0x40
+    GET_LOG_ERROR = LOG_TYPE_GET_LOG_ERROR
+
+
+class AugustLogType(IntEnum):
+    """The log_type at byte 4 of a GetLog reply, in August's numbering."""
+
+    LOCK_OPERATION = 0x00
+    KEYPAD_OPEN = 0x01
+    KEYPAD_WRONG_CODE = 0x02
+    CODE_ADDED = 0x03
+    KEYPAD_INFO = 0x04
+    CODE_DELETED = 0x05
+    ALL_CODES_DELETED = 0x06
+    CODE_OPERATION = 0x07
+    KEYPAD_CLOSE = 0x08
+    FACTORY_RESET = 0x09
+    CODE_ADDED_V2 = 0x0A
+    CODE_DELETED_V2 = 0x0B
+    EXTERNAL_CREDENTIAL_ADDED = 0x0C
+    EXTERNAL_CREDENTIAL_DELETED = 0x0D
+    CREDENTIAL_OPERATION = 0x0E
+    TAMPER = 0x0F
+    BCM_TEST = 0x10
+    ACCESSORY_EVENT = 0x11
+    HOMEKEY_OPERATION = 0x12
+    DPS_INFO = 0x13
+    LOCK_OPERATING_MODE = 0x14
+    WIFI_INFO = 0x15
+    LOCK_DEADBOLT_JAM = 0x16
+    INVALID_CREDENTIAL_ENTRY = 0x17
+    MATTER_EVENT = 0x18
+    LOCK_OPERATION_BLAME = 0x19
+    OUT_OF_SCHEDULE_CREDENTIAL = 0x1D
+    BULK_OPERATION = 0x1E
     DOOR_STATE_CHANGED = 0x20
     DIALOG_REBOOT = 0x40
     GET_LOG_ERROR = LOG_TYPE_GET_LOG_ERROR
@@ -344,6 +387,115 @@ class TamperType(IntEnum):
     TOO_MANY_AUTH_ERRORS_FACE_SCAN_CLEARED = 0x0E
 
 
+class OperatingMode(IntEnum):
+    """The operating mode of August's LockOperatingMode record."""
+
+    NORMAL = 0x00
+    VACATION = 0x01
+    PRIVACY = 0x02
+    PASSAGE = 0x03
+
+
+class JamState(IntEnum):
+    """The jam state of August's LockDeadboltJam record."""
+
+    OCCURS_DURING_LOCKING = 0x00
+    OCCURS_DURING_UNLOCKING = 0x01
+
+
+class CredType(IntEnum):
+    """The cred_type of August's InvalidCredentialEntry and OutOfScheduleCredential."""
+
+    ENTRY_KEYPAD_PINCODE = 0x0000
+    ENTRY_KEYPAD_FINGERPRINT = 0x0002
+    ENTRY_AUX_KEYPAD_PINCODE = 0x0100
+    ENTRY_AUX_KEYPAD_FINGERPRINT = 0x0102
+    ENTRY_APPLE_HOMEKEYS_NFC = 0x1001
+    ENTRY_SAMSUNG_WALLET_NFC = 0x1101
+    ENTRY_GOOGLE_WALLET_NFC = 0x1201
+    ENTRY_RFID_CARD_MIFARE_DESFIRE_EV1_NFC = 0x2101
+    ENTRY_RFID_CARD_MIFARE_DESFIRE_EV2_NFC = 0x2201
+    ENTRY_RFID_CARD_MIFARE_DESFIRE_EV3_NFC = 0x2301
+    ENTRY_MATTER_FABRIC_MATTER = 0x3003
+    ENTRY_UNKNOWN = 0xFFFF
+
+
+class OutOfScheduleType(IntEnum):
+    """The violation type of August's OutOfScheduleCredential record."""
+
+    PREMATURE = 0x00
+    EXPIRED = 0x01
+
+
+class MatterEventType(IntEnum):
+    """The event type of August's MatterEvent record."""
+
+    REGISTRATION = 0x00
+    FABRIC_ADDED = 0x01
+    FABRIC_REMOVED = 0x02
+
+
+class MatterRegistrationStatus(IntEnum):
+    """The registration status of August's MatterEvent record."""
+
+    OK = 0x00
+    FAIL = 0x01
+    UNKNOWN = 0xFF
+
+
+class LockOperationType(IntEnum):
+    """The operation type of August's LockOperationBlame record."""
+
+    LOCK = 0x00
+    UNLOCK = 0x01
+
+
+class AugustLockOperationSource(IntEnum):
+    """The operation source of August's LockOperationBlame record."""
+
+    BLE = 0x01
+    KEYPAD = 0x02
+    LOCK_BUTTON = 0x03
+    AUTORELOCK = 0x04
+    MANUAL = 0x05
+    MATTER = 0x06
+    ZWAVE = 0x07
+
+
+class LockOperationCredType(IntFlag):
+    """The credential types of August's LockOperationBlame and BulkOperation records."""
+
+    PIN = 0x02
+    RF_ID = 0x04
+    FINGERPRINT = 0x08
+    RF_ID_HID = 0x10
+    FACE = 0x20
+    INSIDE_DOOR_PIN = 0x40
+    BLE = 0x80
+
+
+class LockOperationStatus(IntEnum):
+    """The operation status of August's LockOperationBlame record."""
+
+    SUCCESS = 0x00
+    FAIL = 0x01
+    LOW_BATTERY = 0x02
+    JAMMED = 0x03
+    NON_CALIBRATED = 0x04
+    TIMEOUT = 0x05
+    INVALID_CRED = 0x06
+    DISABLED_USER = 0x07
+    OUTSIDE_SCHEDULE = 0x08
+    NON_ACCESS = 0x09
+
+
+class BulkOperationType(IntEnum):
+    """The operation type of August's BulkOperation record."""
+
+    USERS_CLEAR = 0x01
+    CREDS_CLEAR = 0x02
+
+
 # Each table maps a value to the vendor's name for it; a value the vendor
 # does not name has no entry. A suffix names the brand whose app uses the
 # names.
@@ -377,6 +529,40 @@ LOG_TYPE_NAMES_YALE: dict[int, str] = {
     0x80: "GetLogError",
 }
 
+LOG_TYPE_NAMES_AUGUST: dict[int, str] = {
+    0x00: "LockOperation",
+    0x01: "KeypadOpen",
+    0x02: "KeypadWrongCode",
+    0x03: "CodeAdded",
+    0x04: "KeypadInfo",
+    0x05: "CodeDeleted",
+    0x06: "AllCodesDeleted",
+    0x07: "CodeOperation",
+    0x08: "KeypadClose",
+    0x09: "FactoryReset",
+    0x0A: "CodeAddedv2",
+    0x0B: "CodeDeletedv2",
+    0x0C: "ExternalCredentialAdded",
+    0x0D: "ExternalCredentialDeleted",
+    0x0E: "CredentialOperation",
+    0x0F: "Tamper",
+    0x10: "BCMTest",
+    0x11: "AccessoryEvent",
+    0x12: "HomekeyOperation",
+    0x13: "DPSInfo",
+    0x14: "LockOperatingMode",
+    0x15: "WifiInfo",
+    0x16: "LockDeadboltJam",
+    0x17: "InvalidCredentialEntry",
+    0x18: "MatterEvent",
+    0x19: "LockOperationBlame",
+    0x1D: "OutOfScheduleCredential",
+    0x1E: "BulkOperation",
+    0x20: "DoorStateChanged",
+    0x40: "DialogReboot",
+    0x80: "GetLogError",
+}
+
 OP_CODE_NAMES_YALE: dict[int, str] = {
     0x00: "DoorStateChanged",
     0x01: "DoorManualStateChange",
@@ -404,6 +590,28 @@ OP_CODE_NAMES_YALE: dict[int, str] = {
     0xFF: "Undefined",
 }
 
+OP_CODE_NAMES_AUGUST: dict[int, str] = {
+    0x00: "DoorStateChanged",
+    0x01: "DoorManualStateChange",
+    0x02: "KnockReceived",
+    0x03: "BluetoothReceived",
+    0x04: "Anomaly",
+    0x05: "AutoRelock",
+    0x06: "AutoRetry",
+    0x07: "OverTemp",
+    0x08: "BurnIn",
+    0x09: "HomeKit",
+    0x0A: "ZWave",
+    0x0B: "OneTouch",
+    0x0C: "InsideButton",
+    0x0E: "DoorSense",
+    0x0F: "LowBatAutoUnlock",
+    0x10: "EscapeUnlock",
+    0x11: "UWB",
+    0x12: "ExternalModuleOperation",
+    0xFF: "Undefined",
+}
+
 LOCK_STATE_NAMES_YALE: dict[int, str] = {
     0x00: "Init",
     0x01: "Calibrating",
@@ -424,6 +632,25 @@ LOCK_STATE_NAMES_YALE: dict[int, str] = {
     0x11: "InternalForcedLocked",
 }
 
+LOCK_STATE_NAMES_AUGUST: dict[int, str] = {
+    0x00: "Init",
+    0x01: "Calibrating",
+    0x02: "Unlocking",
+    0x03: "Unlocked",
+    0x04: "Locking",
+    0x05: "Locked",
+    0x06: "PolDiscovery",
+    0x07: "UnknownStaticPosition",
+    0x09: "Unlatching",
+    0x0A: "Unlatched",
+    0x0B: "Integrated_Other_System",
+    0x0C: "SecureMode",
+    0x0D: "Master code not set",
+    0x0E: "Default master code set",
+    0x0F: "Lock not handed",
+    0x10: "Shabbat Mode",
+}
+
 CREDENTIAL_TYPE_NAMES_YALE: dict[int, str] = {
     0x00: "pin",
     0x01: "rf",
@@ -432,6 +659,14 @@ CREDENTIAL_TYPE_NAMES_YALE: dict[int, str] = {
     0x05: "inside_door_pin",
     0x06: "palm",
     0x08: "aliro",
+    0xFF: "All",
+}
+
+CREDENTIAL_TYPE_NAMES_AUGUST: dict[int, str] = {
+    0x00: "pin",
+    0x01: "rf",
+    0x02: "finger",
+    0x04: "face",
     0xFF: "All",
 }
 
@@ -459,6 +694,102 @@ TAMPER_TYPE_NAMES_YALE: dict[int, str] = {
     0x0C: "TamperTooManyAuthErrorsPalmCleared",
     0x0D: "TamperTooManyAuthErrorsFaceScan",
     0x0E: "TamperTooManyAuthErrorsFaceScanCleared",
+}
+
+TAMPER_TYPE_NAMES_AUGUST: dict[int, str] = {
+    0x00: "TamperClear",
+    0x01: "TamperTooManyAuthErrors",
+    0x02: "TamperFrontRemoved",
+    0x03: "TamperDoorForcedOpen",
+    0x04: "TamperHighTemperature",
+}
+
+# Only August's app has these names, so their table names have no brand suffix.
+OPERATING_MODE_NAMES: dict[int, str] = {
+    0x00: "OperatingModeNormal",
+    0x01: "OperatingModeVacation",
+    0x02: "OperatingModePrivacy",
+    0x03: "OperatingModePassage",
+}
+
+JAM_STATE_NAMES: dict[int, str] = {
+    0x00: "JamOccursDuringLocking",
+    0x01: "JamOccursDuringUnlocking",
+}
+
+CRED_TYPE_NAMES: dict[int, str] = {
+    0x0000: "CredEntryKeypadPincode",
+    0x0002: "CredEntryKeypadFingerprint",
+    0x0100: "CredEntryAuxKeypadPincode",
+    0x0102: "CredEntryAuxKeypadFingerprint",
+    0x1001: "CredEntryAppleHomekeysNFC",
+    0x1101: "CredEntrySamsungWalletNFC",
+    0x1201: "CredEntryGoogleWalletNFC",
+    0x2101: "CredEntryRFIDCardMIFAREDESFireEV1NFC",
+    0x2201: "CredEntryRFIDCardMIFAREDESFireEV2NFC",
+    0x2301: "CredEntryRFIDCardMIFAREDESFireEV3NFC",
+    0x3003: "CredEntryMatterFabricMatter",
+    0xFFFF: "CredEntryUnknown",
+}
+
+OUT_OF_SCHEDULE_TYPE_NAMES: dict[int, str] = {
+    0x00: "OutOfSchedulePremature",
+    0x01: "OutOfScheduleExpired",
+}
+
+MATTER_EVENT_NAMES: dict[int, str] = {
+    0x00: "MatterEventRegistration",
+    0x01: "MatterEventFabricAdded",
+    0x02: "MatterEventFabricRemoved",
+}
+
+MATTER_REGISTRATION_STATUS_NAMES: dict[int, str] = {
+    0x00: "OK",
+    0x01: "FAIL",
+    0xFF: "UNKNOWN",
+}
+
+LOCK_OPERATION_TYPE_NAMES: dict[int, str] = {
+    0x00: "Lock",
+    0x01: "Unlock",
+}
+
+LOCK_OPERATION_SOURCE_NAMES: dict[int, str] = {
+    0x01: "Ble",
+    0x02: "Keypad",
+    0x03: "Lock_Button",
+    0x04: "Autorelock",
+    0x05: "Manual",
+    0x06: "Matter",
+    0x07: "Zwave",
+}
+
+LOCK_OPERATION_CRED_TYPE_NAMES: dict[int, str] = {
+    0x02: "Pin",
+    0x04: "RfId",
+    0x08: "Fingerprint",
+    0x10: "RfId_Hid",
+    0x20: "Face",
+    0x40: "InsideDoorPin",
+    0x80: "Ble",
+}
+
+LOCK_OPERATION_STATUS_NAMES: dict[int, str] = {
+    0x00: "Success",
+    0x01: "Fail",
+    0x02: "Low_Battery",
+    0x03: "Jammed",
+    0x04: "Non_Calibrated",
+    0x05: "Timeout",
+    0x06: "Invalid_cred",
+    0x07: "Disabled_user",
+    0x08: "Outside_Schedule",
+    0x09: "Non_Access",
+}
+
+BULK_OPERATION_TYPE_NAMES: dict[int, str] = {
+    0x01: "UsersClear",
+    0x02: "CredsClear",
 }
 
 
