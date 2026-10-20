@@ -19,6 +19,7 @@ from yalexs_ble.const import (
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
+    ActivityLogDepth,
     AutoLockMode,
     AutoLockState,
     BatteryState,
@@ -992,6 +993,12 @@ def _with_byte(frame: bytes, offset: int, value: int) -> bytes:
     return _with_checksum(edited.hex())
 
 
+# A LOCK_EVENTS_UNREAD reply captured on 2026-07-26 from a Yale lock: 242 records.
+DEPTH_FRAME = bytes.fromhex("bb02004609000000f2000000000000000200")
+# Built to the same layout with 0xDEADBEEF in the count at byte[8:12].
+NEGATIVE_DEPTH_FRAME = _with_checksum("bb02000009000000efbeadde000000000200")
+
+
 # A GETLOG reply holds one activity record: byte[2] is the record
 # index and byte[4] the record type. 0x80 ends the log and decodes to nothing;
 # 0x20 is a door state change, carrying a door status at byte[9], so it decodes
@@ -1072,6 +1079,13 @@ def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
         # LockStatus.UNLOCKED are both 0x03, so the lock stray mis-parses to
         # exactly OPENED and an OPENED expectation would pass either way.
         ("door_status", LOCK_FRAME, LockStatus.UNLOCKED, DOOR_FRAME, DoorStatus.CLOSED),
+        (
+            "unread_event_count",
+            LOCK_FRAME,
+            LockStatus.UNLOCKED,
+            DEPTH_FRAME,
+            ActivityLogDepth(242),
+        ),
     ],
 )
 async def test_a_poll_is_not_answered_by_a_frame_of_another_subtype(
@@ -1104,6 +1118,100 @@ async def test_a_poll_is_not_answered_by_a_frame_of_another_subtype(
     assert await getattr(lock, poll)() == expected
     # The stray was decoded as what it is, on the path it belonged on.
     assert [stray_state] in emitted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frame", "unread", "is_depth"),
+    [(DEPTH_FRAME, 242, True), (NEGATIVE_DEPTH_FRAME, -559038737, False)],
+    ids=["captured", "top-bit-set"],
+)
+async def test_unread_event_count_returns_the_signed_four_byte_count(
+    frame: bytes, unread: int, is_depth: bool
+) -> None:
+    """The count read sends GETSTATUS LOCK_EVENTS_UNREAD and reads [8:12] signed."""
+    lock, session = _connected_lock()
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(frame))
+
+    write = AsyncMock(side_effect=deliver)
+    session.client.write_gatt_char = write
+
+    depth = await lock.unread_event_count()
+
+    assert depth == ActivityLogDepth(unread)
+    assert depth.is_depth is is_depth
+    (write_call,) = write.await_args_list
+    written = write_call.args[1]
+    assert (written[0x01], written[0x04]) == (
+        Commands.GETSTATUS.value,
+        StatusType.LOCK_EVENTS_UNREAD.value,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_count_reply_publishes_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The count reply reaches no state consumer and is not logged as unknown."""
+    emitted: list[list[LockStateValue]] = []
+    lock, session = _connected_lock(lambda states: emitted.append(list(states)))
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(DEPTH_FRAME))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
+        assert await lock.unread_event_count() == ActivityLogDepth(242)
+
+    assert emitted == []
+    assert "Unknown state" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_an_unsolicited_count_reply_answers_no_other_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A count reply during a battery poll ends no wait and publishes nothing."""
+    emitted: list[list[LockStateValue]] = []
+    lock, session = _connected_lock(lambda states: emitted.append(list(states)))
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(DEPTH_FRAME))
+        assert session._notify_future is not None
+        session._notify(0, bytearray(BATTERY_FRAME))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
+        assert await lock.battery() == BatteryState(5.241, 28)
+
+    assert emitted == [[BatteryState(5.241, 28)]]
+    assert "Unknown state" not in caplog.text
+
+
+def test_another_getstatus_subtype_is_still_unknown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A GETSTATUS reply of a subtype the library does not decode stays unknown."""
+    lock = _make_lock()
+    # Built: a GETSTATUS reply with subtype 0x0A at byte[4].
+    frame = _with_checksum("bb0200000a00000000000000000000000000")
+
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
+        assert lock._parse_state(frame) is None
+        lock._internal_state_callback(frame)
+
+    assert "Unknown state" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unread_event_count_requires_a_connection() -> None:
+    """Reading the count from a disconnected lock raises."""
+    with pytest.raises(DisconnectedError):
+        await _make_lock().unread_event_count()
 
 
 @pytest.mark.asyncio

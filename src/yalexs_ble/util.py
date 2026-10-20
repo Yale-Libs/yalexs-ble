@@ -34,6 +34,11 @@ def _bytes_to_int(buffer: bytes | bytearray) -> int:
     return int.from_bytes(buffer, byteorder="little", signed=False)
 
 
+def _bytes_to_signed_int(buffer: bytes | bytearray) -> int:
+    """Convert a byte buffer to a signed integer."""
+    return int.from_bytes(buffer, byteorder="little", signed=True)
+
+
 def _int_to_bytes(value: int, length: int) -> bytes:
     """Convert an integer to a byte buffer."""
     if length < 1 or length > 8:

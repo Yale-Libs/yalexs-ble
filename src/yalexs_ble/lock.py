@@ -26,6 +26,7 @@ from .const import (
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_STATUS,
     VALUE_TO_OPERATION_ERROR,
+    ActivityLogDepth,
     AutoLockMode,
     AutoLockState,
     BatteryState,
@@ -420,6 +421,10 @@ class Lock:
                     return self._parse_lock_and_door_state(state)
                 if state[4] == StatusType.BATTERY.value:
                     return [self._parse_battery_state(state)]
+                if state[4] == StatusType.LOCK_EVENTS_UNREAD.value:
+                    # The count reaches its consumer as the return of
+                    # unread_event_count(), so the reply publishes nothing.
+                    return ()
             elif (
                 state[1] == Commands.WRITESETTING.value
                 or state[1] == Commands.READSETTING.value
@@ -924,6 +929,28 @@ class Lock:
         # this is the best we can do for now.
         percentage = convert_voltage_to_percentage(voltage / 4)
         return BatteryState(voltage, percentage)
+
+    def _parse_activity_log_depth(self, response: bytes) -> ActivityLogDepth:
+        """Parse the unread count of a LOCK_EVENTS_UNREAD reply, signed at [8:12]."""
+        return ActivityLogDepth(util._bytes_to_signed_int(response[0x08:0x0C]))
+
+    @raise_if_not_connected
+    async def unread_event_count(self) -> ActivityLogDepth:
+        """Read the activity log's unread count; the read removes no record.
+
+        Raises TimeoutError when the lock does not answer within the session's wait.
+        """
+        _LOGGER.debug("%s: Executing unread_event_count", self.name)
+        response = await self._execute_command(
+            Commands.GETSTATUS,
+            StatusType.LOCK_EVENTS_UNREAD,
+            "unread_event_count",
+            _poll_response_matcher(
+                Commands.GETSTATUS.value, StatusType.LOCK_EVENTS_UNREAD.value
+            ),
+        )
+        _LOGGER.debug("%s: Finished executing unread_event_count", self.name)
+        return self._parse_activity_log_depth(response)
 
     @raise_if_not_connected
     async def battery(self) -> BatteryState:
