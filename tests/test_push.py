@@ -2724,17 +2724,21 @@ async def test_a_refused_battery_reading_starts_the_cooldown() -> None:
     mock_lock.battery.assert_called_once()
 
 
-def _real_decoder_pair(address: str) -> tuple[PushLock, Lock]:
-    """A PushLock fed by a real Lock decoder rather than a stub."""
-    push_lock = _named_push_lock(address, always_connected=False)
-    lock = Lock(
-        lambda: BLEDevice(address, "lock"),
+def _real_decoder(push_lock: PushLock) -> Lock:
+    """A real Lock decoder feeding push_lock's state callback."""
+    return Lock(
+        lambda: BLEDevice(push_lock.address, "lock"),
         "0800200c9a66",
         1,
         "Test Lock",
         push_lock._state_callback,
     )
-    return push_lock, lock
+
+
+def _real_decoder_pair(address: str) -> tuple[PushLock, Lock]:
+    """A PushLock fed by a real Lock decoder rather than a stub."""
+    push_lock = _named_push_lock(address, always_connected=False)
+    return push_lock, _real_decoder(push_lock)
 
 
 @pytest.mark.asyncio
@@ -2775,42 +2779,18 @@ async def test_a_door_frame_reaches_the_display_through_the_real_decoder() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("frame", "expected", "unrecognized_logged"),
+    ("frame", "expected"),
     [
         # Built frames: a LOCK_ONLY status reply for each of the six, a DOOR_AND_LOCK
         # status push, and a LOCK_ONLY reply that holds the unnamed 0x08.
-        (
-            "bb020000020000000b000000000000000000",
-            LockStatus.INTEGRATED_OTHER_SYSTEM,
-            False,
-        ),
-        (
-            "bb020000020000000d000000000000000000",
-            LockStatus.MASTER_CODE_NOT_SET,
-            False,
-        ),
-        (
-            "bb020000020000000e000000000000000000",
-            LockStatus.DEFAULT_MASTER_CODE_SET,
-            False,
-        ),
-        (
-            "bb020000020000000f000000000000000000",
-            LockStatus.LOCK_NOT_HANDED,
-            False,
-        ),
-        (
-            "bb0200000200000010000000000000000000",
-            LockStatus.SHABBAT_MODE,
-            False,
-        ),
-        (
-            "bb0200000200000011000000000000000000",
-            LockStatus.INTERNAL_FORCED_LOCKED,
-            False,
-        ),
-        ("bb0200002f0000000d010000000000000000", LockStatus.MASTER_CODE_NOT_SET, False),
-        ("bb0200000200000008000000000000000000", LockStatus.UNKNOWN, True),
+        ("bb020000020000000b000000000000000000", LockStatus.INTEGRATED_OTHER_SYSTEM),
+        ("bb020000020000000d000000000000000000", LockStatus.MASTER_CODE_NOT_SET),
+        ("bb020000020000000e000000000000000000", LockStatus.DEFAULT_MASTER_CODE_SET),
+        ("bb020000020000000f000000000000000000", LockStatus.LOCK_NOT_HANDED),
+        ("bb0200000200000010000000000000000000", LockStatus.SHABBAT_MODE),
+        ("bb0200000200000011000000000000000000", LockStatus.INTERNAL_FORCED_LOCKED),
+        ("bb0200002f0000000d010000000000000000", LockStatus.MASTER_CODE_NOT_SET),
+        ("bb0200000200000008000000000000000000", LockStatus.UNKNOWN),
     ],
     ids=[
         "reply_0x0b",
@@ -2827,19 +2807,18 @@ async def test_a_lock_state_outside_the_status_sets_shows_on_both_locks_and_is_p
     caplog: pytest.LogCaptureFixture,
     frame: str,
     expected: LockStatus,
-    unrecognized_logged: bool,
 ) -> None:
     """A status outside every set shows on both locks and the next cycle polls."""
-    push_lock, lock = _real_decoder_pair("aa:bb:cc:dd:ee:d1")
-    push_lock._lock_info = TEST_LOCK_INFO
-    push_lock._running = True
-    push_lock._advertisement_data = _advertisement({})
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:d1")
+    lock = _real_decoder(push_lock)
 
     with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
         lock._internal_state_callback(bytes(_with_checksum(frame)))
 
     assert (push_lock.lock_status, push_lock.secure_status) == (expected, expected)
-    assert ("Unrecognized lock_status_str code" in caplog.text) is unrecognized_logged
+    assert ("Unrecognized lock_status_str code" in caplog.text) is (
+        expected is LockStatus.UNKNOWN
+    )
 
     push_lock._seen_this_session.update({DoorStatus, BatteryState, AutoLockState})
     mock_lock = MagicMock()

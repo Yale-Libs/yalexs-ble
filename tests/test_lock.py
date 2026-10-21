@@ -1452,12 +1452,12 @@ def test_op_code_refuses_a_value_that_is_not_an_int() -> None:
     [
         # Built: the captured lock-button record with currentLockState 0x11.
         (
-            _with_checksum("bb2d0056000b1100a0a176a3df14194a0200"),
+            _with_byte(KEYPAD_LOCK_BUTTON, 0x06, 0x11),
             LockStatus.INTERNAL_FORCED_LOCKED,
         ),
-        # Built to the 0x0E layout: PIN credential, slot 7, lock state 0x0D, closed.
+        # Built: the 0x0E record with lock state 0x0D.
         (
-            _with_checksum("bb2d00000e9aa176a30007001d0000000000"),
+            _with_byte(CREDENTIAL_RECORD_SLOT_7, 0x0C, 0x1D),
             LockStatus.MASTER_CODE_NOT_SET,
         ),
     ],
@@ -1607,8 +1607,7 @@ async def test_a_get_log_error_record_ends_the_drain_and_reads_as_no_activity(
 @pytest.mark.asyncio
 async def test_get_log_sends_getlog_and_returns_the_matched_reply() -> None:
     """One GETLOG is sent and the reply its matcher takes is returned unchanged."""
-    session = _KeycodeSession([KEYPAD_LOCK_BUTTON])
-    lock = _lock_with_session(session)
+    lock, session = _keycode_lock([KEYPAD_LOCK_BUTTON])
     assert await lock.get_log() is KEYPAD_LOCK_BUTTON
     assert [command[0x01] for command in session.sent] == [Commands.GETLOG.value]
 
