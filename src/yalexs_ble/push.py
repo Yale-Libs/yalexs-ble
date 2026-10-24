@@ -502,6 +502,7 @@ class PushLock:
         self._activity_drain_failures = 0
         self._earliest_activity_drain_time = NEVER_TIME
         self._activity_drain_task: asyncio.Task[None] | None = None
+        self._activity_drain_read_holds_lock = False
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
@@ -1143,9 +1144,10 @@ class PushLock:
     def _jam_hold_ended(self) -> None:
         """Poll the lock now that the display hold has ended."""
         self._jam_hold_timer = None
-        if self._operation_lock.locked():
-            # The holder may be a lock operation, whose exit clears a cycle
-            # armed now, so retry.
+        if self._operation_lock.locked() and not self._activity_drain_read_holds_lock:
+            # The holder may be a lock operation, whose exit clears a cycle armed
+            # now, so retry; the drain hands the lock back after each read, so the
+            # cycle queues behind a drain read.
             self._schedule_jam_hold_timer(OPERATION_IN_PROGRESS_DEFER_SECONDS)
             return
         # Forced: the held status already counts as this session's reading.
@@ -1866,7 +1868,11 @@ class PushLock:
             if (lock := self._client) is None:
                 raise DisconnectedError("Lock is not connected")
             started = time.monotonic()
-            result = await read(lock)
+            self._activity_drain_read_holds_lock = True
+            try:
+                result = await read(lock)
+            finally:
+                self._activity_drain_read_holds_lock = False
             self._complete_operation(time.monotonic())
         return result, started
 
@@ -2312,9 +2318,10 @@ class PushLock:
             return
         if self._wait_for_the_floor(now):
             return
-        if self._operation_lock.locked():
-            # The cycle is re-armed rather than created, so no task sits on the
-            # operation lock while it is held.
+        if self._operation_lock.locked() and not self._activity_drain_read_holds_lock:
+            # The holder may be a lock operation, whose exit clears a cycle armed
+            # now, so retry; the drain hands the lock back after each read, so the
+            # cycle queues behind a drain read.
             _LOGGER.debug(
                 "%s: Rescheduling update until the operation lock is released",
                 self.name,

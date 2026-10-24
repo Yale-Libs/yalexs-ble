@@ -4932,6 +4932,74 @@ async def test_a_lock_command_queued_during_a_read_runs_before_the_next_read() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "timer_callback",
+    ["_deferred_update", "_jam_hold_ended"],
+    ids=["update_cycle", "display_hold_end"],
+)
+async def test_a_cycle_falling_due_during_a_read_polls_before_the_next_read(
+    timer_callback: str,
+) -> None:
+    """An update cycle or the hold's end during a GetLog polls before the next one."""
+    push_lock, mock_lock, _ = _activity_push_lock([], always_connected=True)
+    push_lock._next_battery_refresh_time = time.monotonic() + 1000
+    push_lock._next_auto_lock_read_time = time.monotonic() + 1000
+    order: list[str] = []
+    in_flight = asyncio.Event()
+    answer = asyncio.Event()
+    replies = iter([_RECORDS[0], _GET_LOG_ERROR])
+
+    async def get_log() -> bytes:
+        order.append("get_log")
+        in_flight.set()
+        await answer.wait()
+        return next(replies)
+
+    async def lock_status() -> None:
+        order.append("lock_status")
+
+    mock_lock.get_log = AsyncMock(side_effect=get_log)
+    mock_lock.lock_status = AsyncMock(side_effect=lock_status)
+    push_lock._update_any_state([DoorStatus.OPENED])
+    await asyncio.wait_for(in_flight.wait(), 1)
+
+    getattr(push_lock, timer_callback)()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    answer.set()
+    await _drained(push_lock)
+    if push_lock._update_task is not None:
+        await push_lock._update_task
+
+    assert order == ["get_log", "lock_status", "get_log"]
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_due_mid_operation_after_a_read_that_raised_backs_off() -> None:
+    """After a GetLog that raised, a cycle falling due mid-operation backs off."""
+    push_lock, mock_lock, _ = _activity_push_lock(
+        [TimeoutError("slow")], always_connected=True
+    )
+    push_lock._update_any_state([DoorStatus.OPENED])
+    await _drained(push_lock)
+    mock_lock.get_log.assert_awaited_once()
+    # The floor has lapsed, so only the operation lock holds the cycle off.
+    push_lock._earliest_update_time = time.monotonic() - 1.0
+
+    await push_lock._operation_lock.acquire()
+    try:
+        with patch.object(
+            push_lock, "_schedule_future_update_with_debounce"
+        ) as mock_reschedule:
+            push_lock._deferred_update()
+    finally:
+        push_lock._operation_lock.release()
+
+    assert push_lock._update_task is None
+    mock_reschedule.assert_called_once_with(OPERATION_IN_PROGRESS_DEFER_SECONDS)
+
+
+@pytest.mark.asyncio
 async def test_the_callbacks_run_with_the_operation_lock_released() -> None:
     """No callback runs while the drain holds the operation lock."""
     push_lock, mock_lock, _ = _activity_push_lock([_RECORDS[0], _GET_LOG_ERROR])
