@@ -175,6 +175,9 @@ AUTH_FAILURE_TO_START_REAUTH = 5
 # How long to wait before retrying battery after a timeout (5 minutes)
 BATTERY_TIMEOUT_COOLDOWN = 300
 
+# How long to wait before requesting door status again after a timeout (5 minutes).
+DOOR_STATUS_TIMEOUT_COOLDOWN = 300
+
 # How often to re-poll battery state in always_connected mode (10 minutes)
 BATTERY_REFRESH_INTERVAL = 600
 
@@ -543,6 +546,8 @@ class PushLock:
         self._slow_params_set = False
         # Earliest next battery poll attempt (cooldown)
         self._earliest_battery_attempt_time = NEVER_TIME
+        # Earliest next door status request after a timeout (cooldown).
+        self._earliest_door_status_attempt_time = NEVER_TIME
         # Scheduled battery refresh time (in always_connected mode)
         self._next_battery_refresh_time = NEVER_TIME
         # Earliest next combined lock and door status poll, set when the
@@ -783,20 +788,18 @@ class PushLock:
                 return
             # Connected, so this hands back the link without a connect.
             lock = await self._ensure_connected()
-            info = self._lock_info
-            if info is None:
+            if self._lock_info is None:
                 return
             try:
-                asked = await self._poll_battery(lock, force=True)
-                if not asked and info.door_sense:
-                    await lock.door_status()
-                    asked = True
+                answered = await self._poll_battery(lock, force=True)
+                if not answered:
+                    answered = await self._poll_door_status(lock, force=True)
             except (TimeoutError, *RETRYABLE_EXCEPTIONS) as ex:
                 # The cycle at the floor's end retries and reports the link.
                 _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
                 return
-            if asked:
-                # A request, so the floor check and the keep-alive count from it.
+            if answered:
+                # Only an answer is known to have restarted the lock's idle window.
                 self._last_operation_complete_time = time.monotonic()
                 self._reschedule_next_keep_alive()
 
@@ -970,8 +973,9 @@ class PushLock:
             # None of the auto lock read state is reset here: the backoff timers,
             # both failure counts, and the pending-response flag all persist
             # across reconnects, so the hold outlives the connection.
-            # The combined poll's stand-down survives the reconnect because it
-            # is the lock that stopped answering.
+            # The request cooldowns and the combined poll's stand-down survive
+            # the reconnect, so a lock that does not answer is not asked again on
+            # each new connection.
             self._slow_params_set = False
             return self._client
 
@@ -1568,7 +1572,8 @@ class PushLock:
         BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
         force asks even when the reading is current.
 
-        Returns True if the lock was asked, whether or not it answered.
+        Returns True only when the lock answered, so an unanswered request does
+        not count as the cycle's keep-alive traffic.
         """
         assert self._lock_info is not None  # nosec
         if not self._lock_info.battery_reporting:
@@ -1604,22 +1609,22 @@ class PushLock:
             await lock.battery()
             self._record_auth_success()
             self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
-        except TimeoutError as err:
+        except TimeoutError:
             _LOGGER.info(
-                "%s: Battery request timed out (%s), will retry in %d "
-                "seconds. Continuing with other updates.",
+                "%s: Battery request timed out; not asking again for %d seconds",
                 self.name,
-                err,
                 BATTERY_TIMEOUT_COOLDOWN,
             )
             # Set cooldown to prevent repeated timeouts.
             self._earliest_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+            return False
         except BleakError as err:
             _LOGGER.debug(
-                "%s: Battery request failed (%s), continuing with other updates.",
+                "%s: Battery request failed (%s)",
                 self.name,
                 err,
             )
+            return False
 
         return True
 
@@ -1642,18 +1647,43 @@ class PushLock:
         _LOGGER.debug("Obtained lock info: %s", lock_info)
         return lock_info
 
-    async def _poll_door_status(self, lock: Lock) -> bool:
+    async def _poll_door_status(self, lock: Lock, *, force: bool = False) -> bool:
         """Request the door status from a lock with a door sensor.
 
-        The request is skipped while _seen_this_session holds DoorStatus, and
-        while the combined status poll is in use, since that poll reads the door.
-        Returns True if the lock was asked.
+        force asks even when the reading is current. Unforced, the request is
+        skipped while _seen_this_session holds DoorStatus, and while the combined
+        status poll is in use, since that poll reads the door. Returns True only
+        when the lock answered, so an unanswered request does not count as the
+        cycle's keep-alive traffic. A timeout is caught here and holds the request
+        off for DOOR_STATUS_TIMEOUT_COOLDOWN; left to propagate, it would reach the
+        retry decorator and be handled as a lost connection.
         """
         if not (self._lock_info and self._lock_info.door_sense):
             return False
-        if DoorStatus in self._seen_this_session or self._combined_status_poll_in_use():
+        if not force and (
+            DoorStatus in self._seen_this_session or self._combined_status_poll_in_use()
+        ):
             return False
-        await lock.door_status()
+        now = time.monotonic()
+        if now < self._earliest_door_status_attempt_time:
+            _LOGGER.debug(
+                "%s: Skipping door status request; not asking again for %d seconds",
+                self.name,
+                self._earliest_door_status_attempt_time - now,
+            )
+            return False
+        try:
+            await lock.door_status()
+        except TimeoutError:
+            # The hold is for a request the lock does not answer, so a transport
+            # error propagates.
+            _LOGGER.info(
+                "%s: Door status request timed out; not asking again for %d seconds",
+                self.name,
+                DOOR_STATUS_TIMEOUT_COOLDOWN,
+            )
+            self._earliest_door_status_attempt_time = now + DOOR_STATUS_TIMEOUT_COOLDOWN
+            return False
         self._record_auth_success()
         return True
 
@@ -1819,6 +1849,9 @@ class PushLock:
         poll has shown nothing about the subtype; such a lock pays both response
         timeouts on every attempt of the retry decorator. Any other failure of
         the combined poll raises and is not counted.
+
+        After a stand-down the standalone door request can still be deferred by
+        its own cooldown.
         """
         if not self._combined_status_poll_in_use():
             await lock.lock_status()
