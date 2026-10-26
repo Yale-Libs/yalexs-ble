@@ -41,6 +41,7 @@ from yalexs_ble.push import (
     _LOCK_OPERATION,
     _SECUREMODE_OPERATION,
     _UNLOCK_OPERATION,
+    ACTIVITY_CAPTURE_DRAIN_DELAY,
     ACTIVITY_DRAIN_FAILURE_BACKOFF,
     ACTIVITY_DRAIN_FAILURE_THRESHOLD,
     ACTIVITY_DRAIN_MARGIN,
@@ -60,6 +61,7 @@ from yalexs_ble.push import (
     JAMMED_HOLD_TIME,
     KEEP_ALIVE_TIME,
     LOCK_STALE_STATE_DEBOUNCE_DELAY,
+    MANUAL_UPDATE_COALESCE_SECONDS,
     NEVER_TIME,
     OPERATION_IN_PROGRESS_DEFER_SECONDS,
     RECONNECT_BACKOFF_TIME,
@@ -101,6 +103,8 @@ def _cancel_timers(push_lock: PushLock) -> None:
     push_lock._cancel_jam_hold_timer()
     if push_lock._activity_drain_task is not None:
         push_lock._activity_drain_task.cancel()
+    if push_lock._activity_capture_timer is not None:
+        push_lock._activity_capture_timer.cancel()
 
 
 @pytest.fixture(autouse=True)
@@ -5546,6 +5550,277 @@ async def test_a_failed_count_read_is_retried_by_the_next_drain() -> None:
     assert push_lock._activity_drain_pending is True
     await _update_and_drain(push_lock, mock_lock)
     assert received == [(_RECORDS[0], True), (_GET_LOG_ERROR, False)]
+
+
+# ---------------------------------------------------------------------------
+# The activity capture: every record logged, and a drain asked for hourly
+# ---------------------------------------------------------------------------
+
+_CAPTURE_LOGGER = "yalexs_ble.activity_capture"
+# The capture's logger for _capturing_push_lock's lock.
+_LOCK_CAPTURE_LOGGER = f"{_CAPTURE_LOGGER}.aabbccddeee0"
+
+
+def _capture_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The messages logged on the capture's per-lock loggers."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name.startswith(f"{_CAPTURE_LOGGER}.")
+    ]
+
+
+def _record_lines(caplog: pytest.LogCaptureFixture) -> list[dict[str, str]]:
+    """The fields of each capture line for a record, by key."""
+    return [
+        dict(field.split("=", 1) for field in line.split(" ") if "=" in field)
+        for line in _capture_lines(caplog)
+        if ": activity record " in line
+    ]
+
+
+async def _start(push_lock: PushLock) -> None:
+    """Run start() for a lock the host's Bluetooth stack does not know."""
+    with patch("yalexs_ble.push.get_device", AsyncMock(return_value=None)):
+        await push_lock.start()
+
+
+async def _capturing_push_lock(
+    caplog: pytest.LogCaptureFixture,
+    replies: list[Any],
+    logger: str = _CAPTURE_LOGGER,
+) -> tuple[PushLock, MagicMock]:
+    """A PushLock started with the capture on by logger, on a connected mock Lock.
+
+    Each GetLog answers the next item of replies, and an exception there is
+    raised. No backlog is left and no drain has started.
+    """
+    caplog.set_level(logging.DEBUG, logger=logger)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:e0", always_connected=False)
+    await _start(push_lock)
+    _ready_to_drain(push_lock)
+    mock_lock = MagicMock(is_connected=True)
+    mock_lock.get_log = AsyncMock(side_effect=replies)
+    mock_lock.unread_event_count = AsyncMock(return_value=ActivityLogDepth(0))
+    mock_lock.disconnect = AsyncMock()
+    push_lock._backlog_remaining = 0
+    push_lock._client = mock_lock
+    return push_lock, mock_lock
+
+
+def _seconds_to_the_ask(push_lock: PushLock) -> float:
+    """Seconds until the capture next asks for a drain."""
+    timer = push_lock._activity_capture_timer
+    assert timer is not None
+    return timer.when() - push_lock.loop.time()
+
+
+# A patched ACTIVITY_CAPTURE_DRAIN_DELAY, so the seconds to the next ask show
+# whether the timer restarted while the patch was in place.
+_RESTARTED_DELAY = ACTIVITY_CAPTURE_DRAIN_DELAY / 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("logger", "on"),
+    [
+        (_CAPTURE_LOGGER, True),
+        (f"{_CAPTURE_LOGGER}.aabbccddeee1", True),
+        (f"{_CAPTURE_LOGGER}.aabbccddeee2", False),
+        ("yalexs_ble", False),
+    ],
+    ids=["module level", "this lock's level", "another lock's level", "parent level"],
+)
+async def test_start_turns_the_capture_on_by_the_module_or_lock_loggers_own_level(
+    logger: str, on: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """start() turns the capture on by the module's or lock's logger's own level."""
+    caplog.set_level(logging.DEBUG, logger=logger)
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E1", always_connected=False)
+    await _start(push_lock)
+    assert [
+        (r.name, r.getMessage())
+        for r in caplog.records
+        if r.name.startswith(_CAPTURE_LOGGER)
+    ] == ([(f"{_CAPTURE_LOGGER}.aabbccddeee1", "Test Lock: capture on")] if on else [])
+    _, written = _drain_on_a_real_session(push_lock, [_count_reply(0), _GET_LOG_ERROR])
+
+    push_lock._update_any_state([DoorStatus.OPENED])
+    await _drained(push_lock)
+
+    assert _commands(written) == ([_COUNT_READ, _GET_LOG] if on else [])
+    assert [line["log_type"] for line in _record_lines(caplog)] == (
+        ["0x80"] if on else []
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_start_that_fails_at_the_device_lookup_turns_no_capture_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A start() that raises at the device lookup logs no capture line."""
+    caplog.set_level(logging.DEBUG, logger=_CAPTURE_LOGGER)
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:e0", always_connected=False)
+    with (
+        patch("yalexs_ble.push.ACTIVITY_CAPTURE_DRAIN_DELAY", 0),
+        patch("yalexs_ble.push.get_device", AsyncMock(side_effect=BleakError("bus"))),
+        pytest.raises(BleakError, match="bus"),
+    ):
+        await push_lock.start()
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert _capture_lines(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_a_per_lock_capture_logs_each_record_on_the_locks_logger(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A capture on by the lock's own logger logs each record line on that logger."""
+    push_lock, _ = await _capturing_push_lock(
+        caplog, [_GET_LOG_ERROR], logger=_LOCK_CAPTURE_LOGGER
+    )
+    await _drain_to_the_get_log_error(push_lock)
+
+    assert [
+        r.name for r in caplog.records if ": activity record " in r.getMessage()
+    ] == [_LOCK_CAPTURE_LOGGER]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "since_change"),
+    [
+        (DoorStatus.OPENED, ["-"]),
+        (LockStatus.LOCKED, ["0.600", "1.200", "1.800", "2.400", "3.000"]),
+    ],
+    ids=["no lock change", "lock change"],
+)
+async def test_since_change_counts_monotonic_seconds_from_the_settled_lock_change(
+    change: LockStatus | DoorStatus,
+    since_change: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """since_change is - with no settled lock change, and else seconds since it."""
+    with _patched_clock() as clock:
+        push_lock, mock_lock = await _capturing_push_lock(caplog, [])
+        mock_lock.get_log = _log_on_a_clock(clock, [])
+        push_lock._update_any_state([change])
+        await _drained(push_lock)
+
+    assert [line["since_change"] for line in _record_lines(caplog)] == since_change
+
+
+async def _drain_to_the_get_log_error(push_lock: PushLock) -> None:
+    """A door change drains the log to its GetLogError."""
+    push_lock._update_any_state([DoorStatus.OPENED])
+    await _drained(push_lock)
+
+
+async def _the_hour_passes(push_lock: PushLock) -> None:
+    """The capture's hour passes, and the capture asks for a drain."""
+    push_lock._ask_for_activity_drain()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "restart",
+    [_drain_to_the_get_log_error, _the_hour_passes],
+    ids=["GetLogError", "ask"],
+)
+async def test_the_hour_starts_at_registration_and_restarts_at_get_log_error_and_ask(
+    restart: Callable[[PushLock], Awaitable[None]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The next ask is due the delay after registration, a GetLogError, or an ask."""
+    push_lock, _ = await _capturing_push_lock(caplog, [_GET_LOG_ERROR])
+    assert _seconds_to_the_ask(push_lock) == pytest.approx(
+        ACTIVITY_CAPTURE_DRAIN_DELAY, abs=0.5
+    )
+
+    with patch("yalexs_ble.push.ACTIVITY_CAPTURE_DRAIN_DELAY", _RESTARTED_DELAY):
+        await restart(push_lock)
+
+    assert _seconds_to_the_ask(push_lock) == pytest.approx(_RESTARTED_DELAY, abs=0.5)
+    await _drained(push_lock)
+
+
+@pytest.mark.asyncio
+async def test_the_hour_asks_for_a_drain_and_an_update_with_the_link_down(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With the link down, the ask schedules an update, and its connection drains."""
+    push_lock, mock_lock = await _capturing_push_lock(
+        caplog, [_GET_LOG_ERROR, _GET_LOG_ERROR]
+    )
+    await _update_and_drain(push_lock, mock_lock)
+    mock_lock.is_connected = False
+
+    with patch.object(push_lock, "_schedule_future_update_with_debounce") as debounced:
+        push_lock._ask_for_activity_drain()
+    await _drained(push_lock)
+
+    assert _capture_lines(caplog)[-1] == (
+        "Test Lock: no GetLogError for 3600 s, asking for a drain"
+    )
+    debounced.assert_called_once_with(MANUAL_UPDATE_COALESCE_SECONDS)
+    mock_lock.get_log.assert_awaited_once()
+
+    mock_lock.is_connected = True
+    await _update_and_drain(push_lock, mock_lock)
+    assert mock_lock.get_log.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replies", "records"),
+    [
+        ([DisconnectedError("gone")], []),
+        ([TimeoutError("slow")], []),
+        ([_LOCK_OPERATION_RECORD, DisconnectedError("gone")], ["0x00"]),
+    ],
+    ids=["dropped link", "timeout", "record then dropped link"],
+)
+async def test_an_asked_drain_with_no_get_log_error_is_asked_for_again_an_hour_later(
+    replies: list[bytes | Exception],
+    records: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A drain that ends before a GetLogError leaves the ask's hour running."""
+    push_lock, mock_lock = await _capturing_push_lock(caplog, replies)
+    push_lock._ask_for_activity_drain()
+
+    with patch("yalexs_ble.push.ACTIVITY_CAPTURE_DRAIN_DELAY", _RESTARTED_DELAY):
+        await _drained(push_lock)
+
+    assert mock_lock.get_log.await_count == len(replies)
+    assert [line["log_type"] for line in _record_lines(caplog)] == records
+    assert _seconds_to_the_ask(push_lock) == pytest.approx(
+        ACTIVITY_CAPTURE_DRAIN_DELAY, abs=0.5
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_removes_the_capture_and_hour_and_a_second_start_registers_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """After _cancel the capture asks for no drain, and start() registers it once."""
+    with patch("yalexs_ble.push.ACTIVITY_CAPTURE_DRAIN_DELAY", 0):
+        push_lock, mock_lock = await _capturing_push_lock(caplog, [_GET_LOG_ERROR])
+        push_lock._cancel()
+        await asyncio.wait(set(push_lock._background_tasks))
+
+    await _start(push_lock)
+    push_lock._client = mock_lock
+    push_lock._update_any_state([DoorStatus.OPENED])
+    await _drained(push_lock)
+
+    assert [line["log_type"] for line in _record_lines(caplog)] == ["0x80"]
+    assert _capture_lines(caplog).count("Test Lock: capture on") == 2
+    assert not [
+        line for line in _capture_lines(caplog) if line.endswith("asking for a drain")
+    ]
 
 
 # ---------------------------------------------------------------------------

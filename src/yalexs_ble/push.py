@@ -21,6 +21,7 @@ from bleak_retry_connector import (
 )
 from lru import LRU  # pylint: disable=no-name-in-module
 
+from . import activity_capture
 from .activity_log import LogRecord, parse_log_event_packet
 from .const import (
     APPLE_MFR_ID,
@@ -208,6 +209,9 @@ ACTIVITY_DRAIN_MARGIN = 128
 # Seconds a drain reads on after a settled change of the displayed lock status,
 # so a record the lock writes within them is read by that drain.
 ACTIVITY_DRAIN_WINDOW = 2.0
+# Seconds from the capture's registration, its last GetLogError, or its last
+# ask, whichever is latest, to its next ask for a drain.
+ACTIVITY_CAPTURE_DRAIN_DELAY = 3600.0
 
 # Receives each decoded activity log record and its backlog flag.
 LogRecordCallback = Callable[[LogRecord, bool], Awaitable[None]]
@@ -503,6 +507,11 @@ class PushLock:
         self._earliest_activity_drain_time = NEVER_TIME
         self._activity_drain_task: asyncio.Task[None] | None = None
         self._activity_drain_read_holds_lock = False
+        # The capture's remover, None while the capture is not registered.
+        self._remove_activity_capture: Callable[[], None] | None = None
+        self._activity_capture_timer: asyncio.TimerHandle | None = None
+        # The capture's logger, set by the start() that registers the capture.
+        self._activity_capture_logger: logging.Logger | None = None
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
@@ -2016,6 +2025,45 @@ class PushLock:
             time.monotonic() + ACTIVITY_DRAIN_FAILURE_BACKOFF
         )
 
+    async def _activity_capture(self, reply: bytes, backlog: bool) -> None:
+        """Log the capture line for reply; a GetLogError reschedules the next ask."""
+        since_change = None
+        if self._activity_drain_window_end != NEVER_TIME:
+            changed = self._activity_drain_window_end - ACTIVITY_DRAIN_WINDOW
+            since_change = time.monotonic() - changed
+        assert self._activity_capture_logger is not None  # nosec
+        activity_capture.log_record(
+            self._activity_capture_logger,
+            self.name,
+            reply,
+            backlog,
+            since_change,
+            self.lock_status,
+            self.door_status,
+        )
+        if reply[0x04] == LOG_TYPE_GET_LOG_ERROR:
+            self._restart_activity_capture_timer()
+
+    def _restart_activity_capture_timer(self) -> None:
+        """Schedule the capture's next ask ACTIVITY_CAPTURE_DRAIN_DELAY from now."""
+        if self._activity_capture_timer is not None:
+            self._activity_capture_timer.cancel()
+        self._activity_capture_timer = self.loop.call_later(
+            ACTIVITY_CAPTURE_DRAIN_DELAY, self._ask_for_activity_drain
+        )
+
+    def _ask_for_activity_drain(self) -> None:
+        """Owe a drain for the capture, and request an update when the link is down."""
+        assert self._activity_capture_logger is not None  # nosec
+        activity_capture.log_drain_ask(
+            self._activity_capture_logger, self.name, ACTIVITY_CAPTURE_DRAIN_DELAY
+        )
+        self._restart_activity_capture_timer()
+        self._owe_activity_drain()
+        if not self.is_connected:
+            # The drain never connects; the update's connection starts it.
+            self._schedule_future_update_with_debounce(MANUAL_UPDATE_COALESCE_SECONDS)
+
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""
         if self._slow_params_set:
@@ -2199,12 +2247,26 @@ class PushLock:
         if device := await get_device(self.address):
             self.set_ble_device(device)
             self._schedule_future_update_with_debounce(ADV_UPDATE_COALESCE_SECONDS)
+        # The level is read here once, so a change takes effect at the next start().
+        if (logger := activity_capture.capture_logger(self.address)) is not None:
+            self._activity_capture_logger = logger
+            self._remove_activity_capture = self.register_log_record_callback(
+                self._activity_capture
+            )
+            self._restart_activity_capture_timer()
+            activity_capture.log_capture_on(logger, self.name)
 
         return self._cancel
 
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
+        if self._remove_activity_capture is not None:
+            self._remove_activity_capture()
+            self._remove_activity_capture = None
+        if self._activity_capture_timer is not None:
+            self._activity_capture_timer.cancel()
+            self._activity_capture_timer = None
         if self._activity_drain_task is not None:
             self._activity_drain_task.cancel()
         if not self._operation_in_flight:
