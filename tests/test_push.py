@@ -101,10 +101,9 @@ def _cancel_timers(push_lock: PushLock) -> None:
     push_lock._cancel_disconnect_timer()
     push_lock._cancel_keepalive_timer()
     push_lock._cancel_jam_hold_timer()
+    push_lock._cancel_activity_capture_timer()
     if push_lock._activity_drain_task is not None:
         push_lock._activity_drain_task.cancel()
-    if push_lock._activity_capture_timer is not None:
-        push_lock._activity_capture_timer.cancel()
 
 
 @pytest.fixture(autouse=True)
@@ -4017,9 +4016,9 @@ def _recorder(received: list[tuple[bytes, bool]]) -> LogRecordCallback:
 
 def _ready_to_drain(push_lock: PushLock) -> None:
     """
-    Set push_lock running with lock info and the four status types in
-    _seen_this_session, so an update cycle sends no read of its own beyond the
-    always-connected status poll.
+    Set push_lock running with lock info, the four status types in
+    _seen_this_session, and the battery and auto-lock reads far off, so an update
+    cycle sends no read of its own beyond the always-connected status poll.
     """
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
@@ -4027,6 +4026,26 @@ def _ready_to_drain(push_lock: PushLock) -> None:
     push_lock._seen_this_session.update(
         {LockStatus, DoorStatus, BatteryState, AutoLockState}
     )
+    push_lock._next_battery_refresh_time = time.monotonic() + 100_000
+    push_lock._next_auto_lock_read_time = time.monotonic() + 100_000
+
+
+def _mock_link(
+    push_lock: PushLock, replies: list[Any], count: int | None = None
+) -> MagicMock:
+    """Connect push_lock to a mock Lock whose GetLog answers replies; return the Lock.
+
+    With count, the count read answers count and the backlog stays armed; without,
+    no backlog is left.
+    """
+    mock_lock = MagicMock(is_connected=True)
+    mock_lock.get_log = AsyncMock(side_effect=replies)
+    mock_lock.unread_event_count = AsyncMock(return_value=count or 0)
+    mock_lock.disconnect = AsyncMock()
+    if count is None:
+        push_lock._backlog_remaining = 0
+    push_lock._client = mock_lock
+    return mock_lock
 
 
 def _activity_push_lock(
@@ -4047,14 +4066,7 @@ def _activity_push_lock(
     # Registered before the lock is up, so no drain starts here.
     push_lock.register_log_record_callback(_recorder(received))
     _ready_to_drain(push_lock)
-    mock_lock = MagicMock(is_connected=True)
-    mock_lock.get_log = AsyncMock(side_effect=replies)
-    mock_lock.unread_event_count = AsyncMock(return_value=count or 0)
-    mock_lock.disconnect = AsyncMock()
-    if count is None:
-        push_lock._backlog_remaining = 0
-    push_lock._client = mock_lock
-    return push_lock, mock_lock, received
+    return push_lock, _mock_link(push_lock, replies, count), received
 
 
 def _drain_on_a_real_session(
@@ -4102,6 +4114,12 @@ async def _run_update(push_lock: PushLock, mock_lock: Lock | MagicMock) -> None:
 async def _update_and_drain(push_lock: PushLock, mock_lock: Lock | MagicMock) -> None:
     """Run one update cycle, then wait for a drain it started to end."""
     await _run_update(push_lock, mock_lock)
+    await _drained(push_lock)
+
+
+async def _drain_on_a_door_change(push_lock: PushLock) -> None:
+    """Report the door open, then wait for the drain it starts to end."""
+    push_lock._update_any_state([DoorStatus.OPENED])
     await _drained(push_lock)
 
 
@@ -4183,21 +4201,46 @@ async def test_a_get_log_error_with_the_dirty_bit_is_delivered_and_the_drain_rea
 
 
 @pytest.mark.asyncio
-async def test_the_get_log_error_ends_a_backlog_the_log_ran_out_before() -> None:
-    """A GetLogError read with backlog left is not backlog, and the backlog ends."""
-    push_lock, mock_lock, received = _activity_push_lock(
-        [*_RECORDS[:2], _GET_LOG_ERROR, _RECORDS[2], _GET_LOG_ERROR], count=5
-    )
-    await _update_and_drain(push_lock, mock_lock)
-    push_lock._update_any_state([DoorStatus.OPENED])
-    await _drained(push_lock)
-    assert received == [
-        (_RECORDS[0], True),
-        (_RECORDS[1], True),
-        (_GET_LOG_ERROR, False),
-        (_RECORDS[2], False),
-        (_GET_LOG_ERROR, False),
-    ]
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        (
+            [DoorStatus.OPENED, DoorStatus.CLOSED],
+            [
+                (_RECORDS[0], True),
+                (_GET_LOG_ERROR, False),
+                (_RECORDS[1], False),
+                (_GET_LOG_ERROR, False),
+            ],
+        ),
+        (
+            [LockStatus.LOCKED],
+            [
+                (_RECORDS[0], True),
+                (_GET_LOG_ERROR, False),
+                (_RECORDS[1], False),
+                (_GET_LOG_ERROR, False),
+                (_GET_LOG_ERROR, False),
+            ],
+        ),
+    ],
+    ids=["next drain", "same drain in the window"],
+)
+async def test_the_get_log_error_ends_a_backlog_the_log_ran_out_before(
+    changes: list[LockStatus | DoorStatus], expected: list[tuple[bytes, bool]]
+) -> None:
+    """A GetLogError read with backlog left ends it; a later record is not backlog."""
+    with _patched_clock() as clock:
+        push_lock, mock_lock, received = _activity_push_lock([], count=2)
+        changed = clock[0]
+        mock_lock.get_log = _log_on_a_clock(
+            clock, [(changed, _RECORDS[0]), (changed + 1.5, _RECORDS[1])]
+        )
+        for change in changes:
+            push_lock._update_any_state([change])
+            await _drained(push_lock)
+
+    assert received == expected
     mock_lock.unread_event_count.assert_awaited_once()
 
 
@@ -4273,8 +4316,7 @@ async def test_a_registration_beside_others_shares_their_flags() -> None:
     await _update_and_drain(push_lock, mock_lock)
     second: list[tuple[bytes, bool]] = []
     push_lock.register_log_record_callback(_recorder(second))
-    push_lock._update_any_state([DoorStatus.OPENED])
-    await _drained(push_lock)
+    await _drain_on_a_door_change(push_lock)
 
     assert first[2:] == [(_RECORDS[1], False), (_GET_LOG_ERROR, False)]
     assert second == first[2:]
@@ -4727,28 +4769,6 @@ async def test_a_settled_lock_change_inside_the_window_moves_its_end() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_record_in_the_window_after_a_get_log_error_is_not_backlog() -> None:
-    """A record read in the window after a GetLogError is not backlog."""
-    with _patched_clock() as clock:
-        push_lock, mock_lock, received = _activity_push_lock([], count=2)
-        changed = clock[0]
-        mock_lock.get_log = _log_on_a_clock(
-            clock, [(changed, _RECORDS[0]), (changed + 1.5, _RECORDS[1])]
-        )
-        push_lock._update_any_state([LockStatus.LOCKED])
-        await _drained(push_lock)
-
-    mock_lock.unread_event_count.assert_awaited_once()
-    assert received == [
-        (_RECORDS[0], True),
-        (_GET_LOG_ERROR, False),
-        (_RECORDS[1], False),
-        (_GET_LOG_ERROR, False),
-        (_GET_LOG_ERROR, False),
-    ]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("records", "warned", "count"),
     [
@@ -4798,33 +4818,6 @@ async def test_the_guard_counts_reads_from_the_last_get_log_error_in_the_window(
         if warned
         else []
     )
-
-
-@pytest.mark.asyncio
-async def test_a_read_that_times_out_inside_the_window_leaves_the_drain_owed(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A timeout in the window counts; the next cycle's drain ends at a GetLogError."""
-    with (
-        _patched_clock() as clock,
-        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
-    ):
-        push_lock, mock_lock, received = _activity_push_lock([])
-        mock_lock.get_log = _log_on_a_clock(clock, [(clock[0], TimeoutError("slow"))])
-        push_lock._update_any_state([LockStatus.LOCKED])
-        await _drained(push_lock)
-        assert received == []
-
-        # The next update cycle comes after the window has closed.
-        clock[0] += ACTIVITY_DRAIN_WINDOW
-        await _update_and_drain(push_lock, mock_lock)
-
-    assert mock_lock.get_log.await_count == 2
-    assert received == [(_GET_LOG_ERROR, False)]
-    lines = [r for r in caplog.records if "Reading lock activity" in r.getMessage()]
-    assert [(r.levelno, r.getMessage()) for r in lines] == [
-        (logging.DEBUG, "Test Lock: Reading lock activity failed (slow), will retry.")
-    ]
 
 
 async def _door_opens(push_lock: PushLock, _lock: Lock) -> None:
@@ -4922,8 +4915,6 @@ async def test_a_keep_alive_answer_equal_to_the_display_starts_no_drain() -> Non
         [_GET_LOG_ERROR, _RECORDS[0], _GET_LOG_ERROR], always_connected=True
     )
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
-    push_lock._next_battery_refresh_time = time.monotonic() + 1000
-    push_lock._next_auto_lock_read_time = time.monotonic() + 1000
     mock_lock.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
     await _update_and_drain(push_lock, mock_lock)
 
@@ -4935,9 +4926,20 @@ async def test_a_keep_alive_answer_equal_to_the_display_starts_no_drain() -> Non
 
 
 @pytest.mark.asyncio
-async def test_a_lock_command_queued_during_a_read_runs_before_the_next_read() -> None:
-    """A lock command queued while a GetLog is in flight runs before the next GetLog."""
-    push_lock, mock_lock, _ = _activity_push_lock([])
+@pytest.mark.parametrize(
+    ("queue", "queued"),
+    [
+        (lambda push_lock: asyncio.ensure_future(push_lock.lock()), "lock"),
+        (lambda push_lock: push_lock._deferred_update(), "lock_status"),
+        (lambda push_lock: push_lock._jam_hold_ended(), "lock_status"),
+    ],
+    ids=["lock_command", "update_cycle", "display_hold_end"],
+)
+async def test_a_caller_queued_behind_a_drain_read_runs_before_the_next_read(
+    queue: Callable[[PushLock], Awaitable[None] | None], queued: str
+) -> None:
+    """A lock command, cycle, or hold's end during a GetLog runs before the next one."""
+    push_lock, mock_lock, _ = _activity_push_lock([], always_connected=True)
     order: list[str] = []
     in_flight = asyncio.Event()
     answer = asyncio.Event()
@@ -4952,61 +4954,26 @@ async def test_a_lock_command_queued_during_a_read_runs_before_the_next_read() -
     async def force_lock(**_kwargs: Any) -> None:
         order.append("lock")
 
-    mock_lock.get_log = AsyncMock(side_effect=get_log)
-    mock_lock.force_lock = AsyncMock(side_effect=force_lock)
-    await _run_update(push_lock, mock_lock)
-    await asyncio.wait_for(in_flight.wait(), 1)
-
-    command = asyncio.create_task(push_lock.lock())
-    await asyncio.sleep(0)
-    answer.set()
-    await command
-    await _drained(push_lock)
-
-    assert order == ["get_log", "lock", "get_log"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "timer_callback",
-    ["_deferred_update", "_jam_hold_ended"],
-    ids=["update_cycle", "display_hold_end"],
-)
-async def test_a_cycle_falling_due_during_a_read_polls_before_the_next_read(
-    timer_callback: str,
-) -> None:
-    """An update cycle or the hold's end during a GetLog polls before the next one."""
-    push_lock, mock_lock, _ = _activity_push_lock([], always_connected=True)
-    push_lock._next_battery_refresh_time = time.monotonic() + 1000
-    push_lock._next_auto_lock_read_time = time.monotonic() + 1000
-    order: list[str] = []
-    in_flight = asyncio.Event()
-    answer = asyncio.Event()
-    replies = iter([_RECORDS[0], _GET_LOG_ERROR])
-
-    async def get_log() -> bytes:
-        order.append("get_log")
-        in_flight.set()
-        await answer.wait()
-        return next(replies)
-
     async def lock_status() -> None:
         order.append("lock_status")
 
     mock_lock.get_log = AsyncMock(side_effect=get_log)
+    mock_lock.force_lock = AsyncMock(side_effect=force_lock)
     mock_lock.lock_status = AsyncMock(side_effect=lock_status)
     push_lock._update_any_state([DoorStatus.OPENED])
     await asyncio.wait_for(in_flight.wait(), 1)
 
-    getattr(push_lock, timer_callback)()
+    command = queue(push_lock)
     for _ in range(3):
         await asyncio.sleep(0)
     answer.set()
+    if command is not None:
+        await command
     await _drained(push_lock)
     if push_lock._update_task is not None:
         await push_lock._update_task
 
-    assert order == ["get_log", "lock_status", "get_log"]
+    assert order == ["get_log", queued, "get_log"]
 
 
 @pytest.mark.asyncio
@@ -5015,8 +4982,7 @@ async def test_a_cycle_due_mid_operation_after_a_read_that_raised_backs_off() ->
     push_lock, mock_lock, _ = _activity_push_lock(
         [TimeoutError("slow")], always_connected=True
     )
-    push_lock._update_any_state([DoorStatus.OPENED])
-    await _drained(push_lock)
+    await _drain_on_a_door_change(push_lock)
     mock_lock.get_log.assert_awaited_once()
     # The floor has lapsed, so only the operation lock holds the cycle off.
     push_lock._earliest_update_time = time.monotonic() - 1.0
@@ -5047,23 +5013,6 @@ async def test_the_callbacks_run_with_the_operation_lock_released() -> None:
     await _update_and_drain(push_lock, mock_lock)
 
     assert held == [False, False]
-
-
-@pytest.mark.asyncio
-async def test_the_drain_reads_past_the_count_until_the_get_log_error() -> None:
-    """Records written during the drain are read, and none after the GetLogError."""
-    push_lock, mock_lock, received = _activity_push_lock(
-        [*_RECORDS[:3], _GET_LOG_ERROR, _RECORDS[3]], count=2
-    )
-    await _update_and_drain(push_lock, mock_lock)
-
-    assert received == [
-        (_RECORDS[0], True),
-        (_RECORDS[1], True),
-        (_RECORDS[2], False),
-        (_GET_LOG_ERROR, False),
-    ]
-    assert mock_lock.get_log.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -5166,8 +5115,6 @@ async def test_the_keep_alive_polls_while_a_callback_holds_the_drain() -> None:
     push_lock, mock_lock, received = _activity_push_lock(
         [_RECORDS[0], _GET_LOG_ERROR, _GET_LOG_ERROR], always_connected=True
     )
-    push_lock._next_battery_refresh_time = time.monotonic() + 1000
-    push_lock._next_auto_lock_read_time = time.monotonic() + 1000
     mock_lock.lock_status = AsyncMock()
     waiting = asyncio.Event()
     release = asyncio.Event()
@@ -5214,8 +5161,7 @@ async def test_the_keep_alive_counts_from_the_last_read_of_a_drain() -> None:
             return next(replies)
 
         mock_lock.get_log = AsyncMock(side_effect=get_log)
-        push_lock._update_any_state([DoorStatus.OPENED])
-        await _drained(push_lock)
+        await _drain_on_a_door_change(push_lock)
 
     assert received == [(_RECORDS[0], False), (_GET_LOG_ERROR, False)]
     handle = push_lock._keep_alive_timer
@@ -5223,34 +5169,6 @@ async def test_the_keep_alive_counts_from_the_last_read_of_a_drain() -> None:
     assert (
         KEEP_ALIVE_TIME - 1 < handle.when() - push_lock.loop.time() <= KEEP_ALIVE_TIME
     )
-
-
-@pytest.mark.asyncio
-async def test_a_link_drop_during_a_read_leaves_the_rest_to_the_next_connection(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A read on a dropped link ends the drain; the next connection drains the rest."""
-    push_lock, mock_lock, received = _activity_push_lock(
-        [*_RECORDS[:3], DisconnectedError("gone"), *_RECORDS[3:], _GET_LOG_ERROR],
-        count=5,
-    )
-    mock_lock.connect = AsyncMock()
-    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
-        await _update_and_drain(push_lock, mock_lock)
-    assert received == [(record, True) for record in _RECORDS[:3]]
-    assert push_lock._activity_drain_pending is True
-    assert "Reading lock activity failed" not in caplog.text
-
-    push_lock._client = None
-    with patch.object(push_lock, "_get_lock_instance", return_value=mock_lock):
-        await push_lock._ensure_connected()
-    await _drained(push_lock)
-
-    assert received[3:] == [
-        (_RECORDS[3], True),
-        (_RECORDS[4], True),
-        (_GET_LOG_ERROR, False),
-    ]
 
 
 async def _lock_drops_the_link(push_lock: PushLock) -> None:
@@ -5266,10 +5184,38 @@ async def _disconnect_timer_fires(push_lock: PushLock) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("dropped", "end", "ended", "failed"),
+    [
+        (
+            ACTIVITY_DRAIN_FAILURE_THRESHOLD,
+            _GET_LOG_ERROR,
+            [(_GET_LOG_ERROR, False)],
+            [],
+        ),
+        (
+            ACTIVITY_DRAIN_FAILURE_THRESHOLD - 1,
+            TimeoutError("slow"),
+            [],
+            [
+                (
+                    logging.DEBUG,
+                    "Test Lock: Reading lock activity failed (slow), will retry.",
+                )
+            ],
+        ),
+    ],
+    ids=["drains", "times-out"],
+)
+@pytest.mark.parametrize(
     "drop", [_lock_drops_the_link, _disconnect_timer_fires], ids=["lock", "timer"]
 )
 async def test_a_dropped_link_ends_the_drain_with_no_connection_and_no_failure_counted(
-    drop: Callable[[PushLock], Awaitable[None]], caplog: pytest.LogCaptureFixture
+    drop: Callable[[PushLock], Awaitable[None]],
+    dropped: int,
+    end: bytes | Exception,
+    ended: list[tuple[bytes, bool]],
+    failed: list[tuple[int, str]],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A link dropped in a callback ends the drain; only the next connection drains."""
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:c7", always_connected=False)
@@ -5279,7 +5225,7 @@ async def test_a_dropped_link_ends_the_drain_with_no_connection_and_no_failure_c
         _drain_on_a_real_session(
             push_lock, [_count_reply(5), record] if index == 0 else [record]
         )
-        for index, record in enumerate(_RECORDS[:ACTIVITY_DRAIN_FAILURE_THRESHOLD])
+        for index, record in enumerate(_RECORDS[:dropped])
     ]
 
     async def record_and_drop(reply: bytes, backlog: bool) -> None:
@@ -5294,7 +5240,7 @@ async def test_a_dropped_link_ends_the_drain_with_no_connection_and_no_failure_c
     for read in ("battery", "door_status", "lock_status", "auto_lock_status"):
         setattr(last, read, AsyncMock())
     last.unread_event_count = AsyncMock(return_value=2)
-    last.get_log = AsyncMock(side_effect=[*_RECORDS[3:], _GET_LOG_ERROR, _RECORDS[0]])
+    last.get_log = AsyncMock(side_effect=[*_RECORDS[dropped:], end, _RECORDS[0]])
 
     with (
         caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
@@ -5322,13 +5268,14 @@ async def test_a_dropped_link_ends_the_drain_with_no_connection_and_no_failure_c
         *[[_GET_LOG]] * (len(links) - 1),
     ]
     last.unread_event_count.assert_not_awaited()
-    assert last.get_log.await_count == 3
-    assert received == [
-        *((record, True) for record in _RECORDS),
-        (_GET_LOG_ERROR, False),
-    ]
+    assert last.get_log.await_count == len(_RECORDS) - dropped + 1
+    assert received == [*((record, True) for record in _RECORDS), *ended]
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert "Reading lock activity failed" not in caplog.text
+    assert [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if "Reading lock activity" in r.getMessage()
+    ] == failed
 
 
 @pytest.mark.asyncio
@@ -5358,8 +5305,6 @@ async def test_a_failed_drain_is_retried_each_cycle_until_the_backoff(
             ],
             always_connected=True,
         )
-        push_lock._next_battery_refresh_time = clock[0] + 100_000
-        push_lock._next_auto_lock_read_time = clock[0] + 100_000
         mock_lock.lock_status = AsyncMock()
         for _ in range(ACTIVITY_DRAIN_FAILURE_THRESHOLD):
             await _update_and_drain(push_lock, mock_lock)
@@ -5409,8 +5354,6 @@ async def test_a_log_with_no_end_past_the_count_and_margin_backs_off(
         push_lock, mock_lock, received = _activity_push_lock(
             [*replies, _GET_LOG_ERROR], count=2
         )
-        push_lock._next_battery_refresh_time = clock[0] + 100_000
-        push_lock._next_auto_lock_read_time = clock[0] + 100_000
         with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
             await _update_and_drain(push_lock, mock_lock)
             await _update_and_drain(push_lock, mock_lock)
@@ -5437,35 +5380,6 @@ async def test_a_log_with_no_end_past_the_count_and_margin_backs_off(
 
 
 @pytest.mark.asyncio
-async def test_stop_cancels_a_running_drain() -> None:
-    """Stopping the lock cancels the drain task; no GetLog follows."""
-    push_lock, mock_lock, _ = _activity_push_lock([_RECORDS[0], _GET_LOG_ERROR])
-    waiting = asyncio.Event()
-    cancelled: list[bool] = []
-
-    async def hold(_reply: bytes, _backlog: bool) -> None:
-        waiting.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cancelled.append(True)
-            raise
-
-    push_lock.register_log_record_callback(hold)
-    await _run_update(push_lock, mock_lock)
-    await asyncio.wait_for(waiting.wait(), 1)
-
-    push_lock._cancel()
-    task = push_lock._activity_drain_task
-    assert task is not None
-    await asyncio.wait({task}, timeout=1)
-
-    assert cancelled == [True]
-    assert mock_lock.get_log.await_count == 1
-    assert push_lock._activity_drain_pending is True
-
-
-@pytest.mark.asyncio
 async def test_a_door_change_after_stop_starts_no_drain() -> None:
     """After stop, a door change on a link still up is displayed and starts no drain."""
     push_lock, mock_lock, _ = _activity_push_lock([_GET_LOG_ERROR])
@@ -5483,6 +5397,14 @@ def _cancelling(_push_lock: PushLock) -> LogRecordCallback:
     return AsyncMock(side_effect=asyncio.CancelledError())
 
 
+def _stopping(push_lock: PushLock) -> LogRecordCallback:
+    async def stop(_reply: bytes, _backlog: bool) -> None:
+        push_lock._cancel()
+        await asyncio.sleep(0)
+
+    return stop
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("drain", "extra", "expected"),
@@ -5493,15 +5415,20 @@ def _cancelling(_push_lock: PushLock) -> LogRecordCallback:
             _cancelling,
             [(_RECORDS[0], False)],
         ),
+        (
+            [_RECORDS[0], _RECORDS[1], _GET_LOG_ERROR],
+            _stopping,
+            [(_RECORDS[0], False)],
+        ),
     ],
-    ids=["read", "callback"],
+    ids=["read", "callback", "stop"],
 )
 async def test_activity_cancel_during_drain_keeps_the_flag(
     drain: list[Any],
     extra: Callable[[PushLock], LogRecordCallback] | None,
     expected: list[tuple[bytes, bool]],
 ) -> None:
-    """A cancellation in a read or a callback ends the drain and leaves it owed."""
+    """A cancellation in a read or a callback, or a stop, leaves the drain owed."""
     push_lock, mock_lock, received = _activity_push_lock(drain)
     if extra is not None:
         push_lock.register_log_record_callback(extra(push_lock))
@@ -5511,18 +5438,6 @@ async def test_activity_cancel_during_drain_keeps_the_flag(
     assert task.cancelled()
     assert push_lock._activity_drain_pending is True
     assert received == expected
-
-
-@pytest.mark.asyncio
-async def test_activity_no_reads_without_callbacks() -> None:
-    """With no callback nothing is read, even after a status change."""
-    push_lock, mock_lock, _ = _activity_push_lock([])
-    push_lock._activity_callbacks.clear()
-    push_lock._update_any_state([LockStatus.LOCKED])
-    await _update_and_drain(push_lock, mock_lock)
-    assert push_lock.lock_status is LockStatus.LOCKED
-    assert push_lock._activity_drain_task is None
-    mock_lock.get_log.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -5565,7 +5480,13 @@ async def test_activity_records_before_a_failure_are_delivered(
     )
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
         await _update_and_drain(push_lock, mock_lock)
-    assert "Reading lock activity failed" in caplog.text
+    lines = [r for r in caplog.records if "Reading lock activity" in r.getMessage()]
+    assert [(r.levelno, r.getMessage()) for r in lines] == [
+        (
+            logging.DEBUG,
+            f"Test Lock: Reading lock activity failed ({error}), will retry.",
+        )
+    ]
     assert received == [(_RECORDS[0], False)]
     assert push_lock._activity_drain_pending is True
     await _update_and_drain(push_lock, mock_lock)
@@ -5588,6 +5509,21 @@ async def test_a_failed_count_read_is_retried_by_the_next_drain() -> None:
     assert push_lock._activity_drain_pending is True
     await _update_and_drain(push_lock, mock_lock)
     assert received == [(_RECORDS[0], True), (_GET_LOG_ERROR, False)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("background_task_failure_expected")
+async def test_a_bug_in_a_drain_read_is_logged_and_leaves_the_drain_owed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bug in a drain read is logged at ERROR, and the drain stays owed."""
+    push_lock, mock_lock, _ = _activity_push_lock([ValueError("bad")])
+    with caplog.at_level(logging.ERROR, logger="yalexs_ble.push"):
+        await _update_and_drain(push_lock, mock_lock)
+    assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+        (logging.ERROR, "Test Lock: Background task failed: bad")
+    ]
+    assert push_lock._activity_drain_pending is True
 
 
 # ---------------------------------------------------------------------------
@@ -5637,13 +5573,7 @@ async def _capturing_push_lock(
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:e0", always_connected=False)
     await _start(push_lock)
     _ready_to_drain(push_lock)
-    mock_lock = MagicMock(is_connected=True)
-    mock_lock.get_log = AsyncMock(side_effect=replies)
-    mock_lock.unread_event_count = AsyncMock(return_value=ActivityLogDepth(0))
-    mock_lock.disconnect = AsyncMock()
-    push_lock._backlog_remaining = 0
-    push_lock._client = mock_lock
-    return push_lock, mock_lock
+    return push_lock, _mock_link(push_lock, replies)
 
 
 def _seconds_to_the_ask(push_lock: PushLock) -> float:
@@ -5683,8 +5613,7 @@ async def test_start_turns_the_capture_on_by_the_module_or_lock_loggers_own_leve
     ] == ([(f"{_CAPTURE_LOGGER}.aabbccddeee1", "Test Lock: capture on")] if on else [])
     _, written = _drain_on_a_real_session(push_lock, [_count_reply(0), _GET_LOG_ERROR])
 
-    push_lock._update_any_state([DoorStatus.OPENED])
-    await _drained(push_lock)
+    await _drain_on_a_door_change(push_lock)
 
     assert _commands(written) == ([_COUNT_READ, _GET_LOG] if on else [])
     assert [line["log_type"] for line in _record_lines(caplog)] == (
@@ -5712,21 +5641,6 @@ async def test_a_start_that_fails_at_the_device_lookup_turns_no_capture_on(
 
 
 @pytest.mark.asyncio
-async def test_a_per_lock_capture_logs_each_record_on_the_locks_logger(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A capture on by the lock's own logger logs each record line on that logger."""
-    push_lock, _ = await _capturing_push_lock(
-        caplog, [_GET_LOG_ERROR], logger=_LOCK_CAPTURE_LOGGER
-    )
-    await _drain_to_the_get_log_error(push_lock)
-
-    assert [
-        r.name for r in caplog.records if ": activity record " in r.getMessage()
-    ] == [_LOCK_CAPTURE_LOGGER]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("change", "since_change"),
     [
@@ -5750,21 +5664,15 @@ async def test_since_change_counts_monotonic_seconds_from_the_settled_lock_chang
     assert [line["since_change"] for line in _record_lines(caplog)] == since_change
 
 
-async def _drain_to_the_get_log_error(push_lock: PushLock) -> None:
-    """A door change drains the log to its GetLogError."""
-    push_lock._update_any_state([DoorStatus.OPENED])
-    await _drained(push_lock)
-
-
 async def _the_hour_passes(push_lock: PushLock) -> None:
     """The capture's hour passes, and the capture asks for a drain."""
-    push_lock._ask_for_activity_drain()
+    push_lock._ask_for_activity_drain(logging.getLogger(_LOCK_CAPTURE_LOGGER))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "restart",
-    [_drain_to_the_get_log_error, _the_hour_passes],
+    [_drain_on_a_door_change, _the_hour_passes],
     ids=["GetLogError", "ask"],
 )
 async def test_the_hour_starts_at_registration_and_restarts_at_get_log_error_and_ask(
@@ -5785,6 +5693,26 @@ async def test_the_hour_starts_at_registration_and_restarts_at_get_log_error_and
 
 
 @pytest.mark.asyncio
+async def test_a_restarted_hour_leaves_no_earlier_ask_due(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An ask cancels the ask scheduled at registration, so one ask line is logged."""
+    with patch("yalexs_ble.push.ACTIVITY_CAPTURE_DRAIN_DELAY", 0):
+        push_lock, _ = await _capturing_push_lock(caplog, [_GET_LOG_ERROR])
+
+    await _the_hour_passes(push_lock)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert [
+        line for line in _capture_lines(caplog) if line.endswith("asking for a drain")
+    ] == [
+        "Test Lock: no GetLogError with the dirty bit clear for 3600 s, "
+        "asking for a drain"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_the_hour_asks_for_a_drain_and_an_update_with_the_link_down(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -5796,7 +5724,7 @@ async def test_the_hour_asks_for_a_drain_and_an_update_with_the_link_down(
     mock_lock.is_connected = False
 
     with patch.object(push_lock, "_schedule_future_update_with_debounce") as debounced:
-        push_lock._ask_for_activity_drain()
+        push_lock._ask_for_activity_drain(logging.getLogger(_LOCK_CAPTURE_LOGGER))
     await _drained(push_lock)
 
     assert _capture_lines(caplog)[-1] == (
@@ -5834,7 +5762,7 @@ async def test_an_asked_drain_short_of_the_logs_end_is_asked_for_again_an_hour_l
 ) -> None:
     """A drain that stops before the log's end leaves the ask's hour running."""
     push_lock, mock_lock = await _capturing_push_lock(caplog, replies)
-    push_lock._ask_for_activity_drain()
+    push_lock._ask_for_activity_drain(logging.getLogger(_LOCK_CAPTURE_LOGGER))
 
     with patch("yalexs_ble.push.ACTIVITY_CAPTURE_DRAIN_DELAY", _RESTARTED_DELAY):
         await _drained(push_lock)
@@ -5858,8 +5786,7 @@ async def test_cancel_removes_the_capture_and_hour_and_a_second_start_registers_
 
     await _start(push_lock)
     push_lock._client = mock_lock
-    push_lock._update_any_state([DoorStatus.OPENED])
-    await _drained(push_lock)
+    await _drain_on_a_door_change(push_lock)
 
     assert [line["log_type"] for line in _record_lines(caplog)] == ["0x80"]
     assert _capture_lines(caplog).count("Test Lock: capture on") == 2

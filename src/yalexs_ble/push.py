@@ -511,7 +511,7 @@ class PushLock:
         # the unread count.
         self._backlog_remaining: int | None = None
         self._activity_drain_pending = False
-        self._activity_drain_window_end = NEVER_TIME
+        self._last_settled_lock_change_time = NEVER_TIME
         self._activity_drain_failures = 0
         self._earliest_activity_drain_time = NEVER_TIME
         self._activity_drain_task: asyncio.Task[None] | None = None
@@ -519,8 +519,6 @@ class PushLock:
         # The capture's remover, None while the capture is not registered.
         self._remove_activity_capture: Callable[[], None] | None = None
         self._activity_capture_timer: asyncio.TimerHandle | None = None
-        # The capture's logger, set by the start() that registers the capture.
-        self._activity_capture_logger: logging.Logger | None = None
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
@@ -1448,9 +1446,7 @@ class PushLock:
         if lock_state.lock != display.lock:
             changes["lock"] = display.lock
             if display.settled:
-                self._activity_drain_window_end = (
-                    time.monotonic() + ACTIVITY_DRAIN_WINDOW
-                )
+                self._last_settled_lock_change_time = time.monotonic()
                 self._owe_activity_drain()
         if lock_state.secure != display.secure:
             changes["secure"] = display.secure
@@ -1837,12 +1833,12 @@ class PushLock:
         )
 
     def _activity_drain_window_open(self, started: float) -> bool:
-        """True for a read started before the window's end.
+        """True for a read started before the drain window's end.
 
         The window ends ACTIVITY_DRAIN_WINDOW after the last settled change of the
         displayed lock status.
         """
-        return started < self._activity_drain_window_end
+        return started < self._last_settled_lock_change_time + ACTIVITY_DRAIN_WINDOW
 
     def _owe_activity_drain(self) -> None:
         """Mark the activity log for a drain and start the drain task if one is due."""
@@ -1862,9 +1858,7 @@ class PushLock:
             or (task is not None and not task.done())
         ):
             return
-        task = asyncio.create_task(self._drain_activity_while_due())
-        task.add_done_callback(self._on_background_task_done)
-        self._activity_drain_task = task
+        self._activity_drain_task = self._logged_task(self._drain_activity_while_due())
 
     async def _drain_activity_while_due(self) -> None:
         """Run drains while one is due; a failed drain ends the task."""
@@ -1911,62 +1905,46 @@ class PushLock:
                 return await lock.unread_event_count()
             return await lock.get_log()
 
+        ended = False
         try:
             read = await self._read_for_activity_drain(clear_pending_and_read)
             if read is None:
+                ended = True
                 return True
             first, started = read
             if isinstance(first, int):
                 _LOGGER.info("%s: Activity log unread count: %d", self.name, first)
                 self._backlog_remaining = first
                 ended = await self._deliver_activity_log(
-                    None, first + ACTIVITY_DRAIN_MARGIN
+                    await self._read_for_activity_drain(lambda lock: lock.get_log()),
+                    first + ACTIVITY_DRAIN_MARGIN,
                 )
             else:
                 ended = await self._deliver_activity_log(
                     (first, started), ACTIVITY_DRAIN_MARGIN
                 )
-            if not ended:
-                self._activity_drain_pending = True
-                return False
         except DisconnectedError as err:
             # The drain makes no connection, and a dropped link says nothing about
             # the drain, so it counts as no failure; the next connection starts one.
-            self._activity_drain_pending = True
             _LOGGER.debug("%s: Activity log drain ended: %s", self.name, err)
-            return False
         except (TimeoutError, *RETRYABLE_EXCEPTIONS) as err:
-            self._activity_drain_pending = True
             self._note_activity_drain_failure(err)
-            return False
-        except BaseException:
-            self._activity_drain_pending = True
-            raise
-        self._activity_drain_failures = 0
-        return True
+        finally:
+            if not ended:
+                self._activity_drain_pending = True
+        if ended:
+            self._activity_drain_failures = 0
+        return ended
 
     async def _deliver_activity_log(
-        self, first: tuple[bytes, float] | None, budget: int
+        self, read: tuple[bytes, float] | None, budget: int
     ) -> bool:
-        """Deliver first, if any, then read and deliver records until the drain ends.
+        """Deliver read and each record after it until the log's end after the window.
 
-        first is a reply and the time its GetLog started. A GetLogError with the
-        dirty bit clear ends the drain when its GetLog started after the window's
-        end, and otherwise resets budget to ACTIVITY_DRAIN_MARGIN; one with the bit
-        set is delivered and the drain reads on. Returns False, after a warning and
-        a backoff, when budget replies in a row hold no GetLogError with the bit
-        clear.
+        Returns False, after a warning and a backoff, at budget replies with no end.
         """
         replies = 0
-        read = first
-        while True:
-            if read is None:
-                # The next drain reads a new backlog's unread count before any GetLog.
-                if self._backlog_remaining is None:
-                    return True
-                read = await self._read_for_activity_drain(lambda lock: lock.get_log())
-                if read is None:
-                    return True
+        while read is not None:
             reply, started = read
             replies += 1
             end = _log_is_empty(reply)
@@ -2013,7 +1991,11 @@ class PushLock:
                     ACTIVITY_DRAIN_FAILURE_BACKOFF,
                 )
                 return False
-            read = None
+            # The next drain reads a new backlog's unread count before any GetLog.
+            if self._backlog_remaining is None:
+                return True
+            read = await self._read_for_activity_drain(lambda lock: lock.get_log())
+        return True
 
     def _note_activity_drain_failure(self, err: Exception) -> None:
         """Count a failed drain; after enough in a row, leave the log alone a while."""
@@ -2042,15 +2024,15 @@ class PushLock:
             time.monotonic() + ACTIVITY_DRAIN_FAILURE_BACKOFF
         )
 
-    async def _activity_capture(self, reply: bytes, backlog: bool) -> None:
+    async def _activity_capture(
+        self, logger: logging.Logger, reply: bytes, backlog: bool
+    ) -> None:
         """Log the capture line for reply; the log's end reschedules the next ask."""
         since_change = None
-        if self._activity_drain_window_end != NEVER_TIME:
-            changed = self._activity_drain_window_end - ACTIVITY_DRAIN_WINDOW
-            since_change = time.monotonic() - changed
-        assert self._activity_capture_logger is not None  # nosec
+        if self._last_settled_lock_change_time != NEVER_TIME:
+            since_change = time.monotonic() - self._last_settled_lock_change_time
         activity_capture.log_record(
-            self._activity_capture_logger,
+            logger,
             self.name,
             reply,
             backlog,
@@ -2060,23 +2042,25 @@ class PushLock:
         )
         # A GetLogError with the dirty bit set is not the log's end.
         if _log_is_empty(reply):
-            self._restart_activity_capture_timer()
+            self._restart_activity_capture_timer(logger)
 
-    def _restart_activity_capture_timer(self) -> None:
+    def _restart_activity_capture_timer(self, logger: logging.Logger) -> None:
         """Schedule the capture's next ask ACTIVITY_CAPTURE_DRAIN_DELAY from now."""
-        if self._activity_capture_timer is not None:
-            self._activity_capture_timer.cancel()
+        self._cancel_activity_capture_timer()
         self._activity_capture_timer = self.loop.call_later(
-            ACTIVITY_CAPTURE_DRAIN_DELAY, self._ask_for_activity_drain
+            ACTIVITY_CAPTURE_DRAIN_DELAY, self._ask_for_activity_drain, logger
         )
 
-    def _ask_for_activity_drain(self) -> None:
+    def _cancel_activity_capture_timer(self) -> None:
+        """Cancel the timer for the capture's next ask."""
+        if self._activity_capture_timer:
+            self._activity_capture_timer.cancel()
+            self._activity_capture_timer = None
+
+    def _ask_for_activity_drain(self, logger: logging.Logger) -> None:
         """Owe a drain for the capture, and request an update when the link is down."""
-        assert self._activity_capture_logger is not None  # nosec
-        activity_capture.log_drain_ask(
-            self._activity_capture_logger, self.name, ACTIVITY_CAPTURE_DRAIN_DELAY
-        )
-        self._restart_activity_capture_timer()
+        activity_capture.log_drain_ask(logger, self.name, ACTIVITY_CAPTURE_DRAIN_DELAY)
+        self._restart_activity_capture_timer(logger)
         self._owe_activity_drain()
         if not self.is_connected:
             # The drain never connects; the update's connection starts it.
@@ -2267,11 +2251,10 @@ class PushLock:
             self._schedule_future_update_with_debounce(ADV_UPDATE_COALESCE_SECONDS)
         # The level is read here once, so a change takes effect at the next start().
         if (logger := activity_capture.capture_logger(self.address)) is not None:
-            self._activity_capture_logger = logger
             self._remove_activity_capture = self.register_log_record_callback(
-                self._activity_capture
+                functools.partial(self._activity_capture, logger)
             )
-            self._restart_activity_capture_timer()
+            self._restart_activity_capture_timer(logger)
             activity_capture.log_capture_on(logger, self.name)
 
         return self._cancel
@@ -2282,9 +2265,7 @@ class PushLock:
         if self._remove_activity_capture is not None:
             self._remove_activity_capture()
             self._remove_activity_capture = None
-        if self._activity_capture_timer is not None:
-            self._activity_capture_timer.cancel()
-            self._activity_capture_timer = None
+        self._cancel_activity_capture_timer()
         if self._activity_drain_task is not None:
             self._activity_drain_task.cancel()
         if not self._operation_in_flight:
@@ -2295,9 +2276,13 @@ class PushLock:
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:
         """Execute a background task."""
-        task: asyncio.Task[Any] = asyncio.create_task(fut)
-        self._background_tasks.add(task)
+        self._background_tasks.add(self._logged_task(fut))
+
+    def _logged_task(self, coro: Coroutine[Any, Any, _T]) -> asyncio.Task[_T]:
+        """Run coro as a task whose unexpected exception is logged."""
+        task = asyncio.create_task(coro)
         task.add_done_callback(self._on_background_task_done)
+        return task
 
     def _on_background_task_done(self, task: asyncio.Task[Any]) -> None:
         """Remove finished task and log unexpected exceptions."""

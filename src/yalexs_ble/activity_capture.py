@@ -68,10 +68,10 @@ def log_record(
     lock status, or None when there has been none.
     """
     captured = time.time()
-    yale = _decode(reply, LogBrand.YALE)
+    yale = parse_log_event_packet(reply, LogBrand.YALE)
     time_stamp: int | None = getattr(yale, "time_stamp", None)
-    yale_field = _decoded_field("yale", yale)
-    august_field = _decoded_field("august", _decode(reply, LogBrand.AUGUST))
+    yale_text = _decoded_field(yale)
+    august_text = _decoded_field(parse_log_event_packet(reply, LogBrand.AUGUST))
     fields = [
         ("captured", _time(captured)),
         ("log_type", f"0x{reply[0x04]:02X}"),
@@ -82,10 +82,10 @@ def log_record(
         ("door", door.name),
         ("backlog", str(backlog)),
         ("raw", _loggable_hex(reply)),
-        yale_field,
+        ("yale", yale_text),
     ]
-    if august_field[1] != yale_field[1]:
-        fields.append(august_field)
+    if august_text != yale_text:
+        fields.append(("august", august_text))
     logger.debug(
         "%s: activity record %s",
         name,
@@ -93,19 +93,14 @@ def log_record(
     )
 
 
-def _decode(reply: bytes, brand: LogBrand) -> LogRecord:
-    """Decode reply in brand's numbering."""
-    return parse_log_event_packet(reply, brand)
-
-
-def _decoded_field(key: str, decoded: LogRecord) -> tuple[str, str]:
-    """Return key and the record formatted as one token."""
+def _decoded_field(decoded: LogRecord) -> str:
+    """Return the record formatted as one token."""
     values = ",".join(
         f"{field.name}={_value(field.name, getattr(decoded, field.name))}"
         for field in dataclasses.fields(decoded)
         if field.name not in _FRAME_FIELDS
     )
-    return key, f"{type(decoded).__name__}({values})"
+    return f"{type(decoded).__name__}({values})"
 
 
 def _value(name: str, value: object) -> str:
@@ -119,15 +114,12 @@ def _value(name: str, value: object) -> str:
     if isinstance(value, str):
         if const.MASK_SENSITIVE and name in _CODE_FIELDS:
             return "****"
-        return _text(value)
+        # Percent-encoding leaves no space, comma, equals sign, or parenthesis
+        # in the value.
+        return quote(value, safe="")
     if isinstance(value, tuple):
         return ":".join(_value(name, item) for item in value)
     return str(value)
-
-
-def _text(value: str) -> str:
-    """Percent-encode value, so no space, comma, equals sign, or parenthesis is left."""
-    return quote(value, safe="")
 
 
 def _time(seconds: float) -> str:
