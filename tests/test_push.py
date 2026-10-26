@@ -3992,6 +3992,9 @@ _RECORDS = [_log_record(0x00, index) for index in range(1, 6)]
 _LOCK_OPERATION_RECORD = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
 _CODE_OPERATION_RECORD = bytes.fromhex("bb2d0072079aa176a333004bea14cd000200")
 _GET_LOG_ERROR = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
+# A GetLogError captured from a Yale lock with the dirty bit, byte[5] bit 3, set:
+# it answered a GetLog that raced the lock's write of a door record.
+_DIRTY_GET_LOG_ERROR = bytes.fromhex("bb2d00f0800a0000c542dd6ac542dd6a0200")
 
 
 def _count_reply(count: int) -> bytes:
@@ -4149,6 +4152,34 @@ async def test_the_records_within_the_unread_count_are_delivered_as_backlog() ->
         (_GET_LOG_ERROR, False),
     ]
     assert _commands(written) == [_COUNT_READ, *[_GET_LOG] * 6]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("count", "backlog"), [(0, False), (1, True)], ids=["no backlog", "backlog of one"]
+)
+async def test_a_get_log_error_with_the_dirty_bit_is_delivered_and_the_drain_reads_on(
+    count: int, backlog: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dirty GetLogError is delivered with backlog false and uses no backlog count."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:cc", always_connected=False)
+    received: list[tuple[bytes, bool]] = []
+    _, written = _drain_on_a_real_session(
+        push_lock,
+        [_count_reply(count), _DIRTY_GET_LOG_ERROR, _RECORDS[0], _GET_LOG_ERROR],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
+        push_lock.register_log_record_callback(_recorder(received))
+        await _drained(push_lock)
+
+    assert received == [
+        (_DIRTY_GET_LOG_ERROR, False),
+        (_RECORDS[0], backlog),
+        (_GET_LOG_ERROR, False),
+    ]
+    assert _commands(written) == [_COUNT_READ, *[_GET_LOG] * 3]
+    assert not caplog.records
 
 
 @pytest.mark.asyncio
@@ -5358,16 +5389,23 @@ async def test_a_failed_drain_is_retried_each_cycle_until_the_backoff(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("records", "warned"),
-    [(ACTIVITY_DRAIN_MARGIN + 1, False), (ACTIVITY_DRAIN_MARGIN + 2, True)],
-    ids=["ends-at-the-margin", "no-end-within-the-margin"],
+    ("records", "dirty", "warned"),
+    [
+        (ACTIVITY_DRAIN_MARGIN + 1, False, False),
+        (ACTIVITY_DRAIN_MARGIN + 2, False, True),
+        (ACTIVITY_DRAIN_MARGIN + 2, True, True),
+    ],
+    ids=["ends-at-the-margin", "no-end-within-the-margin", "dirty-bit-never-clears"],
 )
 async def test_a_log_with_no_end_past_the_count_and_margin_backs_off(
-    records: int, warned: bool, caplog: pytest.LogCaptureFixture
+    records: int, dirty: bool, warned: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """With no GetLogError past the count and margin, the drain warns and backs off."""
+    """With no log end past the count and margin, the drain warns and backs off."""
     with _patched_clock() as clock:
-        replies = [_log_record(0x00, index % 256) for index in range(records)]
+        replies = [
+            _DIRTY_GET_LOG_ERROR if dirty else _log_record(0x00, index % 256)
+            for index in range(records)
+        ]
         push_lock, mock_lock, received = _activity_push_lock(
             [*replies, _GET_LOG_ERROR], count=2
         )
@@ -5762,7 +5800,8 @@ async def test_the_hour_asks_for_a_drain_and_an_update_with_the_link_down(
     await _drained(push_lock)
 
     assert _capture_lines(caplog)[-1] == (
-        "Test Lock: no GetLogError for 3600 s, asking for a drain"
+        "Test Lock: no GetLogError with the dirty bit clear for 3600 s, "
+        "asking for a drain"
     )
     debounced.assert_called_once_with(MANUAL_UPDATE_COALESCE_SECONDS)
     mock_lock.get_log.assert_awaited_once()
@@ -5779,15 +5818,21 @@ async def test_the_hour_asks_for_a_drain_and_an_update_with_the_link_down(
         ([DisconnectedError("gone")], []),
         ([TimeoutError("slow")], []),
         ([_LOCK_OPERATION_RECORD, DisconnectedError("gone")], ["0x00"]),
+        ([_DIRTY_GET_LOG_ERROR, DisconnectedError("gone")], ["0x80"]),
     ],
-    ids=["dropped link", "timeout", "record then dropped link"],
+    ids=[
+        "dropped link",
+        "timeout",
+        "record then dropped link",
+        "dirty GetLogError then dropped link",
+    ],
 )
-async def test_an_asked_drain_with_no_get_log_error_is_asked_for_again_an_hour_later(
+async def test_an_asked_drain_short_of_the_logs_end_is_asked_for_again_an_hour_later(
     replies: list[bytes | Exception],
     records: list[str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A drain that ends before a GetLogError leaves the ask's hour running."""
+    """A drain that stops before the log's end leaves the ask's hour running."""
     push_lock, mock_lock = await _capturing_push_lock(caplog, replies)
     push_lock._ask_for_activity_drain()
 

@@ -46,7 +46,11 @@ def log_capture_on(logger: logging.Logger, name: str) -> None:
 
 def log_drain_ask(logger: logging.Logger, name: str, delay: float) -> None:
     """Log the capture's ask for a drain after delay seconds."""
-    logger.debug("%s: no GetLogError for %d s, asking for a drain", name, delay)
+    logger.debug(
+        "%s: no GetLogError with the dirty bit clear for %d s, asking for a drain",
+        name,
+        delay,
+    )
 
 
 def log_record(

@@ -25,6 +25,7 @@ from . import activity_capture
 from .activity_log import LogRecord, parse_log_event_packet
 from .const import (
     APPLE_MFR_ID,
+    GET_LOG_ERROR_DIRTY_BIT,
     HAP_ENCRYPTED_FIRST_BYTE,
     HAP_FIRST_BYTE,
     LOG_TYPE_GET_LOG_ERROR,
@@ -201,16 +202,16 @@ AUTO_LOCK_READ_FAILURE_THRESHOLD = 3
 # update cycle, connection, and status change.
 ACTIVITY_DRAIN_FAILURE_THRESHOLD = 3
 ACTIVITY_DRAIN_FAILURE_BACKOFF = 3600
-# GetLog commands a drain sends with no GetLogError, from its start or its last
-# GetLogError, before it treats the log as one that never ends; from the start
-# of the backlog drain the limit is its unread count plus the margin. The margin
-# covers records written during the drain.
+# GetLog commands a drain sends with no GetLogError whose dirty bit is clear,
+# from its start or its last such GetLogError, before it treats the log as one
+# that never ends; from the start of the backlog drain the limit is its unread
+# count plus the margin. The margin covers records written during the drain.
 ACTIVITY_DRAIN_MARGIN = 128
 # Seconds a drain reads on after a settled change of the displayed lock status,
 # so a record the lock writes within them is read by that drain.
 ACTIVITY_DRAIN_WINDOW = 2.0
-# Seconds from the capture's registration, its last GetLogError, or its last
-# ask, whichever is latest, to its next ask for a drain.
+# Seconds from the capture's registration, its last GetLogError whose dirty bit
+# is clear, or its last ask, whichever is latest, to its next ask for a drain.
 ACTIVITY_CAPTURE_DRAIN_DELAY = 3600.0
 
 # Receives each decoded activity log record and its backlog flag.
@@ -249,6 +250,14 @@ def _select_yale_payload(
     # The scanner merges manufacturer data per company ID, so the payload under
     # one ID may be a cached frame while the current value arrives under the other.
     return min(present, key=lambda item: (len(item[1]) != 1, not item[1]))
+
+
+def _log_is_empty(reply: bytes) -> bool:
+    """Return whether reply is a GetLogError with the dirty bit clear."""
+    return (
+        reply[0x04] == LOG_TYPE_GET_LOG_ERROR
+        and not reply[0x05] & GET_LOG_ERROR_DIRTY_BIT
+    )
 
 
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
@@ -1941,10 +1950,12 @@ class PushLock:
     ) -> bool:
         """Deliver first, if any, then read and deliver records until the drain ends.
 
-        first is a reply and the time its GetLog started. A GetLogError ends the
-        drain when its GetLog started after the window's end, and otherwise resets
-        budget to ACTIVITY_DRAIN_MARGIN. Returns False, after a warning and a
-        backoff, when budget replies in a row hold no GetLogError.
+        first is a reply and the time its GetLog started. A GetLogError with the
+        dirty bit clear ends the drain when its GetLog started after the window's
+        end, and otherwise resets budget to ACTIVITY_DRAIN_MARGIN; one with the bit
+        set is delivered and the drain reads on. Returns False, after a warning and
+        a backoff, when budget replies in a row hold no GetLogError with the bit
+        clear.
         """
         replies = 0
         read = first
@@ -1958,11 +1969,17 @@ class PushLock:
                     return True
             reply, started = read
             replies += 1
-            end = reply[0x04] == LOG_TYPE_GET_LOG_ERROR
+            end = _log_is_empty(reply)
             if end:
                 # The log is empty, so no later record is backlog.
                 backlog = False
                 self._backlog_remaining = 0
+            elif reply[0x04] == LOG_TYPE_GET_LOG_ERROR:
+                # A GetLog that races the lock's write of a record is answered with
+                # a GetLogError whose dirty bit is set, and the record follows on
+                # the next read, so the drain reads on; budget bounds a lock that
+                # never clears the bit.
+                backlog = False
             else:
                 # None: a backlog armed during this read.
                 backlog = self._backlog_remaining != 0
@@ -2026,7 +2043,7 @@ class PushLock:
         )
 
     async def _activity_capture(self, reply: bytes, backlog: bool) -> None:
-        """Log the capture line for reply; a GetLogError reschedules the next ask."""
+        """Log the capture line for reply; the log's end reschedules the next ask."""
         since_change = None
         if self._activity_drain_window_end != NEVER_TIME:
             changed = self._activity_drain_window_end - ACTIVITY_DRAIN_WINDOW
@@ -2041,7 +2058,8 @@ class PushLock:
             self.lock_status,
             self.door_status,
         )
-        if reply[0x04] == LOG_TYPE_GET_LOG_ERROR:
+        # A GetLogError with the dirty bit set is not the log's end.
+        if _log_is_empty(reply):
             self._restart_activity_capture_timer()
 
     def _restart_activity_capture_timer(self) -> None:

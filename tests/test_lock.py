@@ -1486,6 +1486,16 @@ def test_log_type_get_log_error_is_the_log_type_of_the_get_log_error() -> None:
     assert "LOG_TYPE_GET_LOG_ERROR" in yalexs_ble.__all__
 
 
+def test_the_dirty_bit_is_set_in_a_racing_reply_and_clear_at_the_logs_end() -> None:
+    """The package exports GET_LOG_ERROR_DIRTY_BIT, bit 3 of a GetLogError's byte[5]."""
+    # A GetLogError captured from a Yale lock, answering a GetLog that raced the
+    # lock's write of a door record.
+    racing = bytes.fromhex("bb2d00f0800a0000c542dd6ac542dd6a0200")
+    assert racing[0x05] & yalexs_ble.GET_LOG_ERROR_DIRTY_BIT
+    assert not END_OF_LOG[0x05] & yalexs_ble.GET_LOG_ERROR_DIRTY_BIT
+    assert "GET_LOG_ERROR_DIRTY_BIT" in yalexs_ble.__all__
+
+
 @pytest.mark.asyncio
 async def test_get_log_sends_getlog_and_returns_the_matched_reply() -> None:
     """One GETLOG is sent and the reply its matcher takes is returned unchanged."""

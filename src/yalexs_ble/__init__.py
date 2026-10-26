@@ -38,6 +38,7 @@ from .activity_log import (
     parse_log_event_packet,
 )
 from .const import (
+    GET_LOG_ERROR_DIRTY_BIT,
     LOG_TYPE_GET_LOG_ERROR,
     MANUAL_INTERVENTION_STATUSES,
     AugustLockOperationSource,
@@ -88,6 +89,7 @@ from .util import (
 __version__ = "9.1.0"
 
 __all__ = [
+    "GET_LOG_ERROR_DIRTY_BIT",
     "LOG_TYPE_GET_LOG_ERROR",
     "MANUAL_INTERVENTION_STATUSES",
     "AllCodesDeleted",
