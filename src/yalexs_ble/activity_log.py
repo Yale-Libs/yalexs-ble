@@ -50,8 +50,7 @@ def _u32(raw: bytes, offset: int) -> int:
     return _bytes_to_int(raw[offset : offset + 4])
 
 
-# A state with no member reads UNKNOWN, as the status parsers in lock.py do; raw
-# keeps the byte.
+# raw keeps a state byte that has no member.
 def _lock_state(value: int) -> LockStatus:
     return VALUE_TO_LOCK_STATUS.get(value, LockStatus.UNKNOWN)
 
