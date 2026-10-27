@@ -95,6 +95,15 @@ KEYPAD_UNLOCK_SLOT_UNKNOWN = bytes.fromhex("bb2d00d007299c76a3330049e414eeff0200
 KEYPAD_LOCK_BUTTON = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
 END_OF_LOG = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
 
+# The captured frames both brand comparisons decode.
+CAPTURED = [
+    KEYPAD_UNLOCK_SLOT_205,
+    KEYPAD_UNLOCK_SLOT_200,
+    KEYPAD_UNLOCK_SLOT_UNKNOWN,
+    KEYPAD_LOCK_BUTTON,
+    END_OF_LOG,
+]
+
 # Captured GetLog replies from a Yale Unity L9000ER on 2026-10-25.
 AUTO_RELOCK_LOCKED = bytes.fromhex("bb2d000e000505007baddd6a2017193f0200")
 DOOR_STATE_CHANGED_SLOT_0 = bytes.fromhex("bb2d00080000030093aedd6a1f1719340200")
@@ -136,20 +145,9 @@ def _built(log_type: int, fields: dict[int, str] | None = None) -> bytes:
 
 
 def _case(
-    record: Callable[..., LogRecord],
-    log_type: int,
-    fields: dict[int, str],
-    **values: object,
-) -> tuple[bytes, LogRecord]:
-    """A built frame and the record its bytes decode to."""
-    frame = _built(log_type, fields)
-    return frame, record(raw=frame, log_type=log_type, **values)
-
-
-def _captured_case(
     record: Callable[..., LogRecord], frame: bytes, **values: object
 ) -> tuple[bytes, LogRecord]:
-    """A captured frame and the record its bytes decode to."""
+    """A captured or built frame and the record its bytes decode to."""
     return frame, record(raw=frame, log_type=frame[4], **values)
 
 
@@ -458,10 +456,22 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
         parse_log_event_packet(frame)
 
 
+def test_a_bytearray_frame_decodes_to_a_record_holding_bytes() -> None:
+    """Captured frame in a bytearray: the record keeps a bytes copy of it."""
+    frame = bytearray(KEYPAD_LOCK_BUTTON)
+    # A bytearray is outside the bytes signature, and the copy keeps a later
+    # change to it out of the record.
+    record = parse_log_event_packet(frame)  # type: ignore[arg-type]
+    assert type(record.raw) is bytes
+    assert record.raw == KEYPAD_LOCK_BUTTON
+    frame[0x08] ^= 0xFF
+    _assert_record(record, parse_log_event_packet(KEYPAD_LOCK_BUTTON))
+
+
 @pytest.mark.parametrize(
     "case",
     [
-        _captured_case(
+        _case(
             LockOperation,
             AUTO_RELOCK_LOCKED,
             op_code=OpCode.AUTO_RELOCK,
@@ -473,7 +483,7 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
             error=63,
             battery_level_percent=63,
         ),
-        _captured_case(
+        _case(
             LockOperation,
             INSIDE_BUTTON_LOCKED,
             op_code=OpCode.INSIDE_BUTTON,
@@ -485,7 +495,7 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
             error=15,
             battery_level_percent=15,
         ),
-        _captured_case(
+        _case(
             LockOperation,
             DOOR_STATE_CHANGED_SLOT_0,
             op_code=OpCode.DOOR_STATE_CHANGED,
@@ -497,7 +507,7 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
             error=52,
             battery_level_percent=52,
         ),
-        _captured_case(
+        _case(
             LockOperation,
             DOOR_STATE_CHANGED_SLOT_255,
             op_code=OpCode.DOOR_STATE_CHANGED,
@@ -511,21 +521,22 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
         ),
         _case(
             KeypadWrongCode,
-            0x02,
-            {5: TIME, 9: "987654321fffff"},
+            _built(0x02, {5: TIME, 9: "987654321fffff"}),
             time_stamp=TIME_STAMP,
             keycode="987654321FFFFFFF",
         ),
-        _captured_case(
+        _case(
             KeypadInfo,
             KEYPAD_INFO,
             time_stamp=0x6AE02F92,
             battery_level=195,
             stats=0x80000000,
         ),
-        _case(CodeDeleted, 0x05, {5: TIME, 9: "07"}, time_stamp=TIME_STAMP, slot=7),
-        _case(AllCodesDeleted, 0x06, {5: TIME}, time_stamp=TIME_STAMP),
-        _captured_case(
+        _case(
+            CodeDeleted, _built(0x05, {5: TIME, 9: "07"}), time_stamp=TIME_STAMP, slot=7
+        ),
+        _case(AllCodesDeleted, _built(0x06, {5: TIME}), time_stamp=TIME_STAMP),
+        _case(
             CodeOperation,
             CODE_OPERATION_SLOT_1,
             time_stamp=0x6AE02FFC,
@@ -538,16 +549,18 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
         ),
         _case(
             KeypadClose,
-            0x08,
-            {5: TIME, 9: "1234ffffffffff"},
+            _built(0x08, {5: TIME, 9: "1234ffffffffff"}),
             time_stamp=TIME_STAMP,
             keycode="1234FFFFFFFFFFFF",
         ),
-        _case(FactoryReset, 0x09, {5: TIME, 9: "01"}, time_stamp=TIME_STAMP),
+        _case(FactoryReset, _built(0x09, {5: TIME, 9: "01"}), time_stamp=TIME_STAMP),
         _case(
-            CodeDeletedv2, 0x0B, {5: TIME, 9: "eeff"}, time_stamp=TIME_STAMP, slot=65518
+            CodeDeletedv2,
+            _built(0x0B, {5: TIME, 9: "eeff"}),
+            time_stamp=TIME_STAMP,
+            slot=65518,
         ),
-        _captured_case(
+        _case(
             CredentialOperation,
             CREDENTIAL_OPERATION_RF_SLOT_7,
             time_stamp=0x6ADDAD51,
@@ -561,18 +574,19 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
         ),
         _case(
             Tamper,
-            0x0F,
-            {5: TIME, 9: "0e00"},
+            _built(0x0F, {5: TIME, 9: "0e00"}),
             time_stamp=TIME_STAMP,
             tamper_type=TamperType.TOO_MANY_AUTH_ERRORS_FACE_SCAN_CLEARED,
         ),
         _case(
-            Tamper, 0x0F, {5: TIME, 9: "0f01"}, time_stamp=TIME_STAMP, tamper_type=0x10F
+            Tamper,
+            _built(0x0F, {5: TIME, 9: "0f01"}),
+            time_stamp=TIME_STAMP,
+            tamper_type=0x10F,
         ),
         _case(
             BCMTest,
-            0x10,
-            {5: TIME, 9: "03", 10: "3412", 12: "04030201"},
+            _built(0x10, {5: TIME, 9: "03", 10: "3412", 12: "04030201"}),
             time_stamp=TIME_STAMP,
             error=3,
             seconds=0x1234,
@@ -580,8 +594,7 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
         ),
         _case(
             HomekeyOperation,
-            0x12,
-            {5: TIME, 9: "15", 10: "02", 11: "3c", 12: "04030201"},
+            _built(0x12, {5: TIME, 9: "15", 10: "02", 11: "3c", 12: "04030201"}),
             time_stamp=TIME_STAMP,
             current_lock_state=LockStatus.LOCKED,
             battery_level_decivolt=60,
@@ -590,33 +603,30 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
         ),
         _case(
             DPSInfo,
-            0x13,
-            {5: TIME, 9: "4b"},
+            _built(0x13, {5: TIME, 9: "4b"}),
             time_stamp=TIME_STAMP,
             battery_level_percent=75,
         ),
         _case(
             LocalEventNotification,
-            0x16,
-            {5: TIME, 9: "02"},
+            _built(0x16, {5: TIME, 9: "02"}),
             time_stamp=TIME_STAMP,
             notification=2,
         ),
         _case(
             MatterMessage,
-            0x18,
-            {5: TIME, 9: "3412", 11: "0102030405"},
+            _built(0x18, {5: TIME, 9: "3412", 11: "0102030405"}),
             time_stamp=TIME_STAMP,
             msg_type=0x1234,
             data=(1, 2, 3, 4, 5),
         ),
-        _captured_case(
+        _case(
             DoorStateChanged,
             DOOR_CLOSED,
             time_stamp=0x6ADDAD5D,
             current_door_state=DoorStatus.CLOSED,
         ),
-        _captured_case(
+        _case(
             DoorStateChanged,
             DOOR_OPENED,
             time_stamp=0x6ADDAD54,
@@ -624,22 +634,19 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
         ),
         _case(
             DoorStateChanged,
-            0x20,
-            {5: TIME, 9: "02"},
+            _built(0x20, {5: TIME, 9: "02"}),
             time_stamp=TIME_STAMP,
             current_door_state=DoorStatus.AJAR,
         ),
         _case(
             DoorStateChanged,
-            0x20,
-            {5: TIME, 9: "07"},
+            _built(0x20, {5: TIME, 9: "07"}),
             time_stamp=TIME_STAMP,
             current_door_state=DoorStatus.UNKNOWN,
         ),
         _case(
             DialogReboot,
-            0x40,
-            {5: TIME, 9: "15", 10: "23", 11: "07", 12: "04030201"},
+            _built(0x40, {5: TIME, 9: "15", 10: "23", 11: "07", 12: "04030201"}),
             time_stamp=TIME_STAMP,
             lock_state=LockStatus.LOCKED,
             door_state=DoorStatus.CLOSED,
@@ -659,14 +666,7 @@ def test_each_other_record_reads_its_layout(case: tuple[bytes, LogRecord]) -> No
 
 def test_with_no_brand_a_record_reads_in_yales_numbering() -> None:
     """Captured and built frames decode alike with no brand and with LogBrand.YALE."""
-    frames = [
-        KEYPAD_UNLOCK_SLOT_205,
-        KEYPAD_UNLOCK_SLOT_200,
-        KEYPAD_UNLOCK_SLOT_UNKNOWN,
-        KEYPAD_LOCK_BUTTON,
-        END_OF_LOG,
-    ]
-    frames += [_built(log_type, {5: BODY}) for log_type in range(0x100)]
+    frames = [*CAPTURED, *(_built(log_type, {5: BODY}) for log_type in range(0x100))]
     for frame in frames:
         _assert_record(
             parse_log_event_packet(frame),
@@ -676,14 +676,7 @@ def test_with_no_brand_a_record_reads_in_yales_numbering() -> None:
 
 def test_a_log_type_with_the_same_decoder_in_both_brands_reads_alike() -> None:
     """Captured and built frames for each log_type the two brands decode alike."""
-    frames = [
-        KEYPAD_UNLOCK_SLOT_205,
-        KEYPAD_UNLOCK_SLOT_200,
-        KEYPAD_UNLOCK_SLOT_UNKNOWN,
-        KEYPAD_LOCK_BUTTON,
-        END_OF_LOG,
-        _built(0x0E, CREDENTIAL_FIELDS),
-    ]
+    frames = [*CAPTURED, _built(0x0E, CREDENTIAL_FIELDS)]
     alike = [*range(0x0A), *range(0x0B, 0x14), 0x20, 0x40, 0x80]
     frames += [_built(log_type, {5: BODY}) for log_type in alike]
     for frame in frames:
@@ -718,39 +711,34 @@ def test_a_record_the_brands_number_differently_reads_in_the_brands_numbering(
     [
         _case(
             LockOperatingMode,
-            0x14,
-            {5: TIME, 9: "02"},
+            _built(0x14, {5: TIME, 9: "02"}),
             time_stamp=TIME_STAMP,
             lock_op_mode=OperatingMode.PRIVACY,
         ),
         _case(
             LockDeadboltJam,
-            0x16,
-            {5: TIME, 9: "ea14", 11: "01"},
+            _built(0x16, {5: TIME, 9: "ea14", 11: "01"}),
             time_stamp=TIME_STAMP,
             battery_level=5354,
             jam_state=JamState.OCCURS_DURING_UNLOCKING,
         ),
         _case(
             InvalidCredentialEntry,
-            0x17,
-            {5: TIME, 9: "0110", 11: "df14"},
+            _built(0x17, {5: TIME, 9: "0110", 11: "df14"}),
             time_stamp=TIME_STAMP,
             cred_type=CredType.ENTRY_APPLE_HOMEKEYS_NFC,
             battery_level=5343,
         ),
         _case(
             InvalidCredentialEntry,
-            0x17,
-            {5: TIME, 9: "0300", 11: "df14"},
+            _built(0x17, {5: TIME, 9: "0300", 11: "df14"}),
             time_stamp=TIME_STAMP,
             cred_type=0x0003,
             battery_level=5343,
         ),
         _case(
             MatterEvent,
-            0x18,
-            {5: TIME, 9: "01", 10: "03", 11: "4913"},
+            _built(0x18, {5: TIME, 9: "01", 10: "03", 11: "4913"}),
             time_stamp=TIME_STAMP,
             event_type=MatterEventType.FABRIC_ADDED,
             fabric_index=3,
@@ -759,8 +747,10 @@ def test_a_record_the_brands_number_differently_reads_in_the_brands_numbering(
         ),
         _case(
             LockOperationBlame,
-            0x19,
-            {5: TIME, 9: "01", 10: "02", 11: "02", 12: "0700", 14: "09", 15: "03"},
+            _built(
+                0x19,
+                {5: TIME, 9: "01", 10: "02", 11: "02", 12: "0700", 14: "09", 15: "03"},
+            ),
             time_stamp=TIME_STAMP,
             op_type=LockOperationType.UNLOCK,
             op_source=AugustLockOperationSource.KEYPAD,
@@ -773,8 +763,7 @@ def test_a_record_the_brands_number_differently_reads_in_the_brands_numbering(
         ),
         _case(
             OutOfScheduleCredential,
-            0x1D,
-            {5: TIME, 9: "0000", 11: "df14", 13: "01"},
+            _built(0x1D, {5: TIME, 9: "0000", 11: "df14", 13: "01"}),
             time_stamp=TIME_STAMP,
             cred_type=CredType.ENTRY_KEYPAD_PINCODE,
             battery_level=5343,
@@ -782,8 +771,7 @@ def test_a_record_the_brands_number_differently_reads_in_the_brands_numbering(
         ),
         _case(
             BulkOperation,
-            0x1E,
-            {5: TIME, 9: "01", 10: "02", 11: "0500"},
+            _built(0x1E, {5: TIME, 9: "01", 10: "02", 11: "0500"}),
             time_stamp=TIME_STAMP,
             bulk_op_type=BulkOperationType.USERS_CLEAR,
             fabric_index=2,
