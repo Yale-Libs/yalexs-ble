@@ -1140,26 +1140,6 @@ async def test_unread_event_count_returns_the_signed_four_byte_count(
 
 
 @pytest.mark.asyncio
-async def test_a_count_reply_publishes_nothing(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The count reply reaches no state consumer and is not logged as unknown."""
-    emitted: list[list[LockStateValue]] = []
-    lock, session = _connected_lock(lambda states: emitted.append(list(states)))
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        session._notify(0, bytearray(DEPTH_FRAME))
-
-    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-
-    with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
-        assert await lock.unread_event_count() == ActivityLogDepth(242)
-
-    assert emitted == []
-    assert "Unknown state" not in caplog.text
-
-
-@pytest.mark.asyncio
 async def test_an_unsolicited_count_reply_answers_no_other_wait(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

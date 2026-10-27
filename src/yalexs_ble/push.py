@@ -675,8 +675,6 @@ class PushLock:
         Records are read on the next update after a lock or door status change.
         """
         if not self._activity_callbacks:
-            # The next drain reads the unread count and flags up to that many
-            # records.
             self._backlog_remaining = None
             self._activity_drain_pending = True
             if self._running and self._lock_info is not None:

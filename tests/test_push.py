@@ -3948,6 +3948,15 @@ _CODE_OPERATION_RECORD = bytes.fromhex("bb2d0072079aa176a333004bea14cd000200")
 _GET_LOG_ERROR = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
 
 
+def _count_reply(count: int) -> bytes:
+    """A LOCK_EVENTS_UNREAD reply built to the captured layout, count at byte[8:12]."""
+    return bytes(
+        _with_checksum(
+            "bb02000009000000" + count.to_bytes(4, "little").hex() + "000000000200"
+        )
+    )
+
+
 def _recorder(received: list[tuple[bytes, bool]]) -> LogRecordCallback:
     """A log record callback that keeps each record with its backlog flag."""
 
@@ -3958,9 +3967,7 @@ def _recorder(received: list[tuple[bytes, bool]]) -> LogRecordCallback:
 
 
 def _ready_to_drain(push_lock: PushLock) -> None:
-    """
-    Put the four status types in _seen_this_session, so a cycle reads only the log.
-    """
+    """Add the polled types to _seen_this_session, so a cycle reads only the log."""
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
     push_lock._advertisement_data = _advertisement({})
@@ -4033,10 +4040,8 @@ async def test_the_records_within_the_unread_count_are_delivered_as_backlog() ->
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:c1", always_connected=False)
     received: list[tuple[bytes, bool]] = []
     push_lock.register_log_record_callback(_recorder(received))
-    # Built to the LOCK_EVENTS_UNREAD reply layout with a count of 3.
-    count_reply = bytes(_with_checksum("bb020000090000000300000000000000" + "0200"))
     lock, written = _drain_on_a_real_session(
-        push_lock, [count_reply, *_RECORDS, _GET_LOG_ERROR]
+        push_lock, [_count_reply(3), *_RECORDS, _GET_LOG_ERROR]
     )
 
     await _run_update(push_lock, lock)
@@ -4325,10 +4330,8 @@ async def test_a_backlog_armed_during_a_read_flags_its_record_and_drains_anew() 
     record = _recorder(received)
     push_lock.register_log_record_callback(_recorder(removed))
     push_lock._backlog_remaining = 0
-    # Built to the LOCK_EVENTS_UNREAD reply layout with a count of 1.
-    count_reply = bytes(_with_checksum("bb020000090000000100000000000000" + "0200"))
     lock, written = _drain_on_a_real_session(
-        push_lock, [_RECORDS[0], count_reply, _RECORDS[1], _GET_LOG_ERROR]
+        push_lock, [_RECORDS[0], _count_reply(1), _RECORDS[1], _GET_LOG_ERROR]
     )
     client = cast(MagicMock, lock.client)
     answer = client.write_gatt_char.side_effect
@@ -4551,23 +4554,36 @@ async def test_activity_deep_backlog_continues_shortly_without_a_strike(
     assert push_lock._activity_overruns == 0
 
 
+def _cancelling(_push_lock: PushLock) -> LogRecordCallback:
+    return AsyncMock(side_effect=asyncio.CancelledError())
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cancelled", ["read", "callback"])
-async def test_activity_cancel_during_drain_keeps_the_flag(cancelled: str) -> None:
+@pytest.mark.parametrize(
+    ("drain", "extra", "expected"),
+    [
+        ([asyncio.CancelledError()], None, []),
+        (
+            [_RECORDS[0], _RECORDS[1], _GET_LOG_ERROR],
+            _cancelling,
+            [(_RECORDS[0], False)],
+        ),
+    ],
+    ids=["read", "callback"],
+)
+async def test_activity_cancel_during_drain_keeps_the_flag(
+    drain: list[Any],
+    extra: Callable[[PushLock], LogRecordCallback] | None,
+    expected: list[tuple[bytes, bool]],
+) -> None:
     """A cancellation in a read or a callback ends the drain and leaves it owed."""
-    push_lock, mock_lock, received = _activity_push_lock(
-        [[asyncio.CancelledError()]]
-        if cancelled == "read"
-        else [[_RECORDS[0], _RECORDS[1], _GET_LOG_ERROR]]
-    )
-    if cancelled == "callback":
-        push_lock.register_log_record_callback(
-            AsyncMock(side_effect=asyncio.CancelledError())
-        )
+    push_lock, mock_lock, received = _activity_push_lock([drain])
+    if extra is not None:
+        push_lock.register_log_record_callback(extra(push_lock))
     with pytest.raises(asyncio.CancelledError):
         await _run_update(push_lock, mock_lock)
     assert push_lock._activity_drain_pending is True
-    assert received == ([(_RECORDS[0], False)] if cancelled == "callback" else [])
+    assert received == expected
 
 
 @pytest.mark.asyncio
