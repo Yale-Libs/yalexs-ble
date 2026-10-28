@@ -28,14 +28,13 @@ from .const import (
     MANUAL_INTERVENTION_STATUSES,
     SETUP_CONDITION_STATUSES,
     YALE_MFR_IDS,
+    ActivityValue,
     AuthState,
     AutoLockMode,
     AutoLockState,
     BatteryState,
     ConnectionInfo,
-    DoorActivity,
     DoorStatus,
-    LockActivity,
     LockInfo,
     LockState,
     LockStateValue,
@@ -483,9 +482,7 @@ class PushLock:
         self._callbacks: list[
             Callable[[LockState, LockInfo, ConnectionInfo], None]
         ] = []
-        self._activity_callbacks: list[
-            Callable[[LockActivity | DoorActivity], None]
-        ] = []
+        self._activity_callbacks: list[Callable[[ActivityValue], None]] = []
         self._activity_primed = False
         self._activity_drain_pending = False
         self._activity_drain_failures = self._activity_overruns = 0
@@ -648,11 +645,12 @@ class PushLock:
         return unregister_callback
 
     def register_activity_callback(
-        self, callback: Callable[[LockActivity | DoorActivity], None]
+        self, callback: Callable[[ActivityValue], None]
     ) -> Callable[[], None]:
         """Register a callback for each new lock activity record.
 
-        Records are read on the next update after a lock or door status change.
+        Records are read on the next update after a lock or door status change,
+        or a change of the advertised activity flag.
         """
         if not self._activity_callbacks:
             # The first registration primes, so the backlog is not delivered as new.
@@ -1877,7 +1875,7 @@ class PushLock:
             ACTIVITY_DRAIN_FAILURE_BACKOFF,
         )
 
-    def _callback_activity(self, activity: LockActivity | DoorActivity) -> None:
+    def _callback_activity(self, activity: ActivityValue) -> None:
         """Call the activity callbacks."""
         for callback in self._activity_callbacks:
             try:
@@ -1925,6 +1923,44 @@ class PushLock:
                 callback(lock_state, self._lock_info, connection_info)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("%s: Error calling callback", self.name)
+
+    def _read_yale_advertisement(self, mfr_data: Mapping[int, bytes]) -> float:
+        """Track the Yale advertised value; return the update delay it calls for."""
+        # YALE_MFR_ID advertisements come in two formats, and a payload under
+        # ASSA_ABLOY_MFR_ID is read the same way:
+        # - 1-byte: activity flag (0/1), used for change detection
+        # - 18-byte: 2 header bytes + the lock's 16-byte cloud ID (the
+        #   identifier used by the Yale/ASSA ABLOY cloud API), e.g.
+        #   b'\x00\x00\x80\x15\xd0\x11\xf7\xa5\x43\x1f\x85\xd7\xff\x23\x5f\x1e\x75\x46'
+        # Only track byte[0] from the 1-byte format. The two formats
+        # alternate every few seconds; without the length check, the
+        # static 0x00 header of the 18-byte format causes repeated
+        # connections if it differs from the 1-byte value.
+        is_first_advertisement = self._last_adv_value == -1
+        yale_mfr_id, yale_data = _select_yale_payload(mfr_data)
+        next_update = 0.0
+        # An empty payload is skipped rather than indexed.
+        if yale_data and (len(yale_data) == 1 or is_first_advertisement):
+            current_value = yale_data[0]
+            if is_first_advertisement:
+                # We haven't seen a valid value yet so we schedule an update
+                next_update = FIRST_UPDATE_COALESCE_SECONDS
+            elif (
+                current_value in VALID_ADV_VALUES
+                and current_value != self._last_adv_value
+            ):
+                # The flag also flips for activity with no lock or door change,
+                # such as a doorbell press, which only the activity log records.
+                self._activity_drain_pending = True
+                next_update = ADV_UPDATE_COALESCE_SECONDS
+            self._last_adv_value = current_value
+        elif yale_data is not None and not yale_data:
+            _LOGGER.debug(
+                "%s: Empty Yale advertisement payload under company ID %s; skipped",
+                self.name,
+                yale_mfr_id,
+            )
+        return next_update
 
     def update_advertisement(
         self, ble_device: BLEDevice, ad: AdvertisementData
@@ -1989,37 +2025,8 @@ class PushLock:
                 next_update = HK_UPDATE_COALESCE_SECONDS
         elif APPLE_MFR_ID in mfr_data:
             _LOGGER.debug("%s: Empty HomeKit advertisement payload; skipped", self.name)
-        # YALE_MFR_ID advertisements come in two formats, and a payload under
-        # ASSA_ABLOY_MFR_ID is read the same way:
-        # - 1-byte: lock state toggle (0/1), used for change detection
-        # - 18-byte: 2 header bytes + the lock's 16-byte cloud ID (the
-        #   identifier used by the Yale/ASSA ABLOY cloud API), e.g.
-        #   b'\x00\x00\x80\x15\xd0\x11\xf7\xa5\x43\x1f\x85\xd7\xff\x23\x5f\x1e\x75\x46'
-        # Only track byte[0] from the 1-byte format. The two formats
-        # alternate every few seconds; without the length check, the
-        # static 0x00 header of the 18-byte format causes repeated
-        # connections if it differs from the 1-byte value.
-        is_first_advertisement = self._last_adv_value == -1
-        yale_mfr_id, yale_data = _select_yale_payload(mfr_data)
-        # As above, an empty payload is skipped rather than indexed.
-        if yale_data and (len(yale_data) == 1 or is_first_advertisement):
-            current_value = yale_data[0]
-            if not next_update:
-                if is_first_advertisement:
-                    # We haven't seen a valid value yet so we schedule an update
-                    next_update = FIRST_UPDATE_COALESCE_SECONDS
-                elif (
-                    current_value in VALID_ADV_VALUES
-                    and current_value != self._last_adv_value
-                ):
-                    next_update = ADV_UPDATE_COALESCE_SECONDS
-            self._last_adv_value = current_value
-        elif yale_data is not None and not yale_data:
-            _LOGGER.debug(
-                "%s: Empty Yale advertisement payload under company ID %s; skipped",
-                self.name,
-                yale_mfr_id,
-            )
+        yale_update = self._read_yale_advertisement(mfr_data)
+        next_update = next_update or yale_update
         if adv_debug_enabled:
             scheduled_update = None
             if self._cancel_deferred_update:
