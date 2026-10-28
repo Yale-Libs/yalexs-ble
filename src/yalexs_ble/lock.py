@@ -4,8 +4,7 @@ import asyncio
 import bisect
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Iterable
-from datetime import datetime
+from collections.abc import Callable, Iterable
 from typing import Any, TypeVar, cast
 
 from bleak import BleakError
@@ -23,21 +22,15 @@ from .const import (
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_DOOR_STATUS,
-    VALUE_TO_LOCK_OPERATION_REMOTE_TYPE,
-    VALUE_TO_LOCK_OPERATION_SOURCE,
     VALUE_TO_LOCK_STATUS,
     VALUE_TO_OPERATION_ERROR,
+    ActivityLogDepth,
     AutoLockMode,
     AutoLockState,
     BatteryState,
     Commands,
-    DoorActivity,
     DoorStatus,
-    LockActivity,
-    LockActivityType,
     LockInfo,
-    LockOperationRemoteType,
-    LockOperationSource,
     LockStateValue,
     LockStatus,
     OperationError,
@@ -52,7 +45,6 @@ from .session import (
     KeycodeError,
     OperationFailedError,
     OperationProgress,
-    ResponseError,
     Session,
     YaleXSBLEError,
 )
@@ -61,9 +53,6 @@ _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
 LOCK_INFO_ATTEMPTS = 2
-
-# Upper bound on the records read in one drain of the activity log
-MAX_ACTIVITY_RECORDS = 32
 
 # Operation byte that makes an Unlock command an unlatch (retract the latch).
 UNLATCH_OPERATION_BYTE = 0x0A
@@ -165,11 +154,11 @@ def _poll_response_matcher(
     byte read as a voltage, which is the recurring near-zero battery reading
     seen in the field. Typing every status-poll wait keeps a foreign frame on
     the state callback path where it belongs, and the response timeout is the
-    backstop for a poll the lock never answers. LOCK_ACTIVITY declares a record
+    backstop for a poll the lock never answers. GETLOG declares a record
     type in byte[4] rather than a status type, so it matches on the opcode
     alone; an acknowledgment carries back the request's own byte[4], which is
     zero for that command and reads as a lock operation record, so requiring
-    the 0xBB frame keeps an acknowledgment out of that parser too.
+    the 0xBB frame keeps an acknowledgment from being returned as a record.
     auto_lock_status is a poll too, but it completes on its acknowledgment by
     design (see its docstring), so it is not typed here.
     """
@@ -198,7 +187,7 @@ NO_STATE_OPCODES = frozenset(
         Commands.KEYCODE_ACCESS.value,
         Commands.KEYCODE_COMMIT.value,
         Commands.KEYCODE_GET.value,
-        Commands.LOCK_ACTIVITY.value,
+        Commands.GETLOG.value,
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
@@ -258,11 +247,7 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
     return _matches
 
 
-class ActivityLogOverrunError(ResponseError):
-    """The activity log did not end within the read cap."""
-
-
-_LOCK_ACTIVITY_MATCHER = _poll_response_matcher(Commands.LOCK_ACTIVITY.value)
+_GETLOG_MATCHER = _poll_response_matcher(Commands.GETLOG.value)
 
 
 class Lock:
@@ -422,6 +407,10 @@ class Lock:
                     return self._parse_lock_and_door_state(state)
                 if state[4] == StatusType.BATTERY.value:
                     return [self._parse_battery_state(state)]
+                if state[4] == StatusType.LOCK_EVENTS_UNREAD.value:
+                    # The count reaches its consumer as the return of
+                    # unread_event_count(), so the reply publishes nothing.
+                    return ()
             elif (
                 state[1] == Commands.WRITESETTING.value
                 or state[1] == Commands.READSETTING.value
@@ -446,11 +435,11 @@ class Lock:
 
     def _internal_state_callback(self, state: bytes) -> None:
         """Handle state change."""
-        _LOGGER.debug("%s: State changed: %s", self.name, state.hex())
+        _LOGGER.debug("%s: State changed: %s", self.name, util._loggable_hex(state))
         parsed_state = self._parse_state(state)
         if parsed_state is None:
             # Unrecognized frame - surface it for diagnosis.
-            _LOGGER.info("%s: Unknown state: %s", self.name, state.hex())
+            _LOGGER.info("%s: Unknown state: %s", self.name, util._loggable_hex(state))
         elif parsed_state:
             # Non-empty iterable - emit the state(s) to the consumer.
             self._state_callback(parsed_state)
@@ -821,10 +810,18 @@ class Lock:
         # well.
         assert self.session is not None  # nosec
         command = self.session.build_operation_command(opcode, cmd_byte)
-        _LOGGER.debug("%s: send: [%s] [%s]", self.name, command.hex(), hex(cmd_byte))
+        _LOGGER.debug(
+            "%s: send: [%s] [%s]",
+            self.name,
+            util._loggable_hex(command),
+            hex(cmd_byte),
+        )
         response = await self.session.execute(command, command_name, response_matcher)
         _LOGGER.debug(
-            "%s: response: [%s] [%s]", self.name, response.hex(), hex(cmd_byte)
+            "%s: response: [%s] [%s]",
+            self.name,
+            util._loggable_hex(response),
+            hex(cmd_byte),
         )
         return response
 
@@ -927,6 +924,28 @@ class Lock:
         percentage = convert_voltage_to_percentage(voltage / 4)
         return BatteryState(voltage, percentage)
 
+    def _parse_activity_log_depth(self, response: bytes) -> ActivityLogDepth:
+        """Parse the unread count of a LOCK_EVENTS_UNREAD reply, signed at [8:12]."""
+        return ActivityLogDepth(util._bytes_to_signed_int(response[0x08:0x0C]))
+
+    @raise_if_not_connected
+    async def unread_event_count(self) -> ActivityLogDepth:
+        """Read the activity log's unread count; the read removes no record.
+
+        Raises TimeoutError when the lock does not answer within the session's wait.
+        """
+        _LOGGER.debug("%s: Executing unread_event_count", self.name)
+        response = await self._execute_command(
+            Commands.GETSTATUS,
+            StatusType.LOCK_EVENTS_UNREAD,
+            "unread_event_count",
+            _poll_response_matcher(
+                Commands.GETSTATUS.value, StatusType.LOCK_EVENTS_UNREAD.value
+            ),
+        )
+        _LOGGER.debug("%s: Finished executing unread_event_count", self.name)
+        return self._parse_activity_log_depth(response)
+
     @raise_if_not_connected
     async def battery(self) -> BatteryState:
         _LOGGER.debug("%s: Executing battery", self.name)
@@ -958,145 +977,14 @@ class Lock:
         )
         _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
 
-    def _parse_unix_timestamp(self, timestamp_bytes: bytes) -> datetime:
-        """Parse the unix timestamp to datetime from the bytes."""
-        _LOGGER.debug(
-            "%s: Parsing unix timestamp: %s", self.name, timestamp_bytes.hex()
-        )
-        unix_timestamp = int.from_bytes(timestamp_bytes, byteorder="little")
-        _LOGGER.debug("%s: Parsed unix timestamp: %d", self.name, unix_timestamp)
-        return datetime.fromtimestamp(unix_timestamp)
-
-    def _parse_operation_source(
-        self,
-        source: int,
-        remote_type: int,
-    ) -> tuple[LockOperationSource, LockOperationRemoteType | None]:
-        source_enum = VALUE_TO_LOCK_OPERATION_SOURCE.get(
-            source, LockOperationSource.UNKNOWN
-        )
-        remote_type_enum: LockOperationRemoteType | None
-        remote_type_enum = VALUE_TO_LOCK_OPERATION_REMOTE_TYPE.get(
-            remote_type, LockOperationRemoteType.UNKNOWN
-        )
-        if source_enum is LockOperationSource.UNKNOWN:
-            _LOGGER.info(
-                "%s: Unrecognized operation source code: %s",
-                self.name,
-                hex(source),
-            )
-
-        if source_enum is LockOperationSource.REMOTE:
-            if remote_type_enum is LockOperationRemoteType.UNKNOWN:
-                _LOGGER.info(
-                    "%s: Unrecognized operation remote type: %s",
-                    self.name,
-                    hex(remote_type),
-                )
-        else:
-            remote_type_enum = None
-
-        return source_enum, remote_type_enum
-
-    def _parse_lock_activity(
-        self, response: bytes
-    ) -> DoorActivity | LockActivity | None:
-        """Parse the lock activity from the response."""
-        # We only know a subset of lock activities currently
-        # response[0x04] seems to be the activity type
-        # the rest of the response is data for the activity,
-        # format seems to be specific to each individual activity type
-        activity_type = response[0x04]
-        _LOGGER.debug("%s: Activity type: 0x%02X", self.name, activity_type)
-        if activity_type == LockActivityType.NONE.value:
-            _LOGGER.debug("%s: No activity", self.name)
-            return None
-
-        if activity_type == LockActivityType.DOOR.value:
-            # Timestamp is at 0x05-0x08
-            # Door status is at 0x09
-            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            door_status = self._parse_door_status(response[0x09])
-            return DoorActivity(timestamp, door_status)
-        if activity_type == LockActivityType.LOCK.value:
-            # Timestamp is at 0x08-0x0B
-            # Lock status is at 0x06
-            # Operation source is at 0x05
-            # Remote type is at 0x07
-            timestamp = self._parse_unix_timestamp(response[0x08:0x0C])
-            lock_status = self._parse_lock_status(response[0x06])
-            operation_source, remote_type = self._parse_operation_source(
-                response[0x05], response[0x07]
-            )
-
-            return LockActivity(
-                timestamp,
-                lock_status,
-                source=operation_source,
-                remote_type=remote_type,
-            )
-        if activity_type == LockActivityType.PIN.value:
-            # Timestamp is at 0x05-0x08
-            # Slot is at 0x0A
-            # Lock status seems to be at lower half of 0x0C
-            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            pin_slot = response[0x0A]
-            lock_status = self._parse_lock_status(response[0x0C] & 0x0F)
-
-            return LockActivity(
-                timestamp,
-                lock_status,
-                source=LockOperationSource.PIN,
-                slot=pin_slot,
-            )
-        if activity_type == LockActivityType.KEYPAD_UNLOCK.value:
-            # Timestamp is at 0x05-0x08
-            # Slot is a uint16 at 0x0E-0x0F; 0xFFEE is the keypad master code
-            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            slot = util._bytes_to_int(response[0x0E:0x10])
-            return LockActivity(
-                timestamp,
-                LockStatus.UNLOCKED,
-                source=LockOperationSource.PIN,
-                slot=slot,
-            )
-        _LOGGER.debug("%s: Unknown activity type: 0x%02X", self.name, activity_type)
-        return None
-
-    async def _read_lock_activity_response(self) -> bytes:
+    @raise_if_not_connected
+    async def get_log(self) -> bytes:
         """Pop the oldest record from the lock's activity log."""
         assert self.session is not None  # nosec
         return await self.session.execute(
-            self.session.build_command(Commands.LOCK_ACTIVITY.value),
-            "lock_activity",
-            _LOCK_ACTIVITY_MATCHER,
-        )
-
-    @raise_if_not_connected
-    async def lock_activity(self) -> DoorActivity | LockActivity | None:
-        _LOGGER.debug("%s: Executing lock_activity", self.name)
-        response = await self._read_lock_activity_response()
-        _LOGGER.debug("%s: Finished executing lock_activity", self.name)
-        return self._parse_lock_activity(response)
-
-    async def drain_lock_activity(self) -> AsyncIterator[DoorActivity | LockActivity]:
-        """Pop and yield records until the end marker; raise past the read cap.
-
-        Each read pops the lock's oldest record, so records are yielded as
-        they arrive. Unknown types are skipped.
-        """
-        if not self.is_connected:
-            raise DisconnectedError("Lock is not connected")
-        _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
-        for _ in range(MAX_ACTIVITY_RECORDS):
-            response = await self._read_lock_activity_response()
-            if response[0x04] == LockActivityType.NONE.value:
-                _LOGGER.debug("%s: Finished drain_lock_activity", self.name)
-                return
-            if (activity := self._parse_lock_activity(response)) is not None:
-                yield activity
-        raise ActivityLogOverrunError(
-            f"{self.name}: Activity log did not end within {MAX_ACTIVITY_RECORDS} reads"
+            self.session.build_command(Commands.GETLOG.value),
+            "get_log",
+            _GETLOG_MATCHER,
         )
 
     async def disconnect(self) -> None:

@@ -10,7 +10,7 @@ import pytest
 from bleak import BleakError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from yalexs_ble import util
+from yalexs_ble import const, util
 from yalexs_ble.const import Commands, OperationError, SettingType
 from yalexs_ble.lock import (
     _ack_matcher,
@@ -619,6 +619,146 @@ def test_keycode_error_message_names_the_error(
     assert str(err) == expected
     assert err.command == "commit_keycode"
     assert err.error == error
+
+
+# Built frames apart from the captured LockOperation GetLog reply. Each keypad code
+# below is 123456, or 135790 in the keycode read reply.
+@pytest.mark.parametrize(
+    ("mask_sensitive", "frame", "logged"),
+    [
+        pytest.param(
+            True,
+            "bb2d00690178563412123456ffffffff0200",
+            "bb2d00**0178563412**************0200",
+            id="KeypadOpen",
+        ),
+        pytest.param(
+            True,
+            "bb2d00680278563412123456ffffffff0200",
+            "bb2d00**0278563412**************0200",
+            id="KeypadWrongCode",
+        ),
+        pytest.param(
+            True,
+            "bb2d00620878563412123456ffffffff0200",
+            "bb2d00**0878563412**************0200",
+            id="KeypadClose",
+        ),
+        pytest.param(
+            True,
+            "bb2d0061037856341205123456ffffff0200",
+            "bb2d00**037856341205************0200",
+            id="CodeAdded",
+        ),
+        pytest.param(
+            True,
+            "bb2d00d00a78563412050040e20100000200",
+            "bb2d00**0a785634120500**********0200",
+            id="CodeAddedv2",
+        ),
+        pytest.param(
+            True,
+            "ee270051123456ffffffff00000000000200",
+            "ee2700****************00000000000200",
+            id="KeyCode_Set",
+        ),
+        pytest.param(
+            True,
+            "bb270086123456ffffffff00000000000000",
+            "bb2700****************00000000000000",
+            id="KeyCode_Set-reply",
+        ),
+        # A built acknowledgment of KeyCode_Set whose bytes 4 to 10 match the request's;
+        # no capture holds one.
+        pytest.param(
+            True,
+            "aa270095123456ffffffff00000000000200",
+            "aa2700****************00000000000200",
+            id="KeyCode_Set-acknowledgment",
+        ),
+        pytest.param(
+            True,
+            "bb280085123456ffffffff00000000000000",
+            "bb2800****************00000000000000",
+            id="KeyCode_Clear-reply",
+        ),
+        pytest.param(
+            True,
+            "bb2a0083123456ffffffff00000000000000",
+            "bb2a00****************00000000000000",
+            id="KeyCode_Unlock-reply",
+        ),
+        pytest.param(
+            True,
+            "ee2c0047123456ffffffff05000000000200",
+            "ee2c00****************05000000000200",
+            id="KeyCode_Commit",
+        ),
+        pytest.param(
+            True,
+            "bb39004ec800135790ffffffff0000000000",
+            "bb3900**c800**************0000000000",
+            id="UnityGetKeyCode-reply",
+        ),
+        pytest.param(
+            True,
+            "ee39000fc800000000000000000000000200",
+            "ee39000fc800000000000000000000000200",
+            id="UnityGetKeyCode",
+        ),
+        pytest.param(
+            True,
+            "bb2d0056000b0500a0a176a3df14194a0200",
+            "bb2d0056000b0500a0a176a3df14194a0200",
+            id="LockOperation",
+        ),
+        pytest.param(
+            True,
+            "bb02003a0200000005000000000000000200",
+            "bb02003a0200000005000000000000000200",
+            id="status",
+        ),
+        pytest.param(True, "bb2d0069", "bb2d0069", id="short-frame"),
+        pytest.param(
+            False,
+            "bb2d00690178563412123456ffffffff0200",
+            "bb2d00690178563412123456ffffffff0200",
+            id="KeypadOpen-not-masked",
+        ),
+    ],
+)
+def test_loggable_hex_masks_a_keypad_code_and_the_checksum_when_asked(
+    monkeypatch: pytest.MonkeyPatch, mask_sensitive: bool, frame: str, logged: str
+) -> None:
+    """With MASK_SENSITIVE set, a keypad code and the checksum print as asterisks."""
+    monkeypatch.setattr(const, "MASK_SENSITIVE", mask_sensitive)
+    assert util._loggable_hex(bytes.fromhex(frame)) == logged
+
+
+@pytest.mark.asyncio
+async def test_the_session_debug_lines_mask_the_keypad_code_read_when_asked(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With MASK_SENSITIVE set, no session debug line contains the code read."""
+    monkeypatch.setattr(const, "MASK_SENSITIVE", True)
+    session = _make_session([], key=SESSION_KEY)
+    # A built keycode read reply for slot 200 that holds the code 135790.
+    answer = bytes.fromhex("bb39004ec800135790ffffffff0000000000")
+    [on_air] = _lock_side_frames(answer)
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(on_air))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
+        result = await session.execute(bytearray(18), "get_keycode")
+
+    assert result == answer
+    lines = [record.getMessage() for record in caplog.records]
+    masked = "bb3900**c800**************0000000000"
+    assert f"testlock: Decrypted response via notify: {masked}" in lines
+    assert f"testlock: Got response: {masked}" in lines
+    assert not any("135790" in line for line in lines)
 
 
 def _with_checksum(hex_str: str) -> bytearray:

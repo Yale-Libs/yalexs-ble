@@ -14,30 +14,26 @@ import yalexs_ble
 from yalexs_ble import util
 from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
-    KEYPAD_MASTER_CODE_SLOT,
     MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
+    ActivityLogDepth,
     AutoLockMode,
     AutoLockState,
     BatteryState,
     Commands,
-    DoorActivity,
     DoorStatus,
-    LockActivity,
     LockInfo,
-    LockOperationRemoteType,
-    LockOperationSource,
     LockStateValue,
     LockStatus,
+    OpCode,
     OperationError,
     SettingType,
     StatusType,
 )
 from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
-    MAX_ACTIVITY_RECORDS,
     UNLATCH_OPERATION_BYTE,
     Lock,
     _ack_matcher,
@@ -53,7 +49,6 @@ from yalexs_ble.session import (
     OperationFailedError,
     OperationIncompleteError,
     OperationProgress,
-    ResponseError,
     Session,
 )
 from yalexs_ble.util import _simple_checksum
@@ -119,52 +114,6 @@ async def test_connection_canceled_on_disconnect() -> None:
         await task
 
     assert task.cancelled() is True
-
-
-def test_parse_operation_source() -> None:
-    """Test parsing operation source and remote type."""
-    lock = Lock(
-        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
-        "0800200c9a66",
-        1,
-        "mylock",
-        lambda _: None,
-    )
-
-    # Test remote source with BLE type
-    source, remote_type = lock._parse_operation_source(0x00, 0x03)
-    assert source is LockOperationSource.REMOTE
-    assert remote_type is LockOperationRemoteType.BLE
-
-    # Test manual source (remote_type should be None)
-    source, remote_type = lock._parse_operation_source(0x01, 0x03)
-    assert source is LockOperationSource.MANUAL
-    assert remote_type is None
-
-    # Test auto lock source (remote_type should be None)
-    source, remote_type = lock._parse_operation_source(0x05, 0x00)
-    assert source is LockOperationSource.AUTO_LOCK
-    assert remote_type is None
-
-    # Test PIN source (remote_type should be None)
-    source, remote_type = lock._parse_operation_source(0x0B, 0x03)
-    assert source is LockOperationSource.PIN
-    assert remote_type is None
-
-    # Test unknown source
-    source, remote_type = lock._parse_operation_source(0x99, 0x03)
-    assert source is LockOperationSource.UNKNOWN
-    assert remote_type is None
-
-    # Test remote source with unknown remote type
-    source, remote_type = lock._parse_operation_source(0x00, 0x99)
-    assert source is LockOperationSource.REMOTE
-    assert remote_type is LockOperationRemoteType.UNKNOWN
-
-    # Test remote source with UNKNOWN (0x00) remote type
-    source, remote_type = lock._parse_operation_source(0x00, 0x00)
-    assert source is LockOperationSource.REMOTE
-    assert remote_type is LockOperationRemoteType.UNKNOWN
 
 
 def test_parse_lock_command_response_jammed() -> None:
@@ -300,10 +249,10 @@ def test_parse_success_op_response_with_0200_trailer_is_no_update(
     assert "Unknown state" not in caplog.text
 
 
-def test_parse_lock_activity_is_no_update(
+def test_a_get_log_reply_is_no_state_update(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A LOCK_ACTIVITY (0xBB 0x2D) frame is recognized with no state update."""
+    """A GETLOG (0xBB 0x2D) frame is recognized with no state update."""
     lock = _make_lock()
 
     frame = bytes.fromhex("bb2d008000000000000000000000000000")
@@ -672,7 +621,7 @@ def test_parse_state_ack_for_other_opcode_is_unknown() -> None:
     """ACK recognition is scoped to the settings opcodes.
 
     An 0xAA frame for an opcode with no ack decode falls through to None, so a
-    new acknowledgment type still surfaces as an unknown frame. LOCK_ACTIVITY
+    new acknowledgment type still surfaces as an unknown frame. GETLOG
     carries no state on either flag, so its ack is recognised and ignored.
     """
     lock = _make_lock()
@@ -1032,10 +981,15 @@ def _with_checksum(hex_str: str) -> bytes:
     return bytes(frame)
 
 
-# A LOCK_ACTIVITY reply carries one activity record: byte[2] is the record
-# index and byte[4] the record type. 0x80 ends the log and decodes to nothing;
-# 0x20 is a door state change, carrying a door status at byte[9], so it decodes
-# to a value no status frame can be mistaken for.
+# A LOCK_EVENTS_UNREAD reply captured on 2026-07-26 from a Yale lock: 242 records.
+DEPTH_FRAME = bytes.fromhex("bb02004609000000f2000000000000000200")
+# Built to the same layout with 0xDEADBEEF in the count at byte[8:12].
+NEGATIVE_DEPTH_FRAME = _with_checksum("bb02000009000000efbeadde000000000200")
+
+
+# Built GETLOG replies, each holding one activity record: byte[2] is the
+# record index and byte[4] the record type. 0x80 ends the log; 0x20 is a door
+# state change.
 ACTIVITY_FRAME = _with_checksum("bb2d00008000000000000000000000000000")
 DOOR_ACTIVITY_FRAME = _with_checksum("bb2d00002000000000010000000000000000")
 
@@ -1075,18 +1029,18 @@ def test_poll_response_matcher_takes_only_the_requested_subtype() -> None:
 
 
 def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
-    """lock_activity's answer carries a record type at byte[4], not a status type.
+    """get_log's answer has a record type at byte[4], not a status type.
 
     So its matcher keys on the opcode alone and must accept any byte[4].
     """
-    matches = _poll_response_matcher(Commands.LOCK_ACTIVITY.value)
+    matches = _poll_response_matcher(Commands.GETLOG.value)
     assert matches(ACTIVITY_FRAME)
     assert matches(_with_checksum("bb2d00002000000000000000000000000000"))
     # Still opcode-gated.
     assert not matches(BATTERY_FRAME)
     # An acknowledgment carries the request's own byte[4], which is zero for
     # this command and so reads as a lock operation record. Only the 0xBB check
-    # keeps it out of the parser.
+    # keeps it from being returned as a record.
     assert not matches(_with_checksum("aa2d00000000000000000000000000000000"))
 
 
@@ -1112,6 +1066,13 @@ def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
         # LockStatus.UNLOCKED are both 0x03, so the lock stray mis-parses to
         # exactly OPENED and an OPENED expectation would pass either way.
         ("door_status", LOCK_FRAME, LockStatus.UNLOCKED, DOOR_FRAME, DoorStatus.CLOSED),
+        (
+            "unread_event_count",
+            LOCK_FRAME,
+            LockStatus.UNLOCKED,
+            DEPTH_FRAME,
+            ActivityLogDepth(242),
+        ),
     ],
 )
 async def test_a_poll_is_not_answered_by_a_frame_of_another_subtype(
@@ -1147,9 +1108,84 @@ async def test_a_poll_is_not_answered_by_a_frame_of_another_subtype(
 
 
 @pytest.mark.asyncio
-async def test_a_lock_activity_poll_is_not_answered_by_a_status_frame() -> None:
-    """lock_activity matches on the opcode alone, so a status frame is not it."""
+@pytest.mark.parametrize(
+    ("frame", "unread", "is_depth"),
+    [(DEPTH_FRAME, 242, True), (NEGATIVE_DEPTH_FRAME, -559038737, False)],
+    ids=["captured", "top-bit-set"],
+)
+async def test_unread_event_count_returns_the_signed_four_byte_count(
+    frame: bytes, unread: int, is_depth: bool
+) -> None:
+    """The count read sends GETSTATUS LOCK_EVENTS_UNREAD and reads [8:12] signed."""
     lock, session = _connected_lock()
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(frame))
+
+    write = AsyncMock(side_effect=deliver)
+    session.client.write_gatt_char = write
+
+    depth = await lock.unread_event_count()
+
+    assert depth == ActivityLogDepth(unread)
+    assert depth.is_depth is is_depth
+    (write_call,) = write.await_args_list
+    written = write_call.args[1]
+    assert (written[0x01], written[0x04]) == (
+        Commands.GETSTATUS.value,
+        StatusType.LOCK_EVENTS_UNREAD.value,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unsolicited_count_reply_answers_no_other_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A count reply during a battery poll ends no wait and publishes nothing."""
+    emitted: list[list[LockStateValue]] = []
+    lock, session = _connected_lock(lambda states: emitted.append(list(states)))
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(DEPTH_FRAME))
+        assert session._notify_future is not None
+        session._notify(0, bytearray(BATTERY_FRAME))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
+        assert await lock.battery() == BatteryState(5.241, 28)
+
+    assert emitted == [[BatteryState(5.241, 28)]]
+    assert "Unknown state" not in caplog.text
+
+
+def test_another_getstatus_subtype_is_still_unknown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A GETSTATUS reply of a subtype the library does not decode stays unknown."""
+    lock = _make_lock()
+    # Built: a GETSTATUS reply with subtype 0x0A at byte[4].
+    frame = _with_checksum("bb0200000a00000000000000000000000000")
+
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
+        assert lock._parse_state(frame) is None
+        lock._internal_state_callback(frame)
+
+    assert "Unknown state" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unread_event_count_requires_a_connection() -> None:
+    """Reading the count from a disconnected lock raises."""
+    with pytest.raises(DisconnectedError):
+        await _make_lock().unread_event_count()
+
+
+@pytest.mark.asyncio
+async def test_a_get_log_is_not_answered_by_a_status_frame() -> None:
+    """get_log matches on the opcode alone, so a status push does not answer it."""
+    emitted: list[list[LockStateValue]] = []
+    lock, session = _connected_lock(lambda states: emitted.append(list(states)))
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
         session._notify(0, bytearray(LOCK_FRAME))
@@ -1158,11 +1194,8 @@ async def test_a_lock_activity_poll_is_not_answered_by_a_status_frame() -> None:
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
 
-    # The answer is a DOOR activity, which the status stray cannot decode to,
-    # so the returned object says which frame resolved the wait.
-    activity = await lock.lock_activity()
-    assert isinstance(activity, DoorActivity)
-    assert activity.status is DoorStatus.CLOSED
+    assert await lock.get_log() == DOOR_ACTIVITY_FRAME
+    assert emitted == [[LockStatus.UNLOCKED]]
 
 
 @pytest.mark.asyncio
@@ -1399,125 +1432,72 @@ def test_keycode_frames_produce_no_state(opcode: int, flag: int) -> None:
     assert received == []
 
 
-KEYPAD_UNLOCK_SLOT_205 = bytes.fromhex("bb2d0072079aa176a333004bea14cd000200")
-KEYPAD_UNLOCK_SLOT_200 = bytes.fromhex("bb2d00a4077a9e76a333004cdf14c8000200")
-KEYPAD_UNLOCK_SLOT_UNKNOWN = bytes.fromhex("bb2d00d007299c76a3330049e414eeff0200")
+# GetLog replies captured from a Yale lock: a LockOperation (0x00) record and
+# the GetLogError (0x80) that ends the log.
 KEYPAD_LOCK_BUTTON = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
 END_OF_LOG = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
-UNKNOWN_ACTIVITY = _with_checksum("bb2d00005500000000000000000000000000")
 
 
-@pytest.mark.parametrize(
-    ("frame", "slot"),
-    [
-        (KEYPAD_UNLOCK_SLOT_205, 205),
-        (KEYPAD_UNLOCK_SLOT_200, 200),
-        (KEYPAD_UNLOCK_SLOT_UNKNOWN, KEYPAD_MASTER_CODE_SLOT),
-    ],
-)
-def test_parse_keypad_unlock_activity(frame: bytes, slot: int | None) -> None:
-    """Real keypad PIN unlock records (type 0x07) from a Yale YRD256."""
-    activity = _make_lock()._parse_lock_activity(frame)
-    assert isinstance(activity, LockActivity)
-    assert activity.status is LockStatus.UNLOCKED
-    assert activity.source is LockOperationSource.PIN
-    assert activity.slot == slot
-    assert activity.remote_type is None
-    assert int(activity.timestamp.timestamp()) == int.from_bytes(
-        frame[0x05:0x09], "little"
-    )
+def test_op_code_holds_the_vendor_table() -> None:
+    """OpCode holds the vendor's opCode table, with no member for 0x0D or 0x16."""
+    assert {member.name: member.value for member in OpCode} == {
+        "DOOR_STATE_CHANGED": 0x00,
+        "DOOR_MANUAL_STATE_CHANGE": 0x01,
+        "KNOCK_RECEIVED": 0x02,
+        "BLUETOOTH_RECEIVED": 0x03,
+        "ANOMALY": 0x04,
+        "AUTO_RELOCK": 0x05,
+        "AUTO_RETRY": 0x06,
+        "OVER_TEMP": 0x07,
+        "BURN_IN": 0x08,
+        "HOME_KIT": 0x09,
+        "Z_WAVE": 0x0A,
+        "ONE_TOUCH": 0x0B,
+        "INSIDE_BUTTON": 0x0C,
+        "DOOR_SENSE": 0x0E,
+        "LOW_BAT_AUTO_UNLOCK": 0x0F,
+        "ESCAPE_UNLOCK": 0x10,
+        "UWB": 0x11,
+        "EXTERNAL_MODULE_OPERATION": 0x12,
+        "SHABBAT_MODE": 0x13,
+        "SCHEDULED_OPERATION": 0x14,
+        "MATTER": 0x15,
+        "DOUBLE_PRESS": 0x17,
+        "ALIRO": 0x18,
+        "UNDEFINED": 0xFF,
+    }
+    assert "OpCode" in yalexs_ble.__all__
 
 
-def test_parse_keypad_lock_button_and_end_marker() -> None:
-    """The keypad lock button is a type 0x00 record and 0x80 ends the log."""
-    lock = _make_lock()
-    activity = lock._parse_lock_activity(KEYPAD_LOCK_BUTTON)
-    assert isinstance(activity, LockActivity)
-    assert activity.status is LockStatus.LOCKED
-    assert activity.source is LockOperationSource.PIN
-    assert activity.slot is None
-    assert lock._parse_lock_activity(END_OF_LOG) is None
+def test_log_type_get_log_error_is_the_log_type_of_the_get_log_error() -> None:
+    """The package exports LOG_TYPE_GET_LOG_ERROR, byte[4] of a GetLogError reply."""
+    assert yalexs_ble.LOG_TYPE_GET_LOG_ERROR == END_OF_LOG[0x04] == 0x80
+    assert "LOG_TYPE_GET_LOG_ERROR" in yalexs_ble.__all__
 
 
-def _activity_lock(frames: list[bytes | Exception]) -> tuple[Lock, AsyncMock]:
-    """A connected Lock whose activity reads answer with frames in order."""
-    lock, session = _connected_lock()
-    answers = iter(frames)
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        answer = next(answers)
-        if isinstance(answer, Exception):
-            raise answer
-        session._notify(0, bytearray(answer))
-
-    write = AsyncMock(side_effect=deliver)
-    session.client.write_gatt_char = write
-    return lock, write
-
-
-async def _drain(lock: Lock) -> list[DoorActivity | LockActivity]:
-    return [activity async for activity in lock.drain_lock_activity()]
+def test_the_dirty_bit_is_set_in_a_racing_reply_and_clear_at_the_logs_end() -> None:
+    """The package exports GET_LOG_ERROR_DIRTY_BIT, bit 3 of a GetLogError's byte[5]."""
+    # A GetLogError captured from a Yale lock, answering a GetLog that raced the
+    # lock's write of a door record.
+    racing = bytes.fromhex("bb2d00f0800a0000c542dd6ac542dd6a0200")
+    assert racing[0x05] & yalexs_ble.GET_LOG_ERROR_DIRTY_BIT
+    assert not END_OF_LOG[0x05] & yalexs_ble.GET_LOG_ERROR_DIRTY_BIT
+    assert "GET_LOG_ERROR_DIRTY_BIT" in yalexs_ble.__all__
 
 
 @pytest.mark.asyncio
-async def test_drain_lock_activity_stops_at_the_end_marker() -> None:
-    """Records come back in order and the marker ends the drain."""
-    lock, write = _activity_lock(
-        [KEYPAD_UNLOCK_SLOT_205, KEYPAD_LOCK_BUTTON, END_OF_LOG, KEYPAD_UNLOCK_SLOT_200]
-    )
-    activities = await _drain(lock)
-    assert [(a.status, getattr(a, "slot", None)) for a in activities] == [
-        (LockStatus.UNLOCKED, 205),
-        (LockStatus.LOCKED, None),
-    ]
-    assert write.await_count == 3
+async def test_get_log_sends_getlog_and_returns_the_matched_reply() -> None:
+    """One GETLOG is sent and the reply its matcher takes is returned unchanged."""
+    lock, session = _keycode_lock([KEYPAD_LOCK_BUTTON])
+    assert await lock.get_log() is KEYPAD_LOCK_BUTTON
+    assert [command[0x01] for command in session.sent] == [Commands.GETLOG.value]
 
 
 @pytest.mark.asyncio
-async def test_drain_lock_activity_skips_unknown_types(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """An unparsable record is skipped at debug without ending the drain."""
-    lock, write = _activity_lock([UNKNOWN_ACTIVITY, KEYPAD_UNLOCK_SLOT_200, END_OF_LOG])
-    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.lock"):
-        activities = await _drain(lock)
-    assert len(activities) == 1
-    assert isinstance(activities[0], LockActivity)
-    assert activities[0].slot == 200
-    assert write.await_count == 3
-    record = next(r for r in caplog.records if "Unknown activity type" in r.message)
-    assert record.levelno == logging.DEBUG
-
-
-@pytest.mark.asyncio
-async def test_drain_lock_activity_yields_each_record_as_it_is_read() -> None:
-    """Records read before a failure have already been yielded."""
-    lock, _ = _activity_lock([KEYPAD_UNLOCK_SLOT_205, BleakError("gone")])
-    seen: list[DoorActivity | LockActivity] = []
-    with pytest.raises(BleakError):
-        async for activity in lock.drain_lock_activity():
-            seen.append(activity)
-    assert [getattr(a, "slot", None) for a in seen] == [205]
-
-
-@pytest.mark.asyncio
-async def test_drain_lock_activity_raises_past_the_cap() -> None:
-    """Without an end marker the drain raises after max_records reads."""
-    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * (MAX_ACTIVITY_RECORDS + 5))
-    seen: list[DoorActivity | LockActivity] = []
-    with pytest.raises(ResponseError, match=f"within {MAX_ACTIVITY_RECORDS} reads"):
-        async for activity in lock.drain_lock_activity():
-            seen.append(activity)
-    assert len(seen) == MAX_ACTIVITY_RECORDS
-    assert write.await_count == MAX_ACTIVITY_RECORDS
-
-
-@pytest.mark.asyncio
-async def test_drain_lock_activity_requires_a_connection() -> None:
-    """Draining a disconnected lock raises."""
-    lock = _make_lock()
+async def test_get_log_requires_a_connection() -> None:
+    """Reading a record from a disconnected lock raises."""
     with pytest.raises(DisconnectedError):
-        await _drain(lock)
+        await _make_lock().get_log()
 
 
 def test_ack_matcher_matches_only_the_written_operation() -> None:
