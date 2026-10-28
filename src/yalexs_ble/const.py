@@ -225,35 +225,44 @@ class LockState:
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
 
 
-class LockOperationSource(Enum):
-    REMOTE = 0x00
-    MANUAL = 0x01
-    AUTO_LOCK = 0x05
-    PIN = 0x0B
-    UNKNOWN = 0xFF
+class OpCode(IntEnum):
+    """The opCode at byte 5 of a type 0x00 activity record."""
 
-
-VALUE_TO_LOCK_OPERATION_SOURCE = {
-    status.value: status for status in LockOperationSource
-}
-
-
-class LockOperationRemoteType(Enum):
-    UNKNOWN = 0x00
-    BLE = 0x03
-
-
-VALUE_TO_LOCK_OPERATION_REMOTE_TYPE = {
-    status.value: status for status in LockOperationRemoteType
-}
+    # Based on the vendor's term. Locks have been observed to record a lock or unlock
+    # commanded over BLE with this value.
+    DOOR_STATE_CHANGED = 0x00
+    DOOR_MANUAL_STATE_CHANGE = 0x01
+    KNOCK_RECEIVED = 0x02
+    BLUETOOTH_RECEIVED = 0x03
+    ANOMALY = 0x04
+    AUTO_RELOCK = 0x05
+    AUTO_RETRY = 0x06
+    OVER_TEMP = 0x07
+    BURN_IN = 0x08
+    HOME_KIT = 0x09
+    Z_WAVE = 0x0A
+    ONE_TOUCH = 0x0B
+    INSIDE_BUTTON = 0x0C
+    DOOR_SENSE = 0x0E
+    LOW_BAT_AUTO_UNLOCK = 0x0F
+    ESCAPE_UNLOCK = 0x10
+    UWB = 0x11
+    EXTERNAL_MODULE_OPERATION = 0x12
+    SHABBAT_MODE = 0x13
+    SCHEDULED_OPERATION = 0x14
+    MATTER = 0x15
+    DOUBLE_PRESS = 0x17
+    ALIRO = 0x18
+    UNDEFINED = 0xFF
 
 
 @dataclass
 class LockActivity:
     timestamp: datetime
     status: LockStatus
-    source: LockOperationSource
-    remote_type: LockOperationRemoteType | None = None
+    # source is None for a 0x07 or 0x0E record, which has no opCode byte.
+    # OpCode.DOOR_STATE_CHANGED is 0, so a truth test cannot tell it from None.
+    source: OpCode | int | None
     slot: int | None = None
 
 

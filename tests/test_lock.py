@@ -27,10 +27,9 @@ from yalexs_ble.const import (
     DoorStatus,
     LockActivity,
     LockInfo,
-    LockOperationRemoteType,
-    LockOperationSource,
     LockStateValue,
     LockStatus,
+    OpCode,
     OperationError,
     SettingType,
     StatusType,
@@ -119,52 +118,6 @@ async def test_connection_canceled_on_disconnect() -> None:
         await task
 
     assert task.cancelled() is True
-
-
-def test_parse_operation_source() -> None:
-    """Test parsing operation source and remote type."""
-    lock = Lock(
-        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock"),
-        "0800200c9a66",
-        1,
-        "mylock",
-        lambda _: None,
-    )
-
-    # Test remote source with BLE type
-    source, remote_type = lock._parse_operation_source(0x00, 0x03)
-    assert source is LockOperationSource.REMOTE
-    assert remote_type is LockOperationRemoteType.BLE
-
-    # Test manual source (remote_type should be None)
-    source, remote_type = lock._parse_operation_source(0x01, 0x03)
-    assert source is LockOperationSource.MANUAL
-    assert remote_type is None
-
-    # Test auto lock source (remote_type should be None)
-    source, remote_type = lock._parse_operation_source(0x05, 0x00)
-    assert source is LockOperationSource.AUTO_LOCK
-    assert remote_type is None
-
-    # Test PIN source (remote_type should be None)
-    source, remote_type = lock._parse_operation_source(0x0B, 0x03)
-    assert source is LockOperationSource.PIN
-    assert remote_type is None
-
-    # Test unknown source
-    source, remote_type = lock._parse_operation_source(0x99, 0x03)
-    assert source is LockOperationSource.UNKNOWN
-    assert remote_type is None
-
-    # Test remote source with unknown remote type
-    source, remote_type = lock._parse_operation_source(0x00, 0x99)
-    assert source is LockOperationSource.REMOTE
-    assert remote_type is LockOperationRemoteType.UNKNOWN
-
-    # Test remote source with UNKNOWN (0x00) remote type
-    source, remote_type = lock._parse_operation_source(0x00, 0x00)
-    assert source is LockOperationSource.REMOTE
-    assert remote_type is LockOperationRemoteType.UNKNOWN
 
 
 def test_parse_lock_command_response_jammed() -> None:
@@ -1032,6 +985,13 @@ def _with_checksum(hex_str: str) -> bytes:
     return bytes(frame)
 
 
+def _with_byte(frame: bytes, offset: int, value: int) -> bytes:
+    """A copy of frame with one byte replaced and the checksum recomputed."""
+    edited = bytearray(frame)
+    edited[offset] = value
+    return _with_checksum(edited.hex())
+
+
 # A LOCK_ACTIVITY reply carries one activity record: byte[2] is the record
 # index and byte[4] the record type. 0x80 ends the log and decodes to nothing;
 # 0x20 is a door state change, carrying a door status at byte[9], so it decodes
@@ -1405,6 +1365,14 @@ KEYPAD_UNLOCK_SLOT_UNKNOWN = bytes.fromhex("bb2d00d007299c76a3330049e414eeff0200
 KEYPAD_LOCK_BUTTON = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
 END_OF_LOG = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
 UNKNOWN_ACTIVITY = _with_checksum("bb2d00005500000000000000000000000000")
+# Built to the 0x0E layout: PIN credential, slot 7, unlocked and closed.
+CREDENTIAL_RECORD_SLOT_7 = _with_checksum("bb2d00000e9aa176a3000700130000000000")
+# Captured GetLog replies from a Yale Unity L9000ER on 2026-10-25.
+AUTO_RELOCK_LOCKED = bytes.fromhex("bb2d000e000505007baddd6a2017193f0200")
+# Captured from a Yale Unity L9000K3 on 2026-10-25.
+INSIDE_BUTTON_LOCKED = bytes.fromhex("bb2d00d4000c0500a7eedd6a1914190f0200")
+# Captured from a Yale Unity L9000ER on 2026-10-27.
+DOOR_STATE_CHANGED_SLOT_255 = bytes.fromhex("bb2d001c000005ff0433e06a0817193d0200")
 
 
 @pytest.mark.parametrize(
@@ -1413,30 +1381,93 @@ UNKNOWN_ACTIVITY = _with_checksum("bb2d00005500000000000000000000000000")
         (KEYPAD_UNLOCK_SLOT_205, 205),
         (KEYPAD_UNLOCK_SLOT_200, 200),
         (KEYPAD_UNLOCK_SLOT_UNKNOWN, KEYPAD_MASTER_CODE_SLOT),
+        (CREDENTIAL_RECORD_SLOT_7, 7),
     ],
+    ids=["0x07-slot-205", "0x07-slot-200", "0x07-master-code", "0x0e-slot-7"],
 )
-def test_parse_keypad_unlock_activity(frame: bytes, slot: int | None) -> None:
-    """Real keypad PIN unlock records (type 0x07) from a Yale YRD256."""
+def test_a_code_or_credential_record_has_its_slot_and_no_source(
+    frame: bytes, slot: int
+) -> None:
+    """Captured 0x07 and built 0x0E unlocks give their slot and no source."""
     activity = _make_lock()._parse_lock_activity(frame)
     assert isinstance(activity, LockActivity)
     assert activity.status is LockStatus.UNLOCKED
-    assert activity.source is LockOperationSource.PIN
+    assert activity.source is None
     assert activity.slot == slot
-    assert activity.remote_type is None
     assert int(activity.timestamp.timestamp()) == int.from_bytes(
         frame[0x05:0x09], "little"
     )
 
 
-def test_parse_keypad_lock_button_and_end_marker() -> None:
-    """The keypad lock button is a type 0x00 record and 0x80 ends the log."""
-    lock = _make_lock()
-    activity = lock._parse_lock_activity(KEYPAD_LOCK_BUTTON)
+@pytest.mark.parametrize(
+    ("frame", "source", "status"),
+    [
+        (KEYPAD_LOCK_BUTTON, OpCode.ONE_TOUCH, LockStatus.LOCKED),
+        (AUTO_RELOCK_LOCKED, OpCode.AUTO_RELOCK, LockStatus.LOCKED),
+        (INSIDE_BUTTON_LOCKED, OpCode.INSIDE_BUTTON, LockStatus.LOCKED),
+        (DOOR_STATE_CHANGED_SLOT_255, OpCode.DOOR_STATE_CHANGED, LockStatus.LOCKED),
+    ],
+    ids=["one-touch", "auto-relock", "inside-button", "door-state-changed-slot-255"],
+)
+def test_a_lock_record_has_its_op_code_as_source_and_no_slot(
+    frame: bytes, source: OpCode, status: LockStatus
+) -> None:
+    """Captured type 0x00 records give their opCode as source and no slot."""
+    activity = _make_lock()._parse_lock_activity(frame)
     assert isinstance(activity, LockActivity)
-    assert activity.status is LockStatus.LOCKED
-    assert activity.source is LockOperationSource.PIN
+    assert activity.status is status
+    assert activity.source is source
     assert activity.slot is None
-    assert lock._parse_lock_activity(END_OF_LOG) is None
+    assert not hasattr(activity, "remote_type")
+    assert int(activity.timestamp.timestamp()) == int.from_bytes(
+        frame[0x08:0x0C], "little"
+    )
+
+
+def test_the_end_marker_decodes_to_nothing() -> None:
+    """A type 0x80 record ends the log and decodes to nothing."""
+    assert _make_lock()._parse_lock_activity(END_OF_LOG) is None
+
+
+def test_a_lock_record_keeps_an_op_code_with_no_name() -> None:
+    """A type 0x00 record whose opCode has no OpCode member keeps the value."""
+    # Built: the captured lock-button record with opCode 0x0D.
+    frame = _with_byte(KEYPAD_LOCK_BUTTON, 0x05, 0x0D)
+    activity = _make_lock()._parse_lock_activity(frame)
+    assert isinstance(activity, LockActivity)
+    assert activity.source == 13
+    assert type(activity.source) is int
+
+
+def test_op_code_holds_the_vendor_table() -> None:
+    """OpCode holds the vendor's opCode table, with no member for 0x0D or 0x16."""
+    assert {member.name: member.value for member in OpCode} == {
+        "DOOR_STATE_CHANGED": 0x00,
+        "DOOR_MANUAL_STATE_CHANGE": 0x01,
+        "KNOCK_RECEIVED": 0x02,
+        "BLUETOOTH_RECEIVED": 0x03,
+        "ANOMALY": 0x04,
+        "AUTO_RELOCK": 0x05,
+        "AUTO_RETRY": 0x06,
+        "OVER_TEMP": 0x07,
+        "BURN_IN": 0x08,
+        "HOME_KIT": 0x09,
+        "Z_WAVE": 0x0A,
+        "ONE_TOUCH": 0x0B,
+        "INSIDE_BUTTON": 0x0C,
+        "DOOR_SENSE": 0x0E,
+        "LOW_BAT_AUTO_UNLOCK": 0x0F,
+        "ESCAPE_UNLOCK": 0x10,
+        "UWB": 0x11,
+        "EXTERNAL_MODULE_OPERATION": 0x12,
+        "SHABBAT_MODE": 0x13,
+        "SCHEDULED_OPERATION": 0x14,
+        "MATTER": 0x15,
+        "DOUBLE_PRESS": 0x17,
+        "ALIRO": 0x18,
+        "UNDEFINED": 0xFF,
+    }
+    assert "OpCode" in yalexs_ble.__all__
 
 
 def _activity_lock(frames: list[bytes | Exception]) -> tuple[Lock, AsyncMock]:

@@ -29,7 +29,6 @@ from yalexs_ble.const import (
     DoorStatus,
     LockActivity,
     LockInfo,
-    LockOperationSource,
     LockState,
     LockStatus,
     OperationError,
@@ -3853,9 +3852,7 @@ async def _run_update(push_lock: PushLock, mock_lock: MagicMock) -> None:
 
 
 def _unlock(slot: int) -> LockActivity:
-    return LockActivity(
-        datetime(2026, 1, 1), LockStatus.UNLOCKED, LockOperationSource.PIN, slot=slot
-    )
+    return LockActivity(datetime(2026, 1, 1), LockStatus.UNLOCKED, None, slot=slot)
 
 
 @pytest.mark.asyncio

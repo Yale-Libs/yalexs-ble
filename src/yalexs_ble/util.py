@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from asyncio import timeout as asyncio_timeout  # noqa: F401
 from dataclasses import dataclass
+from enum import IntEnum
+from typing import TypeVar
 
 from bleak import BleakError
 from bleak.backends.device import BLEDevice
@@ -11,6 +13,8 @@ from bleak.backends.scanner import AdvertisementData
 from .const import RESPONSE_FRAME_LEN
 
 UNIQUE_LOCAL_NAME_LEN = 7
+
+_EnumT = TypeVar("_EnumT", bound=IntEnum)
 
 
 def _require_frame_length(buf: bytes | bytearray) -> None:
@@ -32,6 +36,17 @@ def _simple_checksum(buf: bytes | bytearray) -> int:
 def _bytes_to_int(buffer: bytes | bytearray) -> int:
     """Convert a byte buffer to an integer."""
     return int.from_bytes(buffer, byteorder="little", signed=False)
+
+
+def _named(enum: type[_EnumT], value: int) -> _EnumT | int:
+    """Return the member of enum for value, or value when enum has none.
+
+    An unnamed value is returned unchanged, so the decoded record keeps it.
+    """
+    try:
+        return enum(value)
+    except ValueError:
+        return value
 
 
 def _int_to_bytes(value: int, length: int) -> bytes:
