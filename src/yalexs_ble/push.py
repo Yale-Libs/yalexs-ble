@@ -929,6 +929,8 @@ class PushLock:
             self._next_disconnect_delay = self._idle_disconnect_delay
             self._reset_disconnect_timer()
             self._seen_this_session.clear()
+            if self._lock_info is not None and self._lock_info.battery_from_activity:
+                self._activity_drain_pending = True
             # None of the auto lock read state is reset here: the backoff timers,
             # both failure counts, and the pending-response flag all persist
             # across reconnects, so the hold outlives the connection.
@@ -1376,7 +1378,10 @@ class PushLock:
         """Mark an operation as complete and reset timers."""
         self._last_operation_complete_time = now
         self._clear_reconnect_backoff()
-        if self._activity_callbacks and not self._activity_primed:
+        if not self._activity_primed and (
+            self._activity_callbacks
+            or (self._lock_info is not None and self._lock_info.battery_from_activity)
+        ):
             # A lock operation cancelled any pending update, the priming one included.
             self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
         self._reset_disconnect_timer()
@@ -1528,7 +1533,7 @@ class PushLock:
         assert self._lock_info is not None  # nosec
         if not self._lock_info.battery_reporting:
             _LOGGER.debug(
-                "%s: Needs battery workaround model %s",
+                "%s: Skipping GATT battery request for model %s",
                 self.name,
                 self._lock_info.model,
             )
@@ -1793,11 +1798,24 @@ class PushLock:
             self._reschedule_next_keep_alive()
 
     def _activity_drain_due(self) -> bool:
-        """True when a registered consumer is owed a drain and no backoff holds it."""
+        """True when activity or battery needs a drain and no backoff holds it."""
+        now = time.monotonic()
+        battery_from_activity = (
+            self._lock_info is not None and self._lock_info.battery_from_activity
+        )
         return bool(
-            self._activity_callbacks
-            and self._activity_drain_pending
-            and time.monotonic() >= self._earliest_activity_drain_time
+            (self._activity_callbacks or battery_from_activity)
+            and (
+                self._activity_drain_pending
+                or (
+                    battery_from_activity
+                    and (
+                        not self._activity_primed
+                        or now >= self._next_battery_refresh_time
+                    )
+                )
+            )
+            and now >= self._earliest_activity_drain_time
         )
 
     async def _poll_activity(self, lock: Lock, *, first_update: bool) -> bool:
@@ -1818,6 +1836,11 @@ class PushLock:
         """
         # Consumed before the await so a change during the drain is kept.
         self._activity_drain_pending = False
+        if self._lock_info is not None and self._lock_info.battery_from_activity:
+            # Empty logs must wait too, rather than being read on every update.
+            self._next_battery_refresh_time = (
+                time.monotonic() + BATTERY_REFRESH_INTERVAL
+            )
         records = 0
         try:
             async for activity in lock.drain_lock_activity():

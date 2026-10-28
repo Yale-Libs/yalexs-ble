@@ -26,6 +26,7 @@ HAP_ENCRYPTED_FIRST_BYTE = 0x11
 RESPONSE_FRAME_LEN = 0x12
 
 
+DEVICE_NAME_CHARACTERISTIC = "00002a00-0000-1000-8000-00805f9b34fb"
 MANUFACTURER_NAME_CHARACTERISTIC = "00002a29-0000-1000-8000-00805f9b34fb"
 MODEL_NUMBER_CHARACTERISTIC = "00002a24-0000-1000-8000-00805f9b34fb"
 SERIAL_NUMBER_CHARACTERISTIC = "00002a25-0000-1000-8000-00805f9b34fb"
@@ -35,12 +36,17 @@ FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 # such as "SL-103-EU", so the tables match an entry or a suffixed variant.
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
 
-# With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these exclusions
-NO_BATTERY_SUPPORT_MODELS = {
+# These models cannot answer GATT battery requests; this does not imply
+# activity battery support, which is selected by device name.
+NO_GATT_BATTERY_SUPPORT_MODELS = {
     "SL-103",  # Linus L2
     "CERES",  # Smart code handle
     "Yale Linus L2",  # Linus L2 Nordic
 }
+
+# GATT models can identify Bluetooth modules shared by different lock products.
+# Use verified device names for this activity format and battery discharge curve.
+ACTIVITY_BATTERY_DEVICE_NAMES = {"Yale Durus"}
 
 
 # Slot reported for unlocks with the keypad master (programming) code, which
@@ -195,10 +201,16 @@ class LockActivityType(Enum):
     NONE = 0x80
 
 
+class BatterySource(Enum):
+    GATT = "gatt"
+    LOG = "log"
+
+
 @dataclass
 class BatteryState:
     voltage: float
     percentage: int
+    source: BatterySource = BatterySource.GATT
 
 
 @dataclass
@@ -274,6 +286,12 @@ class LockInfo:
     model: str
     serial: str
     firmware: str
+    device_name: str | None = None
+
+    @property
+    def battery_from_activity(self) -> bool:
+        """Check if battery voltage is carried in the activity log."""
+        return self.device_name in ACTIVITY_BATTERY_DEVICE_NAMES
 
     @property
     def door_sense(self) -> bool:
@@ -282,8 +300,10 @@ class LockInfo:
 
     @property
     def battery_reporting(self) -> bool:
-        """Check if the lock answers battery status requests."""
-        return not self._model_in(NO_BATTERY_SUPPORT_MODELS)
+        """Check if the lock answers GATT battery status requests."""
+        return not self.battery_from_activity and not self._model_in(
+            NO_GATT_BATTERY_SUPPORT_MODELS
+        )
 
     def _model_in(self, models: set[str]) -> bool:
         """True for a listed model or a suffixed variant of one, not a longer number."""

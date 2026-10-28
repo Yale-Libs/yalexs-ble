@@ -18,9 +18,11 @@ from bleak_retry_connector import (
 
 from . import util
 from .const import (
+    DEVICE_NAME_CHARACTERISTIC,
     FIRMWARE_REVISION_CHARACTERISTIC,
     MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
+    RESPONSE_FRAME_LEN,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_OPERATION_REMOTE_TYPE,
@@ -29,6 +31,7 @@ from .const import (
     VALUE_TO_OPERATION_ERROR,
     AutoLockMode,
     AutoLockState,
+    BatterySource,
     BatteryState,
     Commands,
     DoorActivity,
@@ -378,6 +381,13 @@ class Lock:
         raise BleakError(f"Missing characteristic {char_uuid}")
 
     def _parse_state(self, state: bytes) -> Iterable[LockStateValue] | None:
+        if (
+            len(state) >= 2
+            and state[0] == 0xBB
+            and state[1] == Commands.LOCK_ACTIVITY.value
+        ):
+            battery = self._parse_lock_activity_battery(state)
+            return [battery] if battery is not None else ()
         if state[0] in (0xAA, 0xBB) and state[1] in NO_STATE_OPCODES:
             return ()  # Answered to the waiting command; carries no state
         if state[0] == 0xBB:
@@ -510,6 +520,7 @@ class Lock:
             MODEL_NUMBER_CHARACTERISTIC,
             SERIAL_NUMBER_CHARACTERISTIC,
             FIRMWARE_REVISION_CHARACTERISTIC,
+            DEVICE_NAME_CHARACTERISTIC,
         )
         results: dict[str, str] = {}
         # Retried once: an empty model reads as no door sense, and the
@@ -576,6 +587,7 @@ class Lock:
             model=results.get(MODEL_NUMBER_CHARACTERISTIC, ""),
             serial=results.get(SERIAL_NUMBER_CHARACTERISTIC, serial_fallback),
             firmware=results.get(FIRMWARE_REVISION_CHARACTERISTIC, "Unknown"),
+            device_name=results.get(DEVICE_NAME_CHARACTERISTIC) or None,
         )
         return self._lock_info
 
@@ -1062,6 +1074,25 @@ class Lock:
             )
         _LOGGER.debug("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
+
+    def _parse_lock_activity_battery(self, response: bytes) -> BatteryState | None:
+        """Decode pack millivolts from a supported LOCK activity record."""
+        if (
+            len(response) != RESPONSE_FRAME_LEN
+            or self._lock_info is None
+            or not self._lock_info.battery_from_activity
+            or response[0x04] != LockActivityType.LOCK.value
+        ):
+            return None
+        millivolts = int.from_bytes(response[0x0C:0x0E], "little")
+        if not 4000 <= millivolts <= 8000:
+            return None
+        voltage = millivolts / 1000
+        percentage = convert_voltage_to_percentage(voltage / 4)
+        _LOGGER.debug(
+            "%s: Activity battery: %.3f V, %d%%", self.name, voltage, percentage
+        )
+        return BatteryState(voltage, percentage, BatterySource.LOG)
 
     async def _read_lock_activity_response(self) -> bytes:
         """Pop the oldest record from the lock's activity log."""
