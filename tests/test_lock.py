@@ -2,7 +2,6 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable, Iterable
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,10 +16,9 @@ from yalexs_ble.const import (
     KEYPAD_MASTER_CODE_SLOT,
     MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
+    RESPONSE_FRAME_LEN,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
-    AutoLockMode,
-    AutoLockState,
     BatteryState,
     Commands,
     DoorActivity,
@@ -32,7 +30,6 @@ from yalexs_ble.const import (
     LockStateValue,
     LockStatus,
     OperationError,
-    SettingType,
     StatusType,
 )
 from yalexs_ble.lock import (
@@ -403,13 +400,22 @@ def test_parse_unknown_error_code_is_jammed_and_logs_unknown(
     assert "unknown" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "frame",
+    [
+        # Constructed frames.
+        bytes.fromhex("cc00000000000000000000000000000000"),
+        bytes.fromhex("bb0500000000000000000000000000000000"),
+        bytes.fromhex("aa2e00282800000000000000000000000200"),
+    ],
+    ids=["unhandled-0xcc-flag", "unhandled-0xbb-opcode", "unhandled-0xaa-opcode"],
+)
 def test_parse_bogus_frame_is_none_and_logs_unknown(
-    caplog: pytest.LogCaptureFixture,
+    frame: bytes, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A frame with an unrecognized flag byte is not recognized and still logs."""
+    """_parse_state returns None for a frame it does not handle, logged as unknown."""
     lock = _make_lock()
 
-    frame = bytes.fromhex("cc00000000000000000000000000000000")
     with caplog.at_level("INFO", logger="yalexs_ble.lock"):
         assert lock._parse_state(frame) is None
         lock._internal_state_callback(frame)
@@ -450,259 +456,27 @@ def _make_lock(
     )
 
 
-def test_parse_auto_lock_state_timed_from_wire() -> None:
-    """Real capture: both uint16 timers set to 1800 -> Timed 30 min.
-
-    Front Door READSETTING response, YUR/DEL fw 2.1.0 (2026-07-05 capture).
-    """
-    lock = _make_lock()
-    response = bytes.fromhex("bb0400fb2800000008070807000000000000")
-    result = lock._parse_auto_lock_state(response)
-    assert result == AutoLockState(AutoLockMode.TIMER, 1800)
-
-
-def test_parse_auto_lock_state_off_from_wire() -> None:
-    """Real capture: all-zero setting value -> auto-lock off.
-
-    Back Door READSETTING response (2026-07-05 capture).
-    """
-    lock = _make_lock()
-    response = bytes.fromhex("bb0400192800000000000000000000000000")
-    result = lock._parse_auto_lock_state(response)
-    assert result == AutoLockState(AutoLockMode.OFF, 0)
-
-
-def test_parse_auto_lock_state_old_encoding_reads_user_value() -> None:
-    """A value written by a release before the two-timer encoding -> Timed 30.
-
-    Earlier releases stored the user's seconds in the never-opened timer and a
-    fixed 90 in the door-close timer, so Timed(30) was written as 1e 00 5a 00.
-    The decode reports the never-opened timer, so the value reads back as set.
-    """
-    lock = _make_lock()
-    response = bytes(8) + bytes.fromhex("1e005a00")
-    result = lock._parse_auto_lock_state(response)
-    assert result == AutoLockState(AutoLockMode.TIMER, 30)
-
-
-def test_parse_auto_lock_state_zero_never_opened_falls_back() -> None:
-    """A zero never-opened timer falls back to the door-close timer.
-
-    Synthetic value exercising the branch; not a captured device value.
-    """
-    lock = _make_lock()
-    response = bytes(8) + bytes.fromhex("00005a00")
-    result = lock._parse_auto_lock_state(response)
-    assert result == AutoLockState(AutoLockMode.TIMER, 90)
-
-
-def test_parse_auto_lock_state_instant_never_opened_only() -> None:
-    """Derivation branch: never-opened timer set, door-close timer zero -> Instant.
-
-    Synthetic value exercising the branch; not a captured device value.
-    """
-    lock = _make_lock()
-    response = bytes(8) + (0x0005).to_bytes(4, "little")
-    result = lock._parse_auto_lock_state(response)
-    assert result == AutoLockState(AutoLockMode.INSTANT, 5)
-
-
-class _CommandCaptureSession:
-    """Minimal Session stand-in that captures executed commands.
-
-    build_operation_command mirrors Session's 18-byte frame layout
-    (EE, opcode, cmd byte at [4], ClearText trailer marker at [16]).
-    """
-
-    def __init__(self) -> None:
-        self.sent: list[bytearray] = []
-
-    def build_operation_command(self, opcode: int, cmd_byte: int) -> bytearray:
-        cmd = bytearray(0x12)
-        cmd[0x00] = 0xEE
-        cmd[0x01] = opcode
-        cmd[0x04] = cmd_byte
-        cmd[0x10] = 0x02
-        return cmd
-
-    async def execute(
-        self,
-        command: bytearray,
-        command_name: str,
-        response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
-        self.sent.append(command)
-        return b""
-
-
-def _lock_with_session(session: Any) -> Lock:
-    """A Lock wired as connected over the given session stand-in."""
-    lock = _make_lock()
-    lock.session = session
-    lock.secure_session = MagicMock()
-    lock.client = MagicMock(is_connected=True)
-    return lock
-
-
-async def _set_auto_lock_payload(mode: AutoLockMode, duration: int) -> bytearray:
-    """Run set_auto_lock against a capture session; return the sent command."""
-    session = _CommandCaptureSession()
-    lock = _lock_with_session(session)
-    await lock.set_auto_lock(mode, duration)
-    assert len(session.sent) == 1
-    return session.sent[0]
-
-
-@pytest.mark.asyncio
-async def test_set_auto_lock_timed_encodes_seconds_in_both_timers() -> None:
-    """Timed(1800) -> both uint16 timers = 1800 -> [8:12] = 08 07 08 07."""
-    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 1800)
-    assert cmd[0x01] == Commands.WRITESETTING.value
-    assert cmd[0x04] == 0x28  # auto-lock setting id
-    assert cmd[0x08:0x0C] == bytes.fromhex("08070807")
-
-
-@pytest.mark.asyncio
-async def test_set_auto_lock_instant_encodes_never_opened_only() -> None:
-    """Instant(5) -> never-opened timer = 5, door-close 0 -> [8:12] = 05 00 00 00."""
-    cmd = await _set_auto_lock_payload(AutoLockMode.INSTANT, 5)
-    assert cmd[0x08:0x0C] == bytes.fromhex("05000000")
-
-
-@pytest.mark.asyncio
-async def test_set_auto_lock_off_encodes_zero() -> None:
-    """Off -> value = 0 regardless of the duration argument."""
-    cmd = await _set_auto_lock_payload(AutoLockMode.OFF, 1800)
-    assert cmd[0x08:0x0C] == bytes(4)
-
-
-@pytest.mark.asyncio
-async def test_set_auto_lock_duration_out_of_range_raises() -> None:
-    """Durations must fit a uint16 timer; 0xFFFF+ is rejected (app rule 1-65534)."""
-    with pytest.raises(ValueError, match="out of range"):
-        await _set_auto_lock_payload(AutoLockMode.TIMER, 0xFFFF)
-
-
-@pytest.mark.asyncio
-async def test_set_auto_lock_round_trips_through_decode() -> None:
-    """A value we write, echoed back by the lock, decodes to what we set."""
-    lock = _make_lock()
-    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 1800)
-    echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
-    assert lock._parse_auto_lock_state(echoed) == AutoLockState(
-        AutoLockMode.TIMER, 1800
-    )
-
-
-@pytest.mark.asyncio
-async def test_set_auto_lock_timed_accepts_upper_bound() -> None:
-    """Timed(0xFFFE) is the largest accepted duration.
-
-    Both uint16 timers take the seconds, so [8:12] = fe ff fe ff.
-    """
-    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 0xFFFE)
-    assert cmd[0x08:0x0C] == bytes.fromhex("fefffeff")
-
-
-@pytest.mark.asyncio
-async def test_set_auto_lock_timed_zero_duration_encodes_off_shape() -> None:
-    """Timed with a zero duration collapses to the off shape: an all-zero value."""
-    cmd = await _set_auto_lock_payload(AutoLockMode.TIMER, 0)
-    assert cmd[0x08:0x0C] == bytes(4)
-
-
-@pytest.mark.asyncio
-async def test_auto_lock_status_issues_read() -> None:
-    """auto_lock_status sends a READSETTING for the auto-lock setting.
-
-    The wait completes on the acknowledgment, which carries no value, so the
-    method returns nothing; the stored setting arrives later as a settings
-    response on the notify path.
-    """
-    session = _CommandCaptureSession()
-    lock = _lock_with_session(session)
-    await lock.auto_lock_status()
-    assert len(session.sent) == 1
-    assert session.sent[0][0x01] == Commands.READSETTING.value
-    assert session.sent[0][0x04] == SettingType.AUTOLOCK.value
-
-
-@pytest.mark.asyncio
-async def test_set_auto_lock_instant_round_trips_through_decode() -> None:
-    """Instant(5), encoded then decoded, returns Instant(5)."""
-    lock = _make_lock()
-    cmd = await _set_auto_lock_payload(AutoLockMode.INSTANT, 5)
-    echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
-    assert lock._parse_auto_lock_state(echoed) == AutoLockState(AutoLockMode.INSTANT, 5)
-
-
-@pytest.mark.asyncio
-async def test_set_auto_lock_off_round_trips_through_decode() -> None:
-    """Off, encoded then decoded, returns Off with a zero duration."""
-    lock = _make_lock()
-    cmd = await _set_auto_lock_payload(AutoLockMode.OFF, 0)
-    echoed = bytes([0xBB, 0x04, 0x00, 0x00, 0x28, 0, 0, 0]) + bytes(cmd[0x08:0x0C])
-    assert lock._parse_auto_lock_state(echoed) == AutoLockState(AutoLockMode.OFF, 0)
-
-
-def test_parse_state_readsetting_ack_ignored() -> None:
-    """The READSETTING (0x04) transport ACK carries no state -> recognized, ignored.
-
-    Real ACK frame for an auto-lock READSETTING (2026-07-05 capture); must return
-    an empty iterable (not None), so it is never logged as an unknown frame.
-    """
-    lock = _make_lock()
-    ack = bytes.fromhex("aa0400282800000000000000000000000200")
-    assert lock._parse_state(ack) == ()
-
-
-def test_parse_state_writesetting_ack_ignored() -> None:
-    """The WRITESETTING (0x03) transport ACK carries no state -> recognized, ignored.
-
-    Real ACK frame for an auto-lock write of Timed(90) (2026-07-16 capture); the
-    stored value is echoed at [8:12] but the frame is only the acknowledgment --
-    the authoritative value is the 0xBB settings response that follows.
-    """
-    lock = _make_lock()
-    ack = bytes.fromhex("aa030075280000005a005a00000000000200")
-    assert lock._parse_state(ack) == ()
-
-
-def test_parse_state_ack_for_other_opcode_is_unknown() -> None:
-    """ACK recognition is scoped to the settings opcodes.
-
-    An 0xAA frame for an opcode with no ack decode falls through to None, so a
-    new acknowledgment type still surfaces as an unknown frame. LOCK_ACTIVITY
-    carries no state on either flag, so its ack is recognised and ignored.
-    """
-    lock = _make_lock()
-    ack = bytes.fromhex("aa2d00282800000000000000000000000200")
-    assert lock._parse_state(ack) == ()
-    unknown = bytes.fromhex("aa2e00282800000000000000000000000200")
-    assert lock._parse_state(unknown) is None
+# Captured settings frames, each with setting id 0x28 at byte 4.
+SETTINGS_READ_ACK = bytes.fromhex("aa0400282800000000000000000000000200")
+SETTINGS_READ_RESPONSE = bytes.fromhex("bb0400fb2800000008070807000000000000")
+SETTINGS_WRITE_ACK = bytes.fromhex("aa030075280000005a005a00000000000200")
+SETTINGS_WRITE_RESPONSE = bytes.fromhex("bb030066280000005a005a00000000000000")
 
 
 def test_settings_response_matcher_takes_value_frame_not_ack() -> None:
-    """The matcher keys on 0xBB + the settings opcode + the setting id.
-
-    All frames verbatim from the 2026-07-16 field capture: a settings command
-    is answered by an 0xAA acknowledgment ~40 ms before the 0xBB value frame,
-    and the acknowledgment's zero value field decodes as auto-lock off.
-    """
+    """The matcher takes the 0xBB frame with its opcode and setting id and no other."""
     write_matcher = _settings_response_matcher(
-        Commands.WRITESETTING.value, SettingType.AUTOLOCK.value
+        Commands.WRITESETTING.value, SETTINGS_WRITE_RESPONSE[0x04]
     )
-
-    read_response = bytes.fromhex("bb0400fb2800000008070807000000000000")
-    write_ack = bytes.fromhex("aa030075280000005a005a00000000000200")
-    write_response = bytes.fromhex("bb030066280000005a005a00000000000000")
+    other_id_matcher = _settings_response_matcher(Commands.WRITESETTING.value, 0x9E)
     battery_answer = bytes.fromhex("bb0200a50f00000079140000000000000200")
 
-    assert write_matcher(write_response)
-    assert not write_matcher(write_ack)
-    assert not write_matcher(read_response)  # wrong opcode for the write
+    assert write_matcher(SETTINGS_WRITE_RESPONSE)
+    assert not write_matcher(SETTINGS_WRITE_ACK)
+    assert not write_matcher(SETTINGS_READ_RESPONSE)  # wrong opcode for the write
     assert not write_matcher(battery_answer)
-    assert not write_matcher(write_response[:4])  # truncated below the setting id
+    assert not write_matcher(SETTINGS_WRITE_RESPONSE[:4])  # truncated below byte 4
+    assert not other_id_matcher(SETTINGS_WRITE_RESPONSE)
 
 
 _CHAR_DATA: dict[str, bytes] = {
@@ -1165,32 +939,6 @@ async def test_a_lock_activity_poll_is_not_answered_by_a_status_frame() -> None:
     assert activity.status is DoorStatus.CLOSED
 
 
-@pytest.mark.asyncio
-async def test_the_auto_lock_read_completes_on_its_acknowledgment() -> None:
-    """The auto lock read must stay untyped: its 0xAA acknowledgment ends it.
-
-    It is the one poll deliberately left out of the typed set, so that a lock
-    with no auto lock support answers the command and the read moves on rather
-    than holding the wait open for the full response timeout. A matcher here
-    would wait for a 0xBB such a lock never sends.
-    """
-    lock, session = _connected_lock()
-    ack = _with_checksum("aa0400002800000000000000000000000000")
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        # The read arms no matcher, which is the exemption itself.
-        assert session._notify_matcher is None
-        session._notify(0, bytearray(ack))
-        # Checked here rather than after the call returns: _locked_write
-        # disarms the wait in a finally, so by then it is clear whatever ended
-        # it, and only the acknowledgment can have ended it at this point.
-        assert session._notify_future is None
-
-    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-
-    await lock.auto_lock_status()
-
-
 GET_200_PIN = bytes.fromhex("bb39004ec800135790ffffffff0000000000")
 GET_200_EMPTY = bytes.fromhex("bb39004bc800ffffffffffffff0000000000")
 GET_1_NOSPACE = bytes.fromhex("bb3900000100000000000000000000070000")
@@ -1207,32 +955,37 @@ def _result(opcode: int, error: int = 0, slot: int = 0) -> bytes:
     return bytes(frame)
 
 
-class _KeycodeSession(_CommandCaptureSession):
-    """Command capture that replays canned results through the real matcher."""
+class _KeycodeSession:
+    """Session stand-in that records commands and replays canned frames.
+
+    Each replayed frame is asserted to pass the command's matcher.
+    """
 
     def __init__(self, responses: list[bytes]) -> None:
-        super().__init__()
+        self.sent: list[bytearray] = []
         self.responses = responses
 
-    def build_command(self, opcode: int) -> bytearray:
-        return self.build_operation_command(opcode, 0)
+    build_command = Session.build_command
 
     async def execute(
         self,
         command: bytearray,
         command_name: str,
-        response_matcher: Callable[[bytes], bool] | None = None,
+        response_matcher: Callable[[bytes], bool],
     ) -> bytes:
         self.sent.append(command)
         response = self.responses.pop(0)
-        assert response_matcher is not None
         assert response_matcher(response)
         return response
 
 
 def _keycode_lock(responses: list[bytes]) -> tuple[Lock, _KeycodeSession]:
     session = _KeycodeSession(responses)
-    return _lock_with_session(session), session
+    lock = _make_lock()
+    lock.session = session  # type: ignore[assignment]
+    lock.secure_session = MagicMock()
+    lock.client = MagicMock(is_connected=True)
+    return lock, session
 
 
 SET_KEYCODE_STEPS = (0x28, 0x27, 0x2B, 0x2C)
@@ -1352,10 +1105,20 @@ async def test_set_keycode_pin_validation(pin: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_keycode_operations_require_a_connection() -> None:
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("get_keycode", (1,)),
+        ("get_parameter", (0xB2,)),
+        ("set_parameter", (0xB2, 30)),
+    ],
+)
+async def test_lock_commands_require_a_connection(
+    method: str, args: tuple[int, ...]
+) -> None:
     lock = _make_lock()
     with pytest.raises(DisconnectedError):
-        await lock.get_keycode(1)
+        await getattr(lock, method)(*args)
 
 
 def test_encode_decode_keycode_pin() -> None:
@@ -1387,15 +1150,25 @@ def test_keycode_get_matcher_requires_the_echoed_slot() -> None:
     assert not matches(bytes.fromhex("aa39004ec800000000000000000000000200"))
 
 
-@pytest.mark.parametrize("opcode", [0x27, 0x28, 0x2B, 0x2C, 0x39, 0x2D])
-@pytest.mark.parametrize("flag", [0xBB, 0xAA])
-def test_keycode_frames_produce_no_state(opcode: int, flag: int) -> None:
+@pytest.mark.parametrize(
+    "frame",
+    [
+        # Constructed keycode, activity log, and settings frames on either flag.
+        *(
+            bytes([flag]) + _result(opcode, 0x06, 200)[1:]
+            for opcode in (0x27, 0x28, 0x2B, 0x2C, 0x39, 0x2D, 0x04, 0x03)
+            for flag in (0xBB, 0xAA)
+        ),
+        SETTINGS_READ_ACK,
+        SETTINGS_WRITE_ACK,
+    ],
+    ids=bytes.hex,
+)
+def test_no_state_frames_produce_no_state(frame: bytes) -> None:
     received: list[object] = []
     lock = _make_lock(received.append)
-    frame = bytearray(_result(opcode, 0x06, 200))
-    frame[0] = flag
-    assert lock._parse_state(bytes(frame)) == ()
-    lock._internal_state_callback(bytes(frame))
+    assert lock._parse_state(frame) == ()
+    lock._internal_state_callback(frame)
     assert received == []
 
 
@@ -1899,3 +1672,174 @@ def test_op_response_callback_fires_on_op_responses_not_acks() -> None:
     lock._parse_state(_op_response_frame(Commands.UNLOCK, OperationError.MECH_POSITION))
 
     assert op_calls == [1, 1]
+
+
+def _settings_frame(opcode: int, parameter: int, value: int) -> bytes:
+    """Build the 0xBB settings response with the opcode, the id, and the value."""
+    frame = bytearray(RESPONSE_FRAME_LEN)
+    frame[0x00] = 0xBB
+    frame[0x01] = opcode
+    frame[0x04] = parameter
+    frame[0x08:0x0C] = value.to_bytes(4, "little")
+    frame[0x03] = _simple_checksum(frame)
+    return bytes(frame)
+
+
+def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
+    """Deliver frames on the notify path when the command is written."""
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        for frame in frames:
+            session._notify(0, bytearray(frame))
+
+    return AsyncMock(side_effect=deliver)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args", "frames", "value", "states"),
+    [
+        pytest.param(
+            "get_parameter",
+            (0x28,),
+            [SETTINGS_READ_ACK, SETTINGS_READ_RESPONSE],
+            0x07080708,
+            [],
+            id="read-ack-then-answer",
+        ),
+        pytest.param(
+            "set_parameter",
+            (0x28, 0x005A005A),
+            [
+                SETTINGS_WRITE_ACK,
+                _settings_frame(Commands.WRITESETTING.value, 0x28, value=5),
+            ],
+            5,
+            [],
+            id="write-ack-then-answer-reporting-another-value",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            [_settings_frame(Commands.READSETTING.value, 0xB2, value=30)],
+            30,
+            [],
+            id="read-lone-answer",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            [
+                _settings_frame(Commands.READSETTING.value, 0x84, value=4000),
+                _settings_frame(Commands.READSETTING.value, 0xB2, value=30),
+            ],
+            30,
+            [],
+            id="read-answer-for-another-id-first",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            [
+                # Constructed status push reporting UNLOCKED.
+                _with_checksum("bb0200000200000003000000000000000000"),
+                _settings_frame(Commands.READSETTING.value, 0xB2, value=30),
+            ],
+            30,
+            [[LockStatus.UNLOCKED]],
+            id="read-status-push-first",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            [
+                # Constructed failure op-response, MECH_POSITION, with no operation
+                # in flight.
+                _with_checksum("bb0b000000000000000000000000001f0000"),
+                _settings_frame(Commands.READSETTING.value, 0xB2, value=30),
+            ],
+            30,
+            [[LockStatus.JAMMED]],
+            id="read-op-response-first",
+        ),
+        pytest.param(
+            "get_parameter",
+            (0xB2,),
+            # Captured answer to a read of a parameter the lock has never stored.
+            [bytes.fromhex("bb04008db20200005aa55aa5000000000200")],
+            0xA55AA55A,
+            [],
+            id="read-never-stored-parameter",
+        ),
+    ],
+)
+async def test_a_parameter_command_completes_on_its_own_bb_frame(
+    method: str,
+    args: tuple[int, ...],
+    frames: list[bytes],
+    value: int,
+    states: list[list[LockStateValue]],
+) -> None:
+    """The command returns the value field of the 0xBB frame with its opcode and id."""
+    received: list[list[LockStateValue]] = []
+    lock, session = _connected_lock(lambda s: received.append(list(s)))
+    session.client.write_gatt_char = _answered_by(session, *frames)
+
+    assert await getattr(lock, method)(*args) == value
+    assert received == states
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parameter", "value", "value_bytes"),
+    [
+        pytest.param(0xB2, 0x80000001, "01000080", id="little-endian"),
+        pytest.param(0x00, 0, "00000000", id="lowest-id-and-value"),
+        pytest.param(0xFF, 0xFFFFFFFF, "ffffffff", id="highest-id-and-value"),
+    ],
+)
+async def test_set_parameter_writes_the_value_little_endian_and_returns_the_answer(
+    parameter: int, value: int, value_bytes: str
+) -> None:
+    """The frame holds the id at byte 4 and the value little-endian at bytes 8 to 11."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = _answered_by(
+        session,
+        _settings_frame(Commands.WRITESETTING.value, parameter, value=value),
+    )
+
+    assert await lock.set_parameter(parameter, value) == value
+
+    (written,) = (
+        call.args[1] for call in session.client.write_gatt_char.await_args_list
+    )
+    assert written[0x00] == 0xEE
+    assert written[0x01] == Commands.WRITESETTING.value
+    assert written[0x04] == parameter
+    assert written[0x08:0x0C] == bytes.fromhex(value_bytes)
+    assert written[0x10] == 0x02
+    assert len(written) == RESPONSE_FRAME_LEN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args", "match"),
+    [
+        ("get_parameter", (-1,), "not an unsigned one-byte value"),
+        ("get_parameter", (0x100,), "not an unsigned one-byte value"),
+        ("set_parameter", (0x100, 30), "not an unsigned one-byte value"),
+        ("set_parameter", (0xB2, -1), "not an unsigned four-byte value"),
+        ("set_parameter", (0xB2, 0x100000000), "not an unsigned four-byte value"),
+    ],
+)
+async def test_parameter_commands_reject_an_argument_the_frame_cannot_hold(
+    method: str, args: tuple[int, ...], match: str
+) -> None:
+    """An argument outside its field raises ValueError and nothing is written."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = AsyncMock()
+
+    with pytest.raises(ValueError, match=match):
+        await getattr(lock, method)(*args)
+
+    session.client.write_gatt_char.assert_not_awaited()
