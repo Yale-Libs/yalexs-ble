@@ -1216,10 +1216,8 @@ class PushLock:
                 lambda lock: lock.set_parameter(parameter, value),
             )
         finally:
-            # A write may change the lock status, which the library does not rely on
-            # a push to report, and a write the lock did not answer may still have
-            # been applied, so every exit makes the next update cycle poll the lock
-            # status.
+            # The library does not rely on a push for a status change a write may make,
+            # and a write the lock did not answer may still have been applied.
             self._force_lock_status_poll = True
 
     @operation_lock
