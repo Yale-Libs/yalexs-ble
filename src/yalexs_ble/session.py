@@ -207,7 +207,7 @@ class Session:
             # levels where the INFO drop line was never emitted.
             raise ResponseError(
                 f"Simple checksum mismatch (expected 0, got {checksum}) "
-                f"in frame {response.hex()}"
+                f"in frame {util._loggable_hex(response)}"
             )
 
         if response[0x00] != 0xBB and response[0x00] != 0xAA:
@@ -256,7 +256,11 @@ class Session:
         # all, so a drop and its evidence are visible without turning debug on,
         # where the frames themselves are logged.
         _LOGGER.log(
-            level, "%s: dropping invalid frame %s: %s", self.name, frame.hex(), ex
+            level,
+            "%s: dropping invalid frame %s: %s",
+            self.name,
+            util._loggable_hex(frame),
+            ex,
         )
         if self._operation_progress is not None:
             # A staged wait never fails on a bad frame; its deadline is the backstop.
@@ -320,7 +324,9 @@ class Session:
             return
         decrypted_data = self.decrypt(data)
         _LOGGER.debug(
-            "%s: Decrypted response via notify: %s", self.name, decrypted_data.hex()
+            "%s: Decrypted response via notify: %s",
+            self.name,
+            util._loggable_hex(decrypted_data),
         )
         try:
             # Runs on every frame, not only while a wait is armed: the state
@@ -452,7 +458,7 @@ class Session:
                     asyncio.CancelledError, asyncio.InvalidStateError
                 ):
                     future.exception()
-        _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
+        _LOGGER.debug("%s: Got response: %s", self.name, util._loggable_hex(result))
         return result
 
     async def _locked_write_operation(
