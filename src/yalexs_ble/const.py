@@ -25,6 +25,10 @@ HAP_ENCRYPTED_FIRST_BYTE = 0x11
 # share this length.
 RESPONSE_FRAME_LEN = 0x12
 
+# When True, a log line that prints a decrypted or plaintext frame masks its
+# keypad code and the checksum that gives away the sum of the code's bytes.
+MASK_SENSITIVE = False
+
 
 MANUFACTURER_NAME_CHARACTERISTIC = "00002a29-0000-1000-8000-00805f9b34fb"
 MODEL_NUMBER_CHARACTERISTIC = "00002a24-0000-1000-8000-00805f9b34fb"
@@ -58,8 +62,13 @@ class Commands(IntEnum):
     KEYCODE_CLEAR = 0x28
     KEYCODE_ACCESS = 0x2B
     KEYCODE_COMMIT = 0x2C
-    LOCK_ACTIVITY = 0x2D
+    GETLOG = 0x2D
     KEYCODE_GET = 0x39
+
+
+# The log_type at byte 4 of the GETLOG reply that ends the log, the vendor's
+# GetLogError record.
+LOG_TYPE_GET_LOG_ERROR = 0x80
 
 
 class OperationError(IntEnum):
@@ -154,7 +163,13 @@ class LockStatus(Enum):
     JAMMED = 0x07  # STATICPOSITION
     UNLATCHING = 0x09
     UNLATCHED = 0x0A
+    INTEGRATED_OTHER_SYSTEM = 0x0B
     SECUREMODE = 0x0C
+    MASTER_CODE_NOT_SET = 0x0D
+    DEFAULT_MASTER_CODE_SET = 0x0E
+    LOCK_NOT_HANDED = 0x0F
+    SHABBAT_MODE = 0x10
+    INTERNAL_FORCED_LOCKED = 0x11
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
@@ -192,7 +207,6 @@ class LockActivityType(Enum):
     KEYPAD_UNLOCK = 0x07
     DOOR = 0x20
     PIN = 0x0E
-    NONE = 0x80
 
 
 @dataclass
@@ -225,35 +239,44 @@ class LockState:
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
 
 
-class LockOperationSource(Enum):
-    REMOTE = 0x00
-    MANUAL = 0x01
-    AUTO_LOCK = 0x05
-    PIN = 0x0B
-    UNKNOWN = 0xFF
+class OpCode(IntEnum):
+    """The opCode at byte 5 of a type 0x00 activity record."""
 
-
-VALUE_TO_LOCK_OPERATION_SOURCE = {
-    status.value: status for status in LockOperationSource
-}
-
-
-class LockOperationRemoteType(Enum):
-    UNKNOWN = 0x00
-    BLE = 0x03
-
-
-VALUE_TO_LOCK_OPERATION_REMOTE_TYPE = {
-    status.value: status for status in LockOperationRemoteType
-}
+    # Based on the vendor's term. Locks have been observed to record a lock or unlock
+    # commanded over BLE with this value.
+    DOOR_STATE_CHANGED = 0x00
+    DOOR_MANUAL_STATE_CHANGE = 0x01
+    KNOCK_RECEIVED = 0x02
+    BLUETOOTH_RECEIVED = 0x03
+    ANOMALY = 0x04
+    AUTO_RELOCK = 0x05
+    AUTO_RETRY = 0x06
+    OVER_TEMP = 0x07
+    BURN_IN = 0x08
+    HOME_KIT = 0x09
+    Z_WAVE = 0x0A
+    ONE_TOUCH = 0x0B
+    INSIDE_BUTTON = 0x0C
+    DOOR_SENSE = 0x0E
+    LOW_BAT_AUTO_UNLOCK = 0x0F
+    ESCAPE_UNLOCK = 0x10
+    UWB = 0x11
+    EXTERNAL_MODULE_OPERATION = 0x12
+    SHABBAT_MODE = 0x13
+    SCHEDULED_OPERATION = 0x14
+    MATTER = 0x15
+    DOUBLE_PRESS = 0x17
+    ALIRO = 0x18
+    UNDEFINED = 0xFF
 
 
 @dataclass
 class LockActivity:
     timestamp: datetime
     status: LockStatus
-    source: LockOperationSource
-    remote_type: LockOperationRemoteType | None = None
+    # source is None for a 0x07 or 0x0E record, which has no opCode byte.
+    # OpCode.DOOR_STATE_CHANGED is 0, so a truth test cannot tell it from None.
+    source: OpCode | int | None
     slot: int | None = None
 
 
