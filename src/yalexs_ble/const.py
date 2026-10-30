@@ -42,6 +42,11 @@ NO_BATTERY_SUPPORT_MODELS = {
     "Yale Linus L2",  # Linus L2 Nordic
 }
 
+SUPPORTED_PRIVACY_MODE_MODELS = {
+    "SL-103",  # Linus L2
+    "Yale Linus L2",  # Linus L2 Nordic
+}
+
 
 # Slot reported for unlocks with the keypad master (programming) code, which
 # is set at the keypad and cannot be read or written over BLE
@@ -141,6 +146,7 @@ class StatusType(IntEnum):
 
 class SettingType(IntEnum):
     AUTOLOCK = 0x28
+    PRIVACY_MODE = 0xBC
 
 
 class LockStatus(Enum):
@@ -155,6 +161,7 @@ class LockStatus(Enum):
     UNLATCHING = 0x09
     UNLATCHED = 0x0A
     SECUREMODE = 0x0C
+    PRIVACY_MODE = 0x10
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
@@ -284,6 +291,11 @@ class LockInfo:
     def battery_reporting(self) -> bool:
         """Check if the lock answers battery status requests."""
         return not self._model_in(NO_BATTERY_SUPPORT_MODELS)
+
+    @property
+    def privacy_mode_supported(self) -> bool:
+        """Check if the lock supports privacy (Shabbat) mode."""
+        return bool(self.model) and self._model_in(SUPPORTED_PRIVACY_MODE_MODELS)
 
     def _model_in(self, models: set[str]) -> bool:
         """True for a listed model or a suffixed variant of one, not a longer number."""

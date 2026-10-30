@@ -152,6 +152,7 @@ POSITION_READINGS = MANUAL_INTERVENTION_STATUSES | {
     LockStatus.UNLOCKED,
     LockStatus.UNLATCHED,
     LockStatus.SECUREMODE,
+    LockStatus.PRIVACY_MODE,
 }
 
 # Statuses the lock reports while the motor runs.
@@ -371,6 +372,7 @@ def retry_bluetooth_connection_error(
 # to both locks.
 _SECURE_FOR_STATUS = {
     LockStatus.SECUREMODE: LockStatus.LOCKED,
+    LockStatus.PRIVACY_MODE: LockStatus.UNLOCKED,
     LockStatus.LOCKING: LockStatus.UNLOCKED,
     LockStatus.LOCKED: LockStatus.UNLOCKED,
     LockStatus.UNLOCKED: LockStatus.UNLOCKED,
@@ -1329,6 +1331,22 @@ class PushLock:
         """Clear a keypad slot."""
         validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
+
+    async def get_privacy_mode(self) -> bool:
+        """Read whether privacy mode (setting 0xBC) is enabled."""
+        return await self._run_on_lock(
+            "get_privacy_mode", lambda lock: lock.get_privacy_mode()
+        )
+
+    async def set_privacy_mode(self, enabled: bool) -> None:
+        """Enable or disable privacy mode (setting 0xBC)."""
+        await self._run_on_lock(
+            "set_privacy_mode", lambda lock: lock.set_privacy_mode(enabled)
+        )
+        # Leaving privacy mode the lock sends only the 0xBB settings frame, not
+        # a fresh status, so re-read lock and door state on the next update.
+        self._seen_this_session.discard(LockStatus)
+        self._seen_this_session.discard(DoorStatus)
 
     @operation_lock
     async def _run_on_lock(
