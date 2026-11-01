@@ -206,7 +206,7 @@ ACTIVITY_PRIME_DELAY = 10.0
 # the log counts as one that never ends rather than a deep backlog.
 ACTIVITY_DRAIN_MAX_OVERRUNS = 8
 
-# Receives each activity log record's 18 bytes and its backlog flag.
+# Receives each decoded activity log record and its backlog flag.
 LogRecordCallback = Callable[[LogRecord, bool], Awaitable[None]]
 
 # How long to wait for the 0xBB settings response after the READSETTING ack
