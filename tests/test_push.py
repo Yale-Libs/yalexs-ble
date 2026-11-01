@@ -1651,8 +1651,10 @@ async def test_disconnect_with_timer_triggers_disconnect_when_idle() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_handle_disconnected_skips_when_connect_in_progress() -> None:
-    """Handle-disconnected returns early when a connect is in progress."""
+async def test_async_handle_disconnected_skips_cleanup_while_connect_lock_held(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Logs only the skip and does not disconnect while the connect lock is held."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:09",
         key="0800200c9a66",
@@ -1667,16 +1669,22 @@ async def test_async_handle_disconnected_skips_when_connect_in_progress() -> Non
             patch.object(
                 push_lock, "_execute_disconnect", new_callable=AsyncMock
             ) as mock_disconnect,
+            caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
         ):
             await push_lock._async_handle_disconnected(RuntimeError("boom"))
 
     mock_cancel.assert_not_called()
     mock_disconnect.assert_not_called()
+    assert [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if r.name == "yalexs_ble.push"
+    ] == [(logging.DEBUG, "Test Lock: Connect lock held, skipping cleanup")]
 
 
 @pytest.mark.asyncio
 async def test_async_handle_disconnected_executes_disconnect_when_idle() -> None:
-    """Handle-disconnected runs full cleanup when no connect is in progress."""
+    """Cancels the disconnect timer and disconnects while the connect lock is free."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:0a",
         key="0800200c9a66",
@@ -1695,6 +1703,66 @@ async def test_async_handle_disconnected_executes_disconnect_when_idle() -> None
 
     mock_cancel.assert_called_once()
     mock_disconnect.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_attempt_of_a_retried_call_logs_its_cleanup_then_disconnects(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A retried call's failed attempt logs the cleanup line, then disconnects."""
+    push_lock, lock = _keycode_push_lock()
+    lock.get_keycode = AsyncMock(side_effect=[ResponseError("bad frame"), "135790"])
+    logged_at_the_disconnect: list[list[str]] = []
+
+    async def disconnect() -> None:
+        logged_at_the_disconnect.append(
+            [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == "yalexs_ble.push" and "Cleaning up" in r.getMessage()
+            ]
+        )
+
+    lock.disconnect = AsyncMock(side_effect=disconnect)
+    lock.connect = AsyncMock()
+    push_lock._client = lock
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_get_lock_instance", return_value=lock),
+    ):
+        assert await push_lock.get_keycode(200) == "135790"
+
+    assert logged_at_the_disconnect == [["Test Lock: Cleaning up after bad frame"]]
+
+
+@pytest.mark.asyncio
+async def test_ensure_connected_logs_a_held_connect_lock_then_connects(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Logs at debug that the connect lock is held, then connects after its release."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:1c", always_connected=False)
+    lock = MagicMock()
+    lock.connect = AsyncMock()
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_get_lock_instance", return_value=lock),
+    ):
+        await push_lock._connect_lock.acquire()
+        connecting = asyncio.create_task(push_lock._ensure_connected())
+        await asyncio.sleep(0)
+        logged_while_held = [
+            (r.levelno, r.getMessage())
+            for r in caplog.records
+            if r.name == "yalexs_ble.push" and "Connect lock held" in r.getMessage()
+        ]
+        lock.connect.assert_not_awaited()
+        push_lock._connect_lock.release()
+        assert await connecting is lock
+
+    assert logged_while_held == [(logging.DEBUG, "Test Lock: Connect lock held")]
+    lock.connect.assert_awaited_once()
 
 
 class _MockRetryLock:
