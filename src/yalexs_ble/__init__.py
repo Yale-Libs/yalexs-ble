@@ -9,9 +9,9 @@ from .const import (
     DoorStatus,
     LockActivity,
     LockInfo,
-    LockOperationSource,
     LockState,
     LockStatus,
+    OpCode,
     YaleXSBLEDiscovery,
 )
 from .lock import Lock
@@ -48,9 +48,9 @@ __all__ = [
     "Lock",
     "LockActivity",
     "LockInfo",
-    "LockOperationSource",
     "LockState",
     "LockStatus",
+    "OpCode",
     "OperationFailedError",
     "OperationIncompleteError",
     "PushLock",

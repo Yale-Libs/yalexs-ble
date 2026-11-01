@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, IntEnum
-from typing import TypedDict
+from typing import TypedDict, cast
 
 COMMAND_SERVICE_UUID = "0000fe24-0000-1000-8000-00805f9b34fb"
 WRITE_CHARACTERISTIC = "bd4ac611-0b45-11e3-8ffd-0800200c9a66"
@@ -225,35 +225,56 @@ class LockState:
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
 
 
-class LockOperationSource(Enum):
-    REMOTE = 0x00
-    MANUAL = 0x01
-    AUTO_LOCK = 0x05
-    PIN = 0x0B
-    UNKNOWN = 0xFF
+class OpCode(Enum):
+    """The opCode at byte 5 of a type 0x00 activity record.
 
+    A value the table does not name becomes an UNKNOWN_xx member, so the record
+    keeps it and source stays an OpCode.
+    """
 
-VALUE_TO_LOCK_OPERATION_SOURCE = {
-    status.value: status for status in LockOperationSource
-}
+    # Based on the vendor's term. Locks have been observed to record a lock or unlock
+    # commanded over BLE with this value.
+    DOOR_STATE_CHANGED = 0x00
+    DOOR_MANUAL_STATE_CHANGE = 0x01
+    KNOCK_RECEIVED = 0x02
+    BLUETOOTH_RECEIVED = 0x03
+    ANOMALY = 0x04
+    AUTO_RELOCK = 0x05
+    AUTO_RETRY = 0x06
+    OVER_TEMP = 0x07
+    BURN_IN = 0x08
+    HOME_KIT = 0x09
+    Z_WAVE = 0x0A
+    ONE_TOUCH = 0x0B
+    INSIDE_BUTTON = 0x0C
+    DOOR_SENSE = 0x0E
+    LOW_BAT_AUTO_UNLOCK = 0x0F
+    ESCAPE_UNLOCK = 0x10
+    UWB = 0x11
+    EXTERNAL_MODULE_OPERATION = 0x12
+    SHABBAT_MODE = 0x13
+    SCHEDULED_OPERATION = 0x14
+    MATTER = 0x15
+    DOUBLE_PRESS = 0x17
+    ALIRO = 0x18
+    UNDEFINED = 0xFF
 
-
-class LockOperationRemoteType(Enum):
-    UNKNOWN = 0x00
-    BLE = 0x03
-
-
-VALUE_TO_LOCK_OPERATION_REMOTE_TYPE = {
-    status.value: status for status in LockOperationRemoteType
-}
+    @classmethod
+    def _missing_(cls, value: object) -> OpCode | None:
+        if not isinstance(value, int):
+            return None
+        member = object.__new__(cls)
+        member._name_ = f"UNKNOWN_{value:02X}"
+        member._value_ = value
+        return cast(OpCode, cls._value2member_map_.setdefault(value, member))
 
 
 @dataclass
 class LockActivity:
     timestamp: datetime
     status: LockStatus
-    source: LockOperationSource
-    remote_type: LockOperationRemoteType | None = None
+    # A 0x07 or 0x0E record is a credential use at slot; it has no opCode byte.
+    source: OpCode | None
     slot: int | None = None
 
 
