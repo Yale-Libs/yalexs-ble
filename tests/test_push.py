@@ -31,6 +31,7 @@ from yalexs_ble.const import (
     LockInfo,
     LockState,
     LockStatus,
+    LogBrand,
     OperationError,
 )
 from yalexs_ble.lock import ActivityLogOverrunError, Lock
@@ -292,6 +293,22 @@ def test_battery_reporting(model: str, reporting: bool) -> None:
 )
 def test_door_sense(model: str, door_sense: bool) -> None:
     assert _lock_info(model).door_sense is door_sense
+
+
+@pytest.mark.parametrize(
+    ("model", "brand"),
+    [
+        ("ASL-03", LogBrand.AUGUST),
+        ("ASL-05-XX", LogBrand.AUGUST),
+        ("YRD-456", LogBrand.YALE),
+        ("SL-103-EU", LogBrand.YALE),
+        ("YUR/DEL/1/SIL", LogBrand.YALE),
+        # An unknown model reads Yale's numbering, as the rest of the decoding does.
+        ("", LogBrand.YALE),
+    ],
+)
+def test_log_brand_follows_the_model(model: str, brand: LogBrand) -> None:
+    assert _lock_info(model).log_brand is brand
 
 
 @pytest.mark.asyncio
