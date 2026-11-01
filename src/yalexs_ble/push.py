@@ -1829,7 +1829,8 @@ class PushLock:
         """Read the lock's activity log and deliver every record to every callback.
 
         A drain with no count reads the unread count first. A failed drain
-        stays pending; records already read have been delivered.
+        stays pending; a cancellation during delivery loses that record for the
+        callbacks not yet run.
         """
         # Consumed before the await so a change during the drain is kept.
         self._activity_drain_pending = False
