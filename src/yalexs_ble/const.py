@@ -35,6 +35,17 @@ FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 # such as "SL-103-EU", so the tables match an entry or a suffixed variant.
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
 
+# BLE model numbers seen in the field that ship under one brand alone. The Assure
+# models ship under both and are in neither list: only the pairing tells theirs.
+AUGUST_MODEL_PREFIX = "ASL-"
+YALE_MODELS = {
+    "SL-103",  # Linus L2
+    "Yale Linus L2",  # Linus L2 Nordic
+    "CERES",  # Smart code handle
+    "MD-04I",  # Conexis L1 and L2
+}
+YALE_MODEL_PREFIXES = ("YUR/",)  # Unity
+
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these exclusions
 NO_BATTERY_SUPPORT_MODELS = {
     "SL-103",  # Linus L2
@@ -548,6 +559,15 @@ class LockInfo:
     def battery_reporting(self) -> bool:
         """Check if the lock answers battery status requests."""
         return not self._model_in(NO_BATTERY_SUPPORT_MODELS)
+
+    @property
+    def brand(self) -> Brand | None:
+        """The one brand the model ships under; None for a model sold under both."""
+        if self.model.startswith(AUGUST_MODEL_PREFIX):
+            return Brand.AUGUST
+        if self.model.startswith(YALE_MODEL_PREFIXES) or self._model_in(YALE_MODELS):
+            return Brand.YALE
+        return None
 
     def _model_in(self, models: set[str]) -> bool:
         """True for a listed model or a suffixed variant of one, not a longer number."""

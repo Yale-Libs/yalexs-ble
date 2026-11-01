@@ -615,7 +615,9 @@ class PushLock:
 
     @property
     def brand(self) -> Brand:
-        """The brand the lock is paired with; August, the common one, when not told."""
+        """The lock's brand: certain from its model, else as paired, else August."""
+        if self._lock_info is not None and (known := self._lock_info.brand) is not None:
+            return known
         return self._brand or Brand.AUGUST
 
     @property

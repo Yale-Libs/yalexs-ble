@@ -295,24 +295,50 @@ def test_door_sense(model: str, door_sense: bool) -> None:
     assert _lock_info(model).door_sense is door_sense
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("paired", "brand"),
+    ("model", "brand"),
     [
-        # Most locks in the field are August's.
-        (None, Brand.AUGUST),
-        (Brand.YALE, Brand.YALE),
-        (Brand.AUGUST, Brand.AUGUST),
+        ("ASL-03", Brand.AUGUST),
+        ("ASL-05", Brand.AUGUST),
+        ("SL-103-EU", Brand.YALE),
+        ("Yale Linus L2", Brand.YALE),
+        ("CERES", Brand.YALE),
+        ("MD-04I", Brand.YALE),
+        ("YUR/DEL/1/SIL", Brand.YALE),
+        # The Assure models ship under both brands.
+        ("YRD-256", None),
+        ("", None),
     ],
 )
-async def test_push_lock_brand_is_the_paired_brand(
-    paired: Brand | None, brand: Brand
+def test_lock_info_brand_is_certain_for_single_brand_models(
+    model: str, brand: Brand | None
 ) -> None:
-    """The model says nothing: the same hardware ships under both brands."""
+    assert _lock_info(model).brand is brand
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("paired", "model", "brand"),
+    [
+        # Most locks in the field are August's.
+        (None, "YRD-256", Brand.AUGUST),
+        (Brand.YALE, "YRD-256", Brand.YALE),
+        (Brand.AUGUST, "YRD-256", Brand.AUGUST),
+        # A model sold under one brand outranks the pairing: an August lock
+        # moved into the Yale app still writes August's records.
+        (Brand.YALE, "ASL-03", Brand.AUGUST),
+        (Brand.AUGUST, "SL-103", Brand.YALE),
+        (None, None, Brand.AUGUST),
+    ],
+)
+async def test_push_lock_brand_is_the_models_else_the_paired_else_august(
+    paired: Brand | None, model: str | None, brand: Brand
+) -> None:
     push_lock = _named_push_lock(
         "aa:bb:cc:dd:ee:60", always_connected=False, brand=paired
     )
-    push_lock._lock_info = _lock_info("YRD-256")
+    if model is not None:
+        push_lock._lock_info = _lock_info(model)
     assert push_lock.brand is brand
 
 
