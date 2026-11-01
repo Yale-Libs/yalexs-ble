@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from typing import Self
 
 from .const import (
@@ -46,7 +47,7 @@ def _u32(raw: bytes, offset: int) -> int:
     return _bytes_to_int(raw[offset : offset + 4])
 
 
-# raw keeps a state byte that has no member.
+# An unnamed state reads UNKNOWN; raw keeps the byte.
 def _lock_state(value: int) -> LockStatus:
     return VALUE_TO_LOCK_STATUS.get(value, LockStatus.UNKNOWN)
 
@@ -65,17 +66,21 @@ class LogRecord:
     """One record of the activity log, and the value of a record with no decoder."""
 
     raw: bytes
-    log_type: int
+
+    @property
+    def log_type(self) -> int:
+        """The record type at byte 4."""
+        return self.raw[4]
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
         """Build the record from the 18 bytes of a reply."""
-        return cls(raw, raw[4])
+        return cls(raw)
 
 
 @dataclass(frozen=True)
 class LockOperation(LogRecord):
-    """A LockOperation record (log_type 0x00)."""
+    """A LockOperation record (log_type 0x00); the vendor also names byte 15 error."""
 
     op_code: OpCode
     current_lock_state: LockStatus
@@ -83,22 +88,18 @@ class LockOperation(LogRecord):
     time_stamp: int
     battery_level: int
     temperature: int
-    error: int
     battery_level_percent: int
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             op_code=OpCode(raw[5]),
             current_lock_state=_lock_state(raw[6]),
             key_slot=raw[7],
             time_stamp=_u32(raw, 8),
             battery_level=_u16(raw, 12),
             temperature=raw[14],
-            # The vendor's parser emits byte 15 under both keys.
-            error=raw[15],
             battery_level_percent=raw[15],
         )
 
@@ -112,7 +113,7 @@ class _KeypadCode(LogRecord):
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
-        return cls(raw, raw[4], time_stamp=_u32(raw, 5), keycode=_code(raw[9:16]))
+        return cls(raw, time_stamp=_u32(raw, 5), keycode=_code(raw[9:16]))
 
 
 @dataclass(frozen=True)
@@ -142,7 +143,6 @@ class CodeAdded(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             slot=raw[9],
             code=_code(raw[10:16]),
@@ -161,7 +161,6 @@ class KeypadInfo(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             battery_level=raw[9],
             stats=_u32(raw, 10),
@@ -177,7 +176,7 @@ class CodeDeleted(LogRecord):
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
-        return cls(raw, raw[4], time_stamp=_u32(raw, 5), slot=raw[9])
+        return cls(raw, time_stamp=_u32(raw, 5), slot=raw[9])
 
 
 @dataclass(frozen=True)
@@ -188,7 +187,7 @@ class _TimeStamp(LogRecord):
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
-        return cls(raw, raw[4], time_stamp=_u32(raw, 5))
+        return cls(raw, time_stamp=_u32(raw, 5))
 
 
 @dataclass(frozen=True)
@@ -217,7 +216,6 @@ class CodeOperation(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             current_lock_state=_lock_state(raw[9] & 0x0F),
             current_door_state=_door_state(raw[9] >> 4),
@@ -237,19 +235,10 @@ class CodeAddedv2(LogRecord):
     code: str
 
     @classmethod
-    def decode(cls, raw: bytes) -> Self:
-        return cls._decode(raw, "016X")
-
-    @classmethod
-    def decode_decimal(cls, raw: bytes) -> Self:
-        """Build the record with the code in decimal, as August's app prints it."""
-        return cls._decode(raw, "d")
-
-    @classmethod
-    def _decode(cls, raw: bytes, code_format: str) -> Self:
+    def decode(cls, raw: bytes, code_format: str = "016X") -> Self:
+        """Build the record; Yale's app prints the code in hex, August's in decimal."""
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             slot=_u16(raw, 9),
             code=format(_bytes_to_int(raw[11:16]), code_format),
@@ -265,7 +254,7 @@ class CodeDeletedv2(LogRecord):
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
-        return cls(raw, raw[4], time_stamp=_u32(raw, 5), slot=_u16(raw, 9))
+        return cls(raw, time_stamp=_u32(raw, 5), slot=_u16(raw, 9))
 
 
 @dataclass(frozen=True)
@@ -287,7 +276,6 @@ class _Credential(LogRecord):
         is_error = raw[12] >> 4 == 0x0F
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             credential_type=LockCred(raw[9]),
             slot=_u16(raw, 10),
@@ -331,7 +319,6 @@ class Tamper(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             tamper_type=TamperType(_u16(raw, 9)),
         )
@@ -350,7 +337,6 @@ class BCMTest(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             error=raw[9],
             seconds=_u16(raw, 10),
@@ -372,7 +358,6 @@ class HomekeyOperation(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             current_lock_state=_lock_state(raw[9] & 0x0F),
             battery_level_decivolt=raw[11],
@@ -390,7 +375,7 @@ class DPSInfo(LogRecord):
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
-        return cls(raw, raw[4], time_stamp=_u32(raw, 5), battery_level_percent=raw[9])
+        return cls(raw, time_stamp=_u32(raw, 5), battery_level_percent=raw[9])
 
 
 @dataclass(frozen=True)
@@ -409,7 +394,6 @@ class BatteryInfo(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             battery_level_millivolt=_u16(raw, 9),
             temperature=int.from_bytes(raw[11:12], "little", signed=True),
@@ -429,7 +413,7 @@ class LocalEventNotification(LogRecord):
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
-        return cls(raw, raw[4], time_stamp=_u32(raw, 5), notification=raw[9])
+        return cls(raw, time_stamp=_u32(raw, 5), notification=raw[9])
 
 
 @dataclass(frozen=True)
@@ -444,7 +428,6 @@ class _Message(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             msg_type=_u16(raw, 9),
             data=tuple(raw[11:16]),
@@ -472,7 +455,6 @@ class DoorStateChanged(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             current_door_state=_door_state(raw[9]),
         )
@@ -494,7 +476,6 @@ class DialogReboot(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             lock_state=_lock_state(raw[9] & 0x0F),
             door_state=_door_state(raw[9] >> 4),
@@ -521,7 +502,6 @@ class GetLogError(LogRecord):
         bit_fields = _u16(raw, 5)
         return cls(
             raw,
-            raw[4],
             error=bit_fields & 0x07,
             key_slot=raw[7],
             log_count=bit_fields >> 4,
@@ -542,7 +522,6 @@ class LockOperatingMode(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             lock_op_mode=OperatingMode(raw[9]),
         )
@@ -560,7 +539,6 @@ class LockDeadboltJam(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             battery_level=_u16(raw, 9),
             jam_state=JamState(raw[11]),
@@ -579,7 +557,6 @@ class InvalidCredentialEntry(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             cred_type=CredType(_u16(raw, 9)),
             battery_level=_u16(raw, 11),
@@ -594,8 +571,7 @@ class MatterEvent(LogRecord):
     event_type: MatterEventType
     fabric_index: int | None
     fabric_vendor_id: int | None
-    # registration_status is None unless event_type is MatterEventType.REGISTRATION.
-    # MatterRegistrationStatus.OK is 0, so a truth test cannot tell it from None.
+    # None unless event_type is REGISTRATION.
     registration_status: MatterRegistrationStatus | None
 
     @classmethod
@@ -608,7 +584,6 @@ class MatterEvent(LogRecord):
         is_registration = event_type == MatterEventType.REGISTRATION
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             event_type=MatterEventType(event_type),
             fabric_index=raw[10] if has_fabric else None,
@@ -649,7 +624,6 @@ class LockOperationBlame(LogRecord):
                 fabric_index = raw[14]
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             op_type=LockOperationType(raw[9]),
             op_source=op_source,
@@ -676,7 +650,6 @@ class OutOfScheduleCredential(LogRecord):
     def decode(cls, raw: bytes) -> Self:
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             cred_type=CredType(_u16(raw, 9)),
             battery_level=_u16(raw, 11),
@@ -711,7 +684,6 @@ class BulkOperation(LogRecord):
             fabric_index = None
         return cls(
             raw,
-            raw[4],
             time_stamp=_u32(raw, 5),
             bulk_op_type=BulkOperationType(bulk_op_type),
             fabric_index=fabric_index,
@@ -722,7 +694,8 @@ class BulkOperation(LogRecord):
 
 RecordDecoder = Callable[[bytes], LogRecord]
 
-YALE_LOG_RECORDS: Mapping[int, RecordDecoder] = {
+# The log_types both brands number and lay out alike.
+_COMMON_RECORDS: Mapping[int, RecordDecoder] = {
     LogType.LOCK_OPERATION: LockOperation.decode,
     LogType.KEYPAD_OPEN: KeypadOpen.decode,
     LogType.KEYPAD_WRONG_CODE: KeypadWrongCode.decode,
@@ -742,35 +715,22 @@ YALE_LOG_RECORDS: Mapping[int, RecordDecoder] = {
     LogType.BCM_TEST: BCMTest.decode,
     LogType.HOMEKEY_OPERATION: HomekeyOperation.decode,
     LogType.DPS_INFO: DPSInfo.decode,
-    LogType.BATTERY_INFO: BatteryInfo.decode,
-    LogType.LOCAL_EVENT_NOTIFICATION: LocalEventNotification.decode,
-    LogType.PRODUCT_MESSAGE: ProductMessage.decode,
-    LogType.MATTER_MESSAGE: MatterMessage.decode,
     LogType.DOOR_STATE_CHANGED: DoorStateChanged.decode,
     LogType.DIALOG_REBOOT: DialogReboot.decode,
     LogType.GET_LOG_ERROR: GetLogError.decode,
 }
 
+YALE_LOG_RECORDS: Mapping[int, RecordDecoder] = {
+    **_COMMON_RECORDS,
+    LogType.BATTERY_INFO: BatteryInfo.decode,
+    LogType.LOCAL_EVENT_NOTIFICATION: LocalEventNotification.decode,
+    LogType.PRODUCT_MESSAGE: ProductMessage.decode,
+    LogType.MATTER_MESSAGE: MatterMessage.decode,
+}
+
 AUGUST_LOG_RECORDS: Mapping[int, RecordDecoder] = {
-    AugustLogType.LOCK_OPERATION: LockOperation.decode,
-    AugustLogType.KEYPAD_OPEN: KeypadOpen.decode,
-    AugustLogType.KEYPAD_WRONG_CODE: KeypadWrongCode.decode,
-    AugustLogType.CODE_ADDED: CodeAdded.decode,
-    AugustLogType.KEYPAD_INFO: KeypadInfo.decode,
-    AugustLogType.CODE_DELETED: CodeDeleted.decode,
-    AugustLogType.ALL_CODES_DELETED: AllCodesDeleted.decode,
-    AugustLogType.CODE_OPERATION: CodeOperation.decode,
-    AugustLogType.KEYPAD_CLOSE: KeypadClose.decode,
-    AugustLogType.FACTORY_RESET: FactoryReset.decode,
-    AugustLogType.CODE_ADDED_V2: CodeAddedv2.decode_decimal,
-    AugustLogType.CODE_DELETED_V2: CodeDeletedv2.decode,
-    AugustLogType.EXTERNAL_CREDENTIAL_ADDED: CredentialAdded.decode,
-    AugustLogType.EXTERNAL_CREDENTIAL_DELETED: CredentialDeleted.decode,
-    AugustLogType.CREDENTIAL_OPERATION: CredentialOperation.decode,
-    AugustLogType.TAMPER: Tamper.decode,
-    AugustLogType.BCM_TEST: BCMTest.decode,
-    AugustLogType.HOMEKEY_OPERATION: HomekeyOperation.decode,
-    AugustLogType.DPS_INFO: DPSInfo.decode,
+    **_COMMON_RECORDS,
+    AugustLogType.CODE_ADDED_V2: partial(CodeAddedv2.decode, code_format="d"),
     AugustLogType.LOCK_OPERATING_MODE: LockOperatingMode.decode,
     AugustLogType.LOCK_DEADBOLT_JAM: LockDeadboltJam.decode,
     AugustLogType.INVALID_CREDENTIAL_ENTRY: InvalidCredentialEntry.decode,
@@ -778,9 +738,6 @@ AUGUST_LOG_RECORDS: Mapping[int, RecordDecoder] = {
     AugustLogType.LOCK_OPERATION_BLAME: LockOperationBlame.decode,
     AugustLogType.OUT_OF_SCHEDULE_CREDENTIAL: OutOfScheduleCredential.decode,
     AugustLogType.BULK_OPERATION: BulkOperation.decode,
-    AugustLogType.DOOR_STATE_CHANGED: DoorStateChanged.decode,
-    AugustLogType.DIALOG_REBOOT: DialogReboot.decode,
-    AugustLogType.GET_LOG_ERROR: GetLogError.decode,
 }
 
 _LOG_RECORDS: Mapping[LogBrand, Mapping[int, RecordDecoder]] = {
