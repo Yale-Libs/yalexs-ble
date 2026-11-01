@@ -33,7 +33,6 @@ from yalexs_ble.const import (
 )
 from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
-    MAX_ACTIVITY_RECORDS,
     UNLATCH_OPERATION_BYTE,
     Lock,
     _ack_matcher,
@@ -1437,14 +1436,10 @@ def test_keycode_frames_produce_no_state(opcode: int, flag: int) -> None:
     assert received == []
 
 
-# KEYPAD_UNLOCK_SLOT_* are keypad PIN unlock records (type 0x07) captured from
-# a Yale YRD256; KEYPAD_LOCK_BUTTON (type 0x00) and END_OF_LOG (0x80) are
-# captured from a Yale lock. UNKNOWN_ACTIVITY is built with record type 0x55.
-KEYPAD_UNLOCK_SLOT_205 = bytes.fromhex("bb2d0072079aa176a333004bea14cd000200")
-KEYPAD_UNLOCK_SLOT_200 = bytes.fromhex("bb2d00a4077a9e76a333004cdf14c8000200")
+# GetLog replies captured from a Yale lock: a LockOperation (0x00) record and
+# the GetLogError (0x80) that ends the log.
 KEYPAD_LOCK_BUTTON = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
 END_OF_LOG = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
-UNKNOWN_ACTIVITY = _with_checksum("bb2d00005500000000000000000000000000")
 
 
 def test_op_code_refuses_a_value_that_is_not_an_int() -> None:
@@ -1486,101 +1481,20 @@ def test_op_code_holds_the_vendor_table() -> None:
     assert "OpCode" in yalexs_ble.__all__
 
 
-def _activity_lock(frames: list[bytes | Exception]) -> tuple[Lock, AsyncMock]:
-    """A connected Lock whose activity reads answer with frames in order."""
-    lock, session = _connected_lock()
-    answers = iter(frames)
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        answer = next(answers)
-        if isinstance(answer, Exception):
-            raise answer
-        session._notify(0, bytearray(answer))
-
-    write = AsyncMock(side_effect=deliver)
-    session.client.write_gatt_char = write
-    return lock, write
-
-
-async def _drain(lock: Lock) -> list[bytes]:
-    return [reply async for reply in lock.drain_lock_activity()]
-
-
-@pytest.mark.asyncio
-async def test_drain_lock_activity_yields_every_reply_through_the_get_log_error() -> (
-    None
-):
-    """Every reply is yielded unchanged, whatever its type, the GetLogError last."""
-    lock, write = _activity_lock(
-        [
-            UNKNOWN_ACTIVITY,
-            KEYPAD_UNLOCK_SLOT_205,
-            KEYPAD_LOCK_BUTTON,
-            END_OF_LOG,
-            KEYPAD_UNLOCK_SLOT_200,
-        ]
-    )
-    assert await _drain(lock) == [
-        UNKNOWN_ACTIVITY,
-        KEYPAD_UNLOCK_SLOT_205,
-        KEYPAD_LOCK_BUTTON,
-        END_OF_LOG,
-    ]
-    assert write.await_count == 4
-
-
-@pytest.mark.asyncio
-async def test_drain_lock_activity_sends_the_next_get_log_when_asked() -> None:
-    """A reply is yielded before the next GetLog is sent."""
-    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205, END_OF_LOG])
-    replies = lock.drain_lock_activity()
-    assert await anext(replies) == KEYPAD_UNLOCK_SLOT_205
-    assert write.await_count == 1
-    assert await anext(replies) == END_OF_LOG
-    assert write.await_count == 2
-    await replies.aclose()
-
-
-@pytest.mark.asyncio
-async def test_drain_lock_activity_yields_each_record_as_it_is_read() -> None:
-    """Records read before a failure have already been yielded."""
-    lock, _ = _activity_lock([KEYPAD_UNLOCK_SLOT_205, BleakError("gone")])
-    seen: list[bytes] = []
-    with pytest.raises(BleakError):
-        async for reply in lock.drain_lock_activity():
-            seen.append(reply)
-    assert seen == [KEYPAD_UNLOCK_SLOT_205]
-
-
-@pytest.mark.asyncio
-async def test_drain_lock_activity_raises_past_the_cap() -> None:
-    """Without an end marker the drain raises after max_records reads."""
-    lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * (MAX_ACTIVITY_RECORDS + 5))
-    seen: list[bytes] = []
-    with pytest.raises(ResponseError, match=f"within {MAX_ACTIVITY_RECORDS} reads"):
-        async for reply in lock.drain_lock_activity():
-            seen.append(reply)
-    assert len(seen) == MAX_ACTIVITY_RECORDS
-    assert write.await_count == MAX_ACTIVITY_RECORDS
-
-
-@pytest.mark.asyncio
-async def test_drain_lock_activity_requires_a_connection() -> None:
-    """Draining a disconnected lock raises."""
-    lock = _make_lock()
-    with pytest.raises(DisconnectedError):
-        await _drain(lock)
-
-
-@pytest.mark.asyncio
-async def test_a_get_log_error_record_ends_the_drain() -> None:
-    """A LOG_TYPE_GET_LOG_ERROR reply is the last one a drain yields."""
+def test_log_type_get_log_error_is_the_log_type_of_the_get_log_error() -> None:
+    """The package exports LOG_TYPE_GET_LOG_ERROR, byte[4] of a GetLogError reply."""
     assert yalexs_ble.LOG_TYPE_GET_LOG_ERROR == END_OF_LOG[0x04] == 0x80
     assert "LOG_TYPE_GET_LOG_ERROR" in yalexs_ble.__all__
 
-    lock, write = _activity_lock([END_OF_LOG, KEYPAD_UNLOCK_SLOT_205])
-    assert await _drain(lock) == [END_OF_LOG]
-    assert write.await_count == 1
+
+def test_the_dirty_bit_is_set_in_a_racing_reply_and_clear_at_the_logs_end() -> None:
+    """The package exports GET_LOG_ERROR_DIRTY_BIT, bit 3 of a GetLogError's byte[5]."""
+    # A GetLogError captured from a Yale lock, answering a GetLog that raced the
+    # lock's write of a door record.
+    racing = bytes.fromhex("bb2d00f0800a0000c542dd6ac542dd6a0200")
+    assert racing[0x05] & yalexs_ble.GET_LOG_ERROR_DIRTY_BIT
+    assert not END_OF_LOG[0x05] & yalexs_ble.GET_LOG_ERROR_DIRTY_BIT
+    assert "GET_LOG_ERROR_DIRTY_BIT" in yalexs_ble.__all__
 
 
 @pytest.mark.asyncio
