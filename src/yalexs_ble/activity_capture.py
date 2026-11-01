@@ -1,10 +1,7 @@
-"""Log every activity log record the library reads, with its decodes.
+"""Debug-log every activity log record the library reads, in both numberings.
 
-The capture is on for every lock when this module's logger has its own level set
-to DEBUG, and for one lock when the child logger named for its Bluetooth address,
-in lower case without colons, has its own level set to DEBUG, for example
-yalexs_ble.activity_capture.aabbccddeeff for AA:BB:CC:DD:EE:FF. Each lock's
-lines go to its child logger.
+On for every lock when this logger's own level is DEBUG, or for one lock through
+its child logger, named by its address in lower case without colons.
 """
 
 from __future__ import annotations
@@ -20,9 +17,6 @@ from .activity_log import LogRecord, parse_log_event_packet
 from .const import Brand, DoorStatus, LockStatus
 
 _LOGGER = logging.getLogger(__name__)
-
-# The line gives raw as a field of its own; log_type is a property over it.
-_FRAME_FIELDS = frozenset({"raw"})
 
 
 def capture_logger(address: str) -> logging.Logger | None:
@@ -56,10 +50,9 @@ def log_record(
     lock: LockStatus,
     door: DoorStatus,
 ) -> None:
-    """Log one line for reply with the time logged, lock and door status, and decodes.
+    """Log reply's timing, lock and door status, flag and both decodes as one line.
 
-    since_change is the seconds since the last settled change of the displayed
-    lock status, or None when there has been none.
+    since_change is the seconds since the last settled lock change, or None.
     """
     captured = time.time()
     yale = parse_log_event_packet(reply, Brand.YALE)
@@ -92,7 +85,7 @@ def _decoded_field(decoded: LogRecord) -> str:
     values = ",".join(
         f"{field.name}={_value(field.name, getattr(decoded, field.name))}"
         for field in dataclasses.fields(decoded)
-        if field.name not in _FRAME_FIELDS
+        if field.name != "raw"
     )
     return f"{type(decoded).__name__}({values})"
 

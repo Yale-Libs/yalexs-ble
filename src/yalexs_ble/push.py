@@ -22,13 +22,11 @@ from bleak_retry_connector import (
 from lru import LRU  # pylint: disable=no-name-in-module
 
 from . import activity_capture
-from .activity_log import LogRecord, parse_log_event_packet
+from .activity_log import GetLogError, LogRecord, parse_log_event_packet
 from .const import (
     APPLE_MFR_ID,
-    GET_LOG_ERROR_DIRTY_BIT,
     HAP_ENCRYPTED_FIRST_BYTE,
     HAP_FIRST_BYTE,
-    LOG_TYPE_GET_LOG_ERROR,
     MANUAL_INTERVENTION_STATUSES,
     SETUP_CONDITION_STATUSES,
     YALE_MFR_IDS,
@@ -197,18 +195,13 @@ AUTO_LOCK_READ_FAILURE_BACKOFF = 86400
 # Ack timeouts and response timeouts both count toward this one threshold.
 AUTO_LOCK_READ_FAILURE_THRESHOLD = 3
 
-# Consecutive failed activity drains before the drain is left alone for a
-# while, so a lock whose reads keep failing is not asked again on every
-# update cycle, connection, and status change.
+# Failed drains in a row before the drain backs off for FAILURE_BACKOFF seconds.
 ACTIVITY_DRAIN_FAILURE_THRESHOLD = 3
 ACTIVITY_DRAIN_FAILURE_BACKOFF = 3600
-# GetLog commands a drain sends with no GetLogError whose dirty bit is clear,
-# from its start or its last such GetLogError, before it treats the log as one
-# that never ends; from the start of the backlog drain the limit is its unread
-# count plus the margin. The margin covers records written during the drain.
+# GetLog reads allowed without a clean GetLogError, counted from the last one;
+# a backlog drain also gets its unread count.
 ACTIVITY_DRAIN_MARGIN = 128
-# Seconds a drain reads on after a settled change of the displayed lock status,
-# so a record the lock writes within them is read by that drain.
+# Seconds a drain reads on after a settled lock change, for the record it writes.
 ACTIVITY_DRAIN_WINDOW = 2.0
 # Seconds from the capture's registration, its last GetLogError whose dirty bit
 # is clear, or its last ask, whichever is latest, to its next ask for a drain.
@@ -252,12 +245,9 @@ def _select_yale_payload(
     return min(present, key=lambda item: (len(item[1]) != 1, not item[1]))
 
 
-def _log_is_empty(reply: bytes) -> bool:
-    """Return whether reply is a GetLogError with the dirty bit clear."""
-    return (
-        reply[0x04] == LOG_TYPE_GET_LOG_ERROR
-        and not reply[0x05] & GET_LOG_ERROR_DIRTY_BIT
-    )
+async def _get_log(lock: Lock) -> bytes:
+    """Read the lock's oldest activity log record."""
+    return await lock.get_log()
 
 
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
@@ -516,7 +506,6 @@ class PushLock:
         self._earliest_activity_drain_time = NEVER_TIME
         self._activity_drain_task: asyncio.Task[None] | None = None
         self._activity_drain_read_holds_lock = False
-        # The capture's remover, None while the capture is not registered.
         self._remove_activity_capture: Callable[[], None] | None = None
         self._activity_capture_timer: asyncio.TimerHandle | None = None
         self._update_task: asyncio.Task[None] | None = None
@@ -1157,13 +1146,20 @@ class PushLock:
         self._jammed_hold_deadline = NEVER_TIME
         self._cancel_jam_hold_timer()
 
+    def _a_command_holds_the_lock(self) -> bool:
+        """True while a holder other than a drain read has the operation lock.
+
+        A lock operation's exit clears a cycle armed now, so the cycle retries;
+        a drain read hands the lock back, so the cycle queues behind it.
+        """
+        return (
+            self._operation_lock.locked() and not self._activity_drain_read_holds_lock
+        )
+
     def _jam_hold_ended(self) -> None:
         """Poll the lock now that the display hold has ended."""
         self._jam_hold_timer = None
-        if self._operation_lock.locked() and not self._activity_drain_read_holds_lock:
-            # The holder may be a lock operation, whose exit clears a cycle armed
-            # now, so retry; the drain hands the lock back after each read, so the
-            # cycle queues behind a drain read.
+        if self._a_command_holds_the_lock():
             self._schedule_jam_hold_timer(OPERATION_IN_PROGRESS_DEFER_SECONDS)
             return
         # Forced: the held status already counts as this session's reading.
@@ -1833,11 +1829,7 @@ class PushLock:
         )
 
     def _activity_drain_window_open(self, started: float) -> bool:
-        """True for a read started before the drain window's end.
-
-        The window ends ACTIVITY_DRAIN_WINDOW after the last settled change of the
-        displayed lock status.
-        """
+        """True for a read started within the window after the last settled change."""
         return started < self._last_settled_lock_change_time + ACTIVITY_DRAIN_WINDOW
 
     def _owe_activity_drain(self) -> None:
@@ -1846,10 +1838,7 @@ class PushLock:
         self._start_activity_drain()
 
     def _start_activity_drain(self) -> None:
-        """Start the drain task when a drain is due on a link that is up.
-
-        Does nothing while a drain task is running.
-        """
+        """Start the drain task when a drain is due on a link that is up."""
         task = self._activity_drain_task
         if (
             not self._running
@@ -1897,9 +1886,8 @@ class PushLock:
         """
 
         async def clear_pending_and_read(lock: Lock) -> int | bytes:
-            # Cleared under the operation lock, so a change staged while another
-            # task held the lock is covered by this drain; the backlog is checked
-            # here too, so a backlog armed while the drain waited is counted.
+            # Under the lock: a change staged while another task held it is
+            # covered, and a backlog armed while this drain waited is counted.
             self._activity_drain_pending = False
             if self._backlog_remaining is None:
                 return await lock.unread_event_count()
@@ -1916,7 +1904,7 @@ class PushLock:
                 _LOGGER.info("%s: Activity log unread count: %d", self.name, first)
                 self._backlog_remaining = first
                 ended = await self._deliver_activity_log(
-                    await self._read_for_activity_drain(lambda lock: lock.get_log()),
+                    await self._read_for_activity_drain(_get_log),
                     first + ACTIVITY_DRAIN_MARGIN,
                 )
             else:
@@ -1924,8 +1912,7 @@ class PushLock:
                     (first, started), ACTIVITY_DRAIN_MARGIN
                 )
         except DisconnectedError as err:
-            # The drain makes no connection, and a dropped link says nothing about
-            # the drain, so it counts as no failure; the next connection starts one.
+            # A dropped link is no drain failure; the next connection drains.
             _LOGGER.debug("%s: Activity log drain ended: %s", self.name, err)
         except (TimeoutError, *RETRYABLE_EXCEPTIONS) as err:
             self._note_activity_drain_failure(err)
@@ -1947,23 +1934,19 @@ class PushLock:
         while read is not None:
             reply, started = read
             replies += 1
-            end = _log_is_empty(reply)
-            if end:
-                # The log is empty, so no later record is backlog.
+            record = parse_log_event_packet(reply, self.brand)
+            end = False
+            if isinstance(record, GetLogError):
+                # A set dirty bit means a record write raced this read: read on.
+                end = not record.dirty_bit
                 backlog = False
-                self._backlog_remaining = 0
-            elif reply[0x04] == LOG_TYPE_GET_LOG_ERROR:
-                # A GetLog that races the lock's write of a record is answered with
-                # a GetLogError whose dirty bit is set, and the record follows on
-                # the next read, so the drain reads on; budget bounds a lock that
-                # never clears the bit.
-                backlog = False
+                if end:
+                    self._backlog_remaining = 0
             else:
-                # None: a backlog armed during this read.
+                # None means a backlog was armed mid-read; this record is in it.
                 backlog = self._backlog_remaining != 0
                 if self._backlog_remaining:
                     self._backlog_remaining -= 1
-            record = parse_log_event_packet(reply, self.brand)
             for callback in tuple(self._activity_callbacks):
                 if callback not in self._activity_callbacks:
                     continue
@@ -1994,7 +1977,7 @@ class PushLock:
             # The next drain reads a new backlog's unread count before any GetLog.
             if self._backlog_remaining is None:
                 return True
-            read = await self._read_for_activity_drain(lambda lock: lock.get_log())
+            read = await self._read_for_activity_drain(_get_log)
         return True
 
     def _note_activity_drain_failure(self, err: Exception) -> None:
@@ -2040,8 +2023,7 @@ class PushLock:
             self.lock_status,
             self.door_status,
         )
-        # A GetLogError with the dirty bit set is not the log's end.
-        if _log_is_empty(record.raw):
+        if isinstance(record, GetLogError) and not record.dirty_bit:
             self._restart_activity_capture_timer(logger)
 
     def _restart_activity_capture_timer(self, logger: logging.Logger) -> None:
@@ -2383,10 +2365,7 @@ class PushLock:
             return
         if self._wait_for_the_floor(now):
             return
-        if self._operation_lock.locked() and not self._activity_drain_read_holds_lock:
-            # The holder may be a lock operation, whose exit clears a cycle armed
-            # now, so retry; the drain hands the lock back after each read, so the
-            # cycle queues behind a drain read.
+        if self._a_command_holds_the_lock():
             _LOGGER.debug(
                 "%s: Rescheduling update until the operation lock is released",
                 self.name,

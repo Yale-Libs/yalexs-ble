@@ -4015,11 +4015,7 @@ def _recorder(received: list[tuple[bytes, bool]]) -> LogRecordCallback:
 
 
 def _ready_to_drain(push_lock: PushLock) -> None:
-    """
-    Set push_lock running with lock info, the four status types in
-    _seen_this_session, and the battery and auto-lock reads far off, so an update
-    cycle sends no read of its own beyond the always-connected status poll.
-    """
+    """Set push_lock running so a cycle sends only the always-connected status poll."""
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._running = True
     push_lock._advertisement_data = _advertisement({})
@@ -5726,7 +5722,7 @@ async def test_the_hour_asks_for_a_drain_and_an_update_with_the_link_down(
     mock_lock.is_connected = False
 
     with patch.object(push_lock, "_schedule_future_update_with_debounce") as debounced:
-        push_lock._ask_for_activity_drain(logging.getLogger(_LOCK_CAPTURE_LOGGER))
+        await _the_hour_passes(push_lock)
     await _drained(push_lock)
 
     assert _capture_lines(caplog)[-1] == (
@@ -5764,7 +5760,7 @@ async def test_an_asked_drain_short_of_the_logs_end_is_asked_for_again_an_hour_l
 ) -> None:
     """A drain that stops before the log's end leaves the ask's hour running."""
     push_lock, mock_lock = await _capturing_push_lock(caplog, replies)
-    push_lock._ask_for_activity_drain(logging.getLogger(_LOCK_CAPTURE_LOGGER))
+    await _the_hour_passes(push_lock)
 
     with patch("yalexs_ble.push.ACTIVITY_CAPTURE_DRAIN_DELAY", _RESTARTED_DELAY):
         await _drained(push_lock)
