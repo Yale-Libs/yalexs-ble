@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import pytest
 
-from yalexs_ble import const
 from yalexs_ble.activity_capture import log_record
 from yalexs_ble.const import DoorStatus, LockStatus
 
@@ -47,11 +46,9 @@ def _sydney_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.mark.parametrize(
-    ("frame", "mask_sensitive", "raw", "log_type", "lock_time", "lag", "decodes"),
+    ("frame", "log_type", "lock_time", "lag", "decodes"),
     [
         (
-            _LOCK_OPERATION,
-            False,
             _LOCK_OPERATION,
             "0x00",
             _TIME_2056.format(32),
@@ -61,14 +58,12 @@ def _sydney_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
                     "yale",
                     "LockOperation(op_code=ONE_TOUCH,current_lock_state=LOCKED,"
                     f"key_slot=0,time_stamp={_TIME_2056.format(32)},"
-                    "battery_level=5343,temperature=25,error=74,"
+                    "battery_level=5343,temperature=25,"
                     "battery_level_percent=74)",
                 )
             ],
         ),
         (
-            _CREDENTIAL_OPERATION,
-            False,
             _CREDENTIAL_OPERATION,
             "0x0E",
             _TIME_2026,
@@ -85,8 +80,6 @@ def _sydney_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         ),
         (
             _GET_LOG_ERROR,
-            False,
-            _GET_LOG_ERROR,
             "0x80",
             "-",
             "-",
@@ -99,10 +92,8 @@ def _sydney_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
                 )
             ],
         ),
-        (_NO_DECODER, False, _NO_DECODER, "0x11", "-", "-", [("yale", "LogRecord()")]),
+        (_NO_DECODER, "0x11", "-", "-", [("yale", "LogRecord()")]),
         (
-            _PRODUCT_MESSAGE,
-            False,
             _PRODUCT_MESSAGE,
             "0x17",
             _TIME_1979,
@@ -115,14 +106,12 @@ def _sydney_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
                 ),
                 (
                     "august",
-                    f"InvalidCredentialEntry(time_stamp={_TIME_1979},cred_type=4660,"
+                    f"InvalidCredentialEntry(time_stamp={_TIME_1979},cred_type=UNKNOWN_1234,"
                     "battery_level=513)",
                 ),
             ],
         ),
         (
-            _CODE_ADDED_V2,
-            False,
             _CODE_ADDED_V2,
             "0x0A",
             _TIME_1979,
@@ -140,32 +129,11 @@ def _sydney_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
             ],
         ),
         (
-            _CODE_ADDED_V2,
-            True,
-            "bb2d00**0a785634120102**********0000",
-            "0x0A",
-            _TIME_1979,
-            "1487383704.250",
-            [
-                (
-                    "yale",
-                    f"CodeAddedv2(time_stamp={_TIME_1979},slot=513,code=****)",
-                )
-            ],
-        ),
-        (
             _KEYPAD_OPEN,
-            True,
-            "bb2d00**0178563412**************0000",
             "0x01",
             _TIME_1979,
             "1487383704.250",
-            [
-                (
-                    "yale",
-                    f"KeypadOpen(time_stamp={_TIME_1979},keycode=****)",
-                )
-            ],
+            [("yale", f"KeypadOpen(time_stamp={_TIME_1979},keycode=123456FFFFFFFFFF)")],
         ),
     ],
     ids=[
@@ -175,23 +143,18 @@ def _sydney_time(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "LogRecord",
         "ProductMessage",
         "CodeAddedv2",
-        "CodeAddedv2-masked",
-        "KeypadOpen-masked",
+        "KeypadOpen",
     ],
 )
 def test_the_capture_line_splits_on_spaces_into_its_fields_in_order(
     frame: str,
-    mask_sensitive: bool,
-    raw: str,
     log_type: str,
     lock_time: str,
     lag: str,
     decodes: list[tuple[str, str]],
     caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One debug line per reply; august appears only where the two decodes differ."""
-    monkeypatch.setattr(const, "MASK_SENSITIVE", mask_sensitive)
     with (
         caplog.at_level(logging.DEBUG, logger="yalexs_ble.activity_capture"),
         patch(
@@ -222,6 +185,6 @@ def test_the_capture_line_splits_on_spaces_into_its_fields_in_order(
         ("lock", "LOCKED"),
         ("door", "CLOSED"),
         ("backlog", "True"),
-        ("raw", raw),
+        ("raw", frame),
         *decodes,
     ]

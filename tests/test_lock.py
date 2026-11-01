@@ -48,6 +48,7 @@ from yalexs_ble.session import (
     OperationFailedError,
     OperationIncompleteError,
     OperationProgress,
+    ResponseError,
     Session,
 )
 from yalexs_ble.util import _simple_checksum

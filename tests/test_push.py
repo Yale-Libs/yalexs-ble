@@ -18,7 +18,7 @@ from bleak_retry_connector import BleakNotFoundError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
-from yalexs_ble.activity_log import LogRecord
+from yalexs_ble.activity_log import LogRecord, parse_log_event_packet
 from yalexs_ble.const import (
     ASSA_ABLOY_MFR_ID,
     YALE_MFR_ID,
@@ -4448,7 +4448,7 @@ async def test_the_removal_of_the_last_callback_sends_no_further_get_log(
     assert received == [_RECORDS[0]]
     assert _commands(written) == commands
     assert replacement.await_args_list == (
-        [call(_GET_LOG_ERROR, False)] if replaced else []
+        [call(parse_log_event_packet(_GET_LOG_ERROR), False)] if replaced else []
     )
 
 
@@ -4688,8 +4688,8 @@ async def test_a_record_written_after_a_settled_lock_change_is_read_in_the_windo
         mock_lock.get_log = _log_on_a_clock(clock, [(changed + 1.5, _RECORDS[0])])
         delivered: list[float] = []
 
-        async def note_the_time(reply: bytes, _backlog: bool) -> None:
-            if reply == _RECORDS[0]:
+        async def note_the_time(record: LogRecord, _backlog: bool) -> None:
+            if record.raw == _RECORDS[0]:
                 delivered.append(clock[0] - changed)
 
         push_lock.register_log_record_callback(note_the_time)
@@ -4730,7 +4730,7 @@ async def test_the_get_log_sent_after_the_window_reads_a_record_written_in_it(
             clock[0] += transit
             return reply
 
-        async def take_time(_reply: bytes, _backlog: bool) -> None:
+        async def take_time(_record: LogRecord, _backlog: bool) -> None:
             clock[0] += callback_time
 
         mock_lock.get_log = AsyncMock(side_effect=get_log)
@@ -4752,7 +4752,9 @@ async def test_a_settled_lock_change_inside_the_window_moves_its_end() -> None:
         push_lock, mock_lock, received = _activity_push_lock([])
         mock_lock.get_log = _log_on_a_clock(clock, [])
 
-        async def unlock_at_the_second_reply(_reply: bytes, _backlog: bool) -> None:
+        async def unlock_at_the_second_reply(
+            _record: LogRecord, _backlog: bool
+        ) -> None:
             if len(received) == 2:
                 push_lock._update_any_state([LockStatus.UNLOCKED])
 
@@ -5006,7 +5008,7 @@ async def test_the_callbacks_run_with_the_operation_lock_released() -> None:
     push_lock, mock_lock, _ = _activity_push_lock([_RECORDS[0], _GET_LOG_ERROR])
     held: list[bool] = []
 
-    async def check(_reply: bytes, _backlog: bool) -> None:
+    async def check(_record: LogRecord, _backlog: bool) -> None:
         held.append(push_lock._operation_lock.locked())
 
     push_lock.register_log_record_callback(check)
@@ -5024,8 +5026,8 @@ async def test_a_change_during_a_drain_starts_the_next_drain_after_it() -> None:
     staged = asyncio.Event()
     release = asyncio.Event()
 
-    async def change_state(reply: bytes, _backlog: bool) -> None:
-        if reply == _RECORDS[0]:
+    async def change_state(record: LogRecord, _backlog: bool) -> None:
+        if record.raw == _RECORDS[0]:
             push_lock._update_any_state([DoorStatus.OPENED])
             staged.set()
             await release.wait()
@@ -5119,8 +5121,8 @@ async def test_the_keep_alive_polls_while_a_callback_holds_the_drain() -> None:
     waiting = asyncio.Event()
     release = asyncio.Event()
 
-    async def hold(reply: bytes, _backlog: bool) -> None:
-        if reply == _RECORDS[0]:
+    async def hold(record: LogRecord, _backlog: bool) -> None:
+        if record.raw == _RECORDS[0]:
             # Owes the next drain, so a drain is due while this one waits.
             push_lock._update_any_state([DoorStatus.OPENED])
             waiting.set()
@@ -5228,8 +5230,8 @@ async def test_a_dropped_link_ends_the_drain_with_no_connection_and_no_failure_c
         for index, record in enumerate(_RECORDS[:dropped])
     ]
 
-    async def record_and_drop(reply: bytes, backlog: bool) -> None:
-        received.append((reply, backlog))
+    async def record_and_drop(record: LogRecord, backlog: bool) -> None:
+        received.append((record.raw, backlog))
         if len(received) <= len(links):
             await drop(push_lock)
 
@@ -5398,7 +5400,7 @@ def _cancelling(_push_lock: PushLock) -> LogRecordCallback:
 
 
 def _stopping(push_lock: PushLock) -> LogRecordCallback:
-    async def stop(_reply: bytes, _backlog: bool) -> None:
+    async def stop(_record: LogRecord, _backlog: bool) -> None:
         push_lock._cancel()
         await asyncio.sleep(0)
 

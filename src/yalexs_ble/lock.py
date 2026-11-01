@@ -44,6 +44,7 @@ from .session import (
     KeycodeError,
     OperationFailedError,
     OperationProgress,
+    ResponseError,
     Session,
     YaleXSBLEError,
 )

@@ -2025,23 +2025,23 @@ class PushLock:
         )
 
     async def _activity_capture(
-        self, logger: logging.Logger, reply: bytes, backlog: bool
+        self, logger: logging.Logger, record: LogRecord, backlog: bool
     ) -> None:
-        """Log the capture line for reply; the log's end reschedules the next ask."""
+        """Log the capture line for record; the log's end reschedules the next ask."""
         since_change = None
         if self._last_settled_lock_change_time != NEVER_TIME:
             since_change = time.monotonic() - self._last_settled_lock_change_time
         activity_capture.log_record(
             logger,
             self.name,
-            reply,
+            record.raw,
             backlog,
             since_change,
             self.lock_status,
             self.door_status,
         )
         # A GetLogError with the dirty bit set is not the log's end.
-        if _log_is_empty(reply):
+        if _log_is_empty(record.raw):
             self._restart_activity_capture_timer(logger)
 
     def _restart_activity_capture_timer(self, logger: logging.Logger) -> None:

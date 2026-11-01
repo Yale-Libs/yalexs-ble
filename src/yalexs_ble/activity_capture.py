@@ -16,19 +16,13 @@ from datetime import UTC, datetime
 from enum import Enum
 from urllib.parse import quote
 
-from . import const
 from .activity_log import LogRecord, parse_log_event_packet
-from .const import DoorStatus, LockStatus, LogBrand
-from .util import _loggable_hex
+from .const import Brand, DoorStatus, LockStatus
 
 _LOGGER = logging.getLogger(__name__)
 
-# The line gives these as fields of its own.
-_FRAME_FIELDS = frozenset({"raw", "log_type"})
-
-# The record fields that hold a keypad code, kept apart from their byte positions
-# in util._GETLOG_CODE_START because activity_log imports util.
-_CODE_FIELDS = frozenset({"keycode", "code"})
+# The line gives raw as a field of its own; log_type is a property over it.
+_FRAME_FIELDS = frozenset({"raw"})
 
 
 def capture_logger(address: str) -> logging.Logger | None:
@@ -68,10 +62,10 @@ def log_record(
     lock status, or None when there has been none.
     """
     captured = time.time()
-    yale = parse_log_event_packet(reply, LogBrand.YALE)
+    yale = parse_log_event_packet(reply, Brand.YALE)
     time_stamp: int | None = getattr(yale, "time_stamp", None)
     yale_text = _decoded_field(yale)
-    august_text = _decoded_field(parse_log_event_packet(reply, LogBrand.AUGUST))
+    august_text = _decoded_field(parse_log_event_packet(reply, Brand.AUGUST))
     fields = [
         ("captured", _time(captured)),
         ("log_type", f"0x{reply[0x04]:02X}"),
@@ -81,7 +75,7 @@ def log_record(
         ("lock", lock.name),
         ("door", door.name),
         ("backlog", str(backlog)),
-        ("raw", _loggable_hex(reply)),
+        ("raw", reply.hex()),
         ("yale", yale_text),
     ]
     if august_text != yale_text:
@@ -112,8 +106,6 @@ def _value(name: str, value: object) -> str:
     if isinstance(value, int) and (name == "time_stamp" or name.endswith("_time")):
         return _time(value)
     if isinstance(value, str):
-        if const.MASK_SENSITIVE and name in _CODE_FIELDS:
-            return "****"
         # Percent-encoding leaves no space, comma, equals sign, or parenthesis
         # in the value.
         return quote(value, safe="")
