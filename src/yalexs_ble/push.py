@@ -21,10 +21,12 @@ from bleak_retry_connector import (
 )
 from lru import LRU  # pylint: disable=no-name-in-module
 
+from .activity_log import LogRecord, parse_log_event_packet
 from .const import (
     APPLE_MFR_ID,
     HAP_ENCRYPTED_FIRST_BYTE,
     HAP_FIRST_BYTE,
+    LOG_TYPE_GET_LOG_ERROR,
     MANUAL_INTERVENTION_STATUSES,
     SETUP_CONDITION_STATUSES,
     YALE_MFR_IDS,
@@ -34,9 +36,7 @@ from .const import (
     BatteryState,
     Brand,
     ConnectionInfo,
-    DoorActivity,
     DoorStatus,
-    LockActivity,
     LockInfo,
     LockState,
     LockStateValue,
@@ -205,6 +205,9 @@ ACTIVITY_PRIME_DELAY = 10.0
 # Consecutive drains that read records but never reach the end marker before
 # the log counts as one that never ends rather than a deep backlog.
 ACTIVITY_DRAIN_MAX_OVERRUNS = 8
+
+# Receives each decoded activity log record and its backlog flag.
+LogRecordCallback = Callable[[LogRecord, bool], Awaitable[None]]
 
 # How long to wait for the 0xBB settings response after the READSETTING ack
 # before treating the read as unresolved. The ack completes the solicited wait;
@@ -487,10 +490,10 @@ class PushLock:
         self._callbacks: list[
             Callable[[LockState, LockInfo, ConnectionInfo], None]
         ] = []
-        self._activity_callbacks: list[
-            Callable[[LockActivity | DoorActivity], None]
-        ] = []
-        self._activity_primed = False
+        self._activity_callbacks: list[LogRecordCallback] = []
+        # Records still to be flagged backlog; None until the next drain reads
+        # the unread count.
+        self._backlog_remaining: int | None = None
         self._activity_drain_pending = False
         self._activity_drain_failures = self._activity_overruns = 0
         self._earliest_activity_drain_time = NEVER_TIME
@@ -658,26 +661,26 @@ class PushLock:
         self._callbacks.append(callback)
         return unregister_callback
 
-    def register_activity_callback(
-        self, callback: Callable[[LockActivity | DoorActivity], None]
+    def register_log_record_callback(
+        self, callback: LogRecordCallback
     ) -> Callable[[], None]:
-        """Register a callback for each new lock activity record.
+        """Register an async callback for every log record and its backlog flag.
 
-        Records are read on the next update after a lock or door status change.
+        Returns the remover. Callbacks run under the operation lock, so one must
+        not await a command of this PushLock.
         """
         if not self._activity_callbacks:
-            # The first registration primes, so the backlog is not delivered as new.
-            self._activity_primed = False
+            self._backlog_remaining = None
             self._activity_drain_pending = True
             if self._running and self._lock_info is not None:
-                # Past the first update, so nothing else would prime soon.
+                # Past the first update, so nothing else would drain soon.
                 self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
         self._activity_callbacks.append(callback)
 
-        def unregister_activity_callback() -> None:
+        def unregister_log_record_callback() -> None:
             self._activity_callbacks.remove(callback)
 
-        return unregister_activity_callback
+        return unregister_log_record_callback
 
     def set_lock_key(self, key: str, slot: int) -> None:
         """Set the lock key."""
@@ -1387,8 +1390,9 @@ class PushLock:
         """Mark an operation as complete and reset timers."""
         self._last_operation_complete_time = now
         self._clear_reconnect_backoff()
-        if self._activity_callbacks and not self._activity_primed:
-            # A lock operation cancelled any pending update, the priming one included.
+        if self._activity_callbacks and self._backlog_remaining is None:
+            # A lock operation cancelled any pending update, the one that reads
+            # the unread count included.
             self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
         self._reset_disconnect_timer()
         self._reschedule_next_keep_alive()
@@ -1822,19 +1826,47 @@ class PushLock:
         return True
 
     async def _drain_activity(self, lock: Lock) -> None:
-        """Read the lock's activity log and deliver the records.
+        """Read the lock's activity log and deliver every record to every callback.
 
-        The first drain only primes, discarding the backlog. An incomplete
-        drain stays pending; records already read are delivered regardless.
+        A drain with no count reads the unread count first. A failed drain
+        stays pending; a cancellation during delivery loses that record for the
+        callbacks not yet run.
         """
         # Consumed before the await so a change during the drain is kept.
         self._activity_drain_pending = False
         records = 0
         try:
-            async for activity in lock.drain_lock_activity():
-                records += 1
-                if self._activity_primed:
-                    self._callback_activity(activity)
+            if self._backlog_remaining is None:
+                self._backlog_remaining = await lock.unread_event_count()
+            async with contextlib.aclosing(lock.drain_lock_activity()) as replies:
+                # Stop when no callback is left or a new backlog was armed.
+                while self._activity_callbacks and self._backlog_remaining is not None:
+                    if (reply := await anext(replies, None)) is None:
+                        break
+                    records += 1
+                    if reply[0x04] == LOG_TYPE_GET_LOG_ERROR:
+                        # The log is empty, so no later record is backlog.
+                        backlog = False
+                        self._backlog_remaining = 0
+                    else:
+                        # None: a backlog armed during this read.
+                        backlog = self._backlog_remaining != 0
+                        if self._backlog_remaining:
+                            self._backlog_remaining -= 1
+                    record = parse_log_event_packet(reply, self.brand)
+                    for callback in tuple(self._activity_callbacks):
+                        if callback not in self._activity_callbacks:
+                            continue
+                        try:
+                            await callback(record, backlog)
+                        except Exception:  # pylint: disable=broad-except
+                            _LOGGER.warning(
+                                "%s: Unexpected error in a log record callback"
+                                " (log_type 0x%02X)",
+                                self.name,
+                                record.log_type,
+                                exc_info=True,
+                            )
         except BaseException as err:
             self._activity_drain_pending = True
             if not isinstance(err, (BleakError, TimeoutError, ResponseError)):
@@ -1843,13 +1875,6 @@ class PushLock:
             return
         self._activity_drain_failures = 0
         self._activity_overruns = 0
-        if not self._activity_primed:
-            _LOGGER.debug(
-                "%s: Primed the activity log, discarding %d backlog records",
-                self.name,
-                records,
-            )
-        self._activity_primed = True
 
     def _note_activity_drain_failure(self, err: Exception, records: int) -> None:
         """Count a failed drain; after enough in a row, leave the log alone a while."""
@@ -1887,14 +1912,6 @@ class PushLock:
             err,
             ACTIVITY_DRAIN_FAILURE_BACKOFF,
         )
-
-    def _callback_activity(self, activity: LockActivity | DoorActivity) -> None:
-        """Call the activity callbacks."""
-        for callback in self._activity_callbacks:
-            try:
-                callback(activity)
-            except Exception:  # pylint: disable=broad-except
-                _LOGGER.exception("%s: Error calling activity callback", self.name)
 
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""

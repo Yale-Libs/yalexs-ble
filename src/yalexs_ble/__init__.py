@@ -38,7 +38,6 @@ from .activity_log import (
     parse_log_event_packet,
 )
 from .const import (
-    KEYPAD_MASTER_CODE_SLOT,
     LOG_TYPE_GET_LOG_ERROR,
     MANUAL_INTERVENTION_STATUSES,
     AugustLockOperationSource,
@@ -48,10 +47,8 @@ from .const import (
     BulkOperationType,
     ConnectionInfo,
     CredType,
-    DoorActivity,
     DoorStatus,
     JamState,
-    LockActivity,
     LockCred,
     LockInfo,
     LockOperationCredType,
@@ -91,7 +88,6 @@ from .util import (
 __version__ = "9.1.0"
 
 __all__ = [
-    "KEYPAD_MASTER_CODE_SLOT",
     "LOG_TYPE_GET_LOG_ERROR",
     "MANUAL_INTERVENTION_STATUSES",
     "AllCodesDeleted",
@@ -117,7 +113,6 @@ __all__ = [
     "DPSInfo",
     "DialogReboot",
     "DisconnectedError",
-    "DoorActivity",
     "DoorStateChanged",
     "DoorStatus",
     "FactoryReset",
@@ -132,7 +127,6 @@ __all__ = [
     "KeypadWrongCode",
     "LocalEventNotification",
     "Lock",
-    "LockActivity",
     "LockCred",
     "LockDeadboltJam",
     "LockInfo",

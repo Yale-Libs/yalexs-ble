@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from enum import Enum, IntEnum, IntFlag
 from typing import NotRequired, Self, TypedDict, TypeVar, cast
 
@@ -53,11 +52,6 @@ NO_BATTERY_SUPPORT_MODELS = {
     "CERES",  # Smart code handle
     "Yale Linus L2",  # Linus L2 Nordic
 }
-
-
-# Slot reported for unlocks with the keypad master (programming) code, which
-# is set at the keypad and cannot be read or written over BLE
-KEYPAD_MASTER_CODE_SLOT = 0xFFEE
 
 
 class Commands(IntEnum):
@@ -154,6 +148,8 @@ class StatusType(IntEnum):
     DOOR_ONLY = 0x2E
     DOOR_AND_LOCK = 0x2F
     BATTERY = 0x0F
+    # The activity log's unread count: records no client has read yet.
+    LOCK_EVENTS_UNREAD = 0x09
 
 
 class SettingType(IntEnum):
@@ -208,13 +204,6 @@ class AutoLockMode(IntEnum):
     INSTANT = 0
     TIMER = 1
     OFF = 2
-
-
-class LockActivityType(Enum):
-    LOCK = 0x00
-    KEYPAD_UNLOCK = 0x07
-    DOOR = 0x20
-    PIN = 0x0E
 
 
 @dataclass
@@ -522,21 +511,6 @@ class BulkOperationType(_OpenIntEnum):
 
     USERS_CLEAR = 0x01
     CREDS_CLEAR = 0x02
-
-
-@dataclass
-class LockActivity:
-    timestamp: datetime
-    status: LockStatus
-    # A 0x07 or 0x0E record is a credential use at slot; it has no opCode byte.
-    source: OpCode | None
-    slot: int | None = None
-
-
-@dataclass
-class DoorActivity:
-    timestamp: datetime
-    status: DoorStatus
 
 
 @dataclass

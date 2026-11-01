@@ -4,8 +4,7 @@ import asyncio
 import bisect
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Iterable
-from datetime import datetime
+from collections.abc import AsyncGenerator, Callable, Iterable
 from typing import Any, TypeVar, cast
 
 from bleak import BleakError
@@ -30,14 +29,10 @@ from .const import (
     AutoLockState,
     BatteryState,
     Commands,
-    DoorActivity,
     DoorStatus,
-    LockActivity,
-    LockActivityType,
     LockInfo,
     LockStateValue,
     LockStatus,
-    OpCode,
     OperationError,
     SettingType,
     StatusType,
@@ -167,7 +162,7 @@ def _poll_response_matcher(
     type in byte[4] rather than a status type, so it matches on the opcode
     alone; an acknowledgment carries back the request's own byte[4], which is
     zero for that command and reads as a lock operation record, so requiring
-    the 0xBB frame keeps an acknowledgment out of that parser too.
+    the 0xBB frame keeps an acknowledgment from being returned as a record.
     auto_lock_status is a poll too, but it completes on its acknowledgment by
     design (see its docstring), so it is not typed here.
     """
@@ -420,6 +415,9 @@ class Lock:
                     return self._parse_lock_and_door_state(state)
                 if state[4] == StatusType.BATTERY.value:
                     return [self._parse_battery_state(state)]
+                if state[4] == StatusType.LOCK_EVENTS_UNREAD.value:
+                    # Answered through unread_event_count(); no state to publish.
+                    return ()
             elif (
                 state[1] == Commands.WRITESETTING.value
                 or state[1] == Commands.READSETTING.value
@@ -880,17 +878,8 @@ class Lock:
 
     @raise_if_not_connected
     async def lock_status(self) -> LockStatus:
-        _LOGGER.debug("%s: Executing lock_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
-        response = await self._execute_command(
-            Commands.GETSTATUS,
-            StatusType.LOCK_ONLY,
-            "lock_status",
-            _poll_response_matcher(
-                Commands.GETSTATUS.value, StatusType.LOCK_ONLY.value
-            ),
-        )
-        _LOGGER.debug("%s: Finished executing lock_status", self.name)
+        response = await self._poll_status(StatusType.LOCK_ONLY, "lock_status")
         # The answering frame was already decoded and logged on the notify
         # path, so the bare lookup here keeps the unrecognized-code
         # diagnostic to one line per frame.
@@ -898,17 +887,8 @@ class Lock:
 
     @raise_if_not_connected
     async def door_status(self) -> DoorStatus:
-        _LOGGER.debug("%s: Executing door_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
-        response = await self._execute_command(
-            Commands.GETSTATUS,
-            StatusType.DOOR_ONLY,
-            "door_status",
-            _poll_response_matcher(
-                Commands.GETSTATUS.value, StatusType.DOOR_ONLY.value
-            ),
-        )
-        _LOGGER.debug("%s: Finished executing door_status", self.name)
+        response = await self._poll_status(StatusType.DOOR_ONLY, "door_status")
         # The answering frame was already decoded and logged on the notify
         # path, so the bare lookup here keeps the unrecognized-code
         # diagnostic to one line per frame.
@@ -925,16 +905,35 @@ class Lock:
         percentage = convert_voltage_to_percentage(voltage / 4)
         return BatteryState(voltage, percentage)
 
-    @raise_if_not_connected
-    async def battery(self) -> BatteryState:
-        _LOGGER.debug("%s: Executing battery", self.name)
+    async def _poll_status(self, status_type: StatusType, name: str) -> bytes:
+        """Send a GetStatus for status_type and return the reply of that subtype."""
+        _LOGGER.debug("%s: Executing %s", self.name, name)
         response = await self._execute_command(
             Commands.GETSTATUS,
-            StatusType.BATTERY,
-            "battery",
-            _poll_response_matcher(Commands.GETSTATUS.value, StatusType.BATTERY.value),
+            status_type,
+            name,
+            _poll_response_matcher(Commands.GETSTATUS.value, status_type.value),
         )
-        _LOGGER.debug("%s: Finished executing battery", self.name)
+        _LOGGER.debug("%s: Finished executing %s", self.name, name)
+        return response
+
+    @raise_if_not_connected
+    async def unread_event_count(self) -> int:
+        """Read the activity log's unread count; the read removes no record.
+
+        A negative count, signed at bytes 8 to 11, is not a depth and raises.
+        """
+        response = await self._poll_status(
+            StatusType.LOCK_EVENTS_UNREAD, "unread_event_count"
+        )
+        count = util._bytes_to_int(response[0x08:0x0C], signed=True)
+        if count < 0:
+            raise ResponseError(f"Unread count {count} is not a depth")
+        return count
+
+    @raise_if_not_connected
+    async def battery(self) -> BatteryState:
+        response = await self._poll_status(StatusType.BATTERY, "battery")
         return self._parse_battery_state(response)
 
     @raise_if_not_connected
@@ -956,75 +955,6 @@ class Lock:
         )
         _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
 
-    def _parse_unix_timestamp(self, timestamp_bytes: bytes) -> datetime:
-        """Parse the unix timestamp to datetime from the bytes."""
-        _LOGGER.debug(
-            "%s: Parsing unix timestamp: %s", self.name, timestamp_bytes.hex()
-        )
-        unix_timestamp = int.from_bytes(timestamp_bytes, byteorder="little")
-        _LOGGER.debug("%s: Parsed unix timestamp: %d", self.name, unix_timestamp)
-        return datetime.fromtimestamp(unix_timestamp)
-
-    def _parse_lock_activity(
-        self, response: bytes
-    ) -> DoorActivity | LockActivity | None:
-        """Parse the lock activity from the response."""
-        # We only know a subset of lock activities currently
-        # response[0x04] seems to be the activity type
-        # the rest of the response is data for the activity,
-        # format seems to be specific to each individual activity type
-        activity_type = response[0x04]
-        _LOGGER.debug("%s: Activity type: 0x%02X", self.name, activity_type)
-        if activity_type == LOG_TYPE_GET_LOG_ERROR:
-            _LOGGER.debug("%s: No activity", self.name)
-            return None
-
-        if activity_type == LockActivityType.DOOR.value:
-            # Timestamp is at 0x05-0x08
-            # Door status is at 0x09
-            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            door_status = self._parse_door_status(response[0x09])
-            return DoorActivity(timestamp, door_status)
-        if activity_type == LockActivityType.LOCK.value:
-            # Timestamp is at 0x08-0x0B
-            # Lock status is at 0x06
-            # The opCode is at 0x05
-            timestamp = self._parse_unix_timestamp(response[0x08:0x0C])
-            lock_status = self._parse_lock_status(response[0x06])
-
-            return LockActivity(
-                timestamp,
-                lock_status,
-                source=OpCode(response[0x05]),
-            )
-        if activity_type == LockActivityType.PIN.value:
-            # Timestamp is at 0x05-0x08
-            # Slot is at 0x0A
-            # Lock status seems to be at lower half of 0x0C
-            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            pin_slot = response[0x0A]
-            lock_status = self._parse_lock_status(response[0x0C] & 0x0F)
-
-            return LockActivity(
-                timestamp,
-                lock_status,
-                source=None,
-                slot=pin_slot,
-            )
-        if activity_type == LockActivityType.KEYPAD_UNLOCK.value:
-            # Timestamp is at 0x05-0x08
-            # Slot is a uint16 at 0x0E-0x0F; 0xFFEE is the keypad master code
-            timestamp = self._parse_unix_timestamp(response[0x05:0x09])
-            slot = util._bytes_to_int(response[0x0E:0x10])
-            return LockActivity(
-                timestamp,
-                LockStatus.UNLOCKED,
-                source=None,
-                slot=slot,
-            )
-        _LOGGER.debug("%s: Unknown activity type: 0x%02X", self.name, activity_type)
-        return None
-
     @raise_if_not_connected
     async def get_log(self) -> bytes:
         """Pop the oldest record from the lock's activity log."""
@@ -1035,29 +965,21 @@ class Lock:
             _GETLOG_MATCHER,
         )
 
-    @raise_if_not_connected
-    async def lock_activity(self) -> DoorActivity | LockActivity | None:
-        _LOGGER.debug("%s: Executing lock_activity", self.name)
-        response = await self.get_log()
-        _LOGGER.debug("%s: Finished executing lock_activity", self.name)
-        return self._parse_lock_activity(response)
+    async def drain_lock_activity(self) -> AsyncGenerator[bytes]:
+        """Yield each GetLog reply unchanged, ending after the GetLogError record.
 
-    async def drain_lock_activity(self) -> AsyncIterator[DoorActivity | LockActivity]:
-        """Pop and yield records until the end marker; raise past the read cap.
-
-        Each read pops the lock's oldest record, so records are yielded as
-        they arrive. Unknown types are skipped.
+        The next GetLog is sent when the caller asks for the next reply. Raises
+        ActivityLogOverrunError past the read cap.
         """
         if not self.is_connected:
             raise DisconnectedError("Lock is not connected")
         _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
         for _ in range(MAX_ACTIVITY_RECORDS):
             response = await self.get_log()
+            yield response
             if response[0x04] == LOG_TYPE_GET_LOG_ERROR:
                 _LOGGER.debug("%s: Finished drain_lock_activity", self.name)
                 return
-            if (activity := self._parse_lock_activity(response)) is not None:
-                yield activity
         raise ActivityLogOverrunError(
             f"{self.name}: Activity log did not end within {MAX_ACTIVITY_RECORDS} reads"
         )
