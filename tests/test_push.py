@@ -13,7 +13,7 @@ import pytest
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakDBusError, BleakError
-from bleak_retry_connector import BleakNotFoundError
+from bleak_retry_connector import BleakConnectionError, BleakNotFoundError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
@@ -8473,3 +8473,97 @@ async def test_an_op_response_the_lock_parses_holds_the_next_read_off():
     lock._parse_state(bytes(_with_checksum(_OP_RESPONSE_OK)))
 
     assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+def _records_above_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> list[tuple[str, int, str, bool]]:
+    """Each yalexs_ble record above DEBUG: logger, level, message, has a traceback."""
+    return [
+        (r.name, r.levelno, r.getMessage(), r.exc_info is not None)
+        for r in caplog.records
+        if r.name.startswith("yalexs_ble") and r.levelno > logging.DEBUG
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_first_update_whose_retry_connects_logs_nothing_above_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A first update whose retry connects after a failed connect logs only debug."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:DE", always_connected=False)
+    device = BLEDevice(push_lock.address, "Test Lock", None)
+    push_lock.set_ble_device(device)
+    failing = push_lock._get_lock_instance()
+    link = MagicMock(is_connected=True)
+    link.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    link.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    link.connect = AsyncMock()
+    link.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
+    link.battery = AsyncMock()
+    link.auto_lock_status = AsyncMock()
+    error = BleakConnectionError("Failed to connect after 1 attempt(s): Disconnected")
+    establish = AsyncMock(side_effect=error)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble"),
+        patch("yalexs_ble.lock.establish_connection", establish),
+        patch.object(push_lock, "_get_lock_instance", side_effect=[failing, link]),
+    ):
+        with patch("yalexs_ble.push.get_device", AsyncMock(return_value=device)):
+            await push_lock.start()
+        await push_lock.wait_for_first_update(1)
+
+    establish.assert_awaited_once()
+    assert establish.await_args_list[0].kwargs["max_attempts"] == 1
+    link.connect.assert_awaited_once()
+    assert (
+        "yalexs_ble.lock",
+        logging.DEBUG,
+        f"Test Lock: Failed to connect to the lock: {error}",
+    ) in [(r.name, r.levelno, r.getMessage()) for r in caplog.records]
+    assert _records_above_debug(caplog) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "logged", "traceback", "connects"),
+    [
+        (
+            BleakNotFoundError("Failed to connect after 4 attempt(s): not found"),
+            "Test Lock: Failed to connect to the lock: "
+            "Failed to connect after 4 attempt(s): not found",
+            False,
+            1,
+        ),
+        (
+            BleakConnectionError("Failed to connect after 4 attempt(s): Disconnected"),
+            "Test Lock: Bluetooth error updating",
+            True,
+            DEFAULT_ATTEMPTS,
+        ),
+    ],
+    ids=["not-found", "connection-error"],
+)
+async def test_an_update_that_cannot_connect_logs_one_error_from_the_cycle(
+    error: Exception,
+    logged: str,
+    traceback: bool,
+    connects: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An update whose connects all fail logs one error, from the update cycle."""
+    push_lock = _backoff_lock("AA:BB:CC:DD:EE:DF", always_connected=False)
+    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
+    establish = AsyncMock(side_effect=error)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble"),
+        patch("yalexs_ble.lock.establish_connection", establish),
+    ):
+        await push_lock._execute_deferred_update()
+
+    assert establish.await_count == connects
+    assert _records_above_debug(caplog) == [
+        ("yalexs_ble.push", logging.ERROR, logged, traceback)
+    ]

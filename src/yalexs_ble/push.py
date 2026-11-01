@@ -2272,7 +2272,7 @@ class PushLock:
             wrapped_bleak_exc = BluetoothError(str(ex))
             wrapped_bleak_exc.__cause__ = ex
             self._set_update_state(wrapped_bleak_exc)
-            _LOGGER.debug("%s: not found error updating", self.name, exc_info=True)
+            _LOGGER.error("%s: Failed to connect to the lock: %s", self.name, ex)
         except BleakError as ex:
             wrapped_bleak_exc = BluetoothError(str(ex))
             wrapped_bleak_exc.__cause__ = ex
