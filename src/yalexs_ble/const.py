@@ -591,6 +591,6 @@ class YaleXSBLEDiscovery(TypedDict):
     serial: str
     key: str
     slot: int
-    # A Brand value. Only the app a lock is paired with knows its numbering;
-    # the same hardware ships under both brands.
+    # A Brand value: the app the lock is paired with, which alone tells the
+    # brand of a model that ships under both.
     brand: NotRequired[str]
