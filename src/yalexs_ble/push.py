@@ -32,6 +32,7 @@ from .const import (
     AutoLockMode,
     AutoLockState,
     BatteryState,
+    Brand,
     ConnectionInfo,
     DoorActivity,
     DoorStatus,
@@ -459,6 +460,7 @@ class PushLock:
         idle_disconnect_delay: float = DISCONNECT_DELAY,
         always_connected: bool = False,
         idle_disconnect_delay_pending_update: float = DISCONNECT_DELAY_PENDING_UPDATE,
+        brand: Brand | str | None = None,
     ) -> None:
         """Init the lock watcher."""
         if local_name is None and address is None:
@@ -471,6 +473,8 @@ class PushLock:
         self._address = address
         self._name: str | None = None
         self._lock_info: LockInfo | None = None
+        # A str is a Brand value, as a stored discovery hands it back.
+        self._brand = Brand(brand) if brand is not None else None
         self._lock_state: LockState | None = None
         self._last_adv_value = -1
         self._last_hk_state = -1
@@ -609,6 +613,13 @@ class PushLock:
     def lock_info(self) -> LockInfo | None:
         """Return the current lock info."""
         return self._lock_info
+
+    @property
+    def brand(self) -> Brand:
+        """The lock's brand: certain from its model, else as paired, else August."""
+        if self._lock_info is not None and (known := self._lock_info.brand) is not None:
+            return known
+        return self._brand or Brand.AUGUST
 
     @property
     def connection_info(self) -> ConnectionInfo | None:

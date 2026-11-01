@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum, IntEnum
-from typing import TypedDict, cast
+from enum import Enum, IntEnum, IntFlag
+from typing import NotRequired, Self, TypedDict, TypeVar, cast
 
 COMMAND_SERVICE_UUID = "0000fe24-0000-1000-8000-00805f9b34fb"
 WRITE_CHARACTERISTIC = "bd4ac611-0b45-11e3-8ffd-0800200c9a66"
@@ -34,6 +34,18 @@ FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 # The Model Number characteristic carries regional and firmware suffixes
 # such as "SL-103-EU", so the tables match an entry or a suffixed variant.
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
+
+# BLE model numbers seen in the field that pair with one brand's app alone. The
+# Assure locks, their MD-01 module and the smart safe pair with either and are in
+# neither list: only the pairing tells theirs.
+AUGUST_MODEL_PREFIX = "ASL-"
+YALE_MODELS = {
+    "SL-103",  # Linus L2
+    "Yale Linus L2",  # Linus L2 Nordic
+    "CERES",  # Smart code handle
+    "MD-04I",  # Conexis L1 and L2
+}
+YALE_MODEL_PREFIXES = ("YUR/",)  # Unity
 
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these exclusions
 NO_BATTERY_SUPPORT_MODELS = {
@@ -235,12 +247,31 @@ class LockState:
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
 
 
-class OpCode(Enum):
-    """The opCode at byte 5 of a type 0x00 activity record.
+_EnumT = TypeVar("_EnumT", bound=Enum)
 
-    A value the table does not name becomes an UNKNOWN_xx member, so the record
-    keeps it and source stays an OpCode.
-    """
+
+def _unknown_member(cls: type[_EnumT], member: _EnumT, value: int) -> _EnumT:
+    """Name member UNKNOWN_xx for value; a one-byte value is kept so repeats share."""
+    member._name_ = f"UNKNOWN_{value:02X}"
+    member._value_ = value
+    if value > 0xFF:
+        # Not registered: a two-byte field could register 65536 of them from bad frames.
+        return member
+    return cast(_EnumT, cls._value2member_map_.setdefault(value, member))
+
+
+class _OpenIntEnum(IntEnum):
+    """An IntEnum that keeps a value it does not name as an UNKNOWN_xx member."""
+
+    @classmethod
+    def _missing_(cls, value: object) -> Self | None:
+        if not isinstance(value, int):
+            return None
+        return _unknown_member(cls, int.__new__(cls, value), value)
+
+
+class OpCode(Enum):
+    """The opCode at byte 5 of a type 0x00 record; an unnamed value is UNKNOWN_xx."""
 
     # Based on the vendor's term. Locks have been observed to record a lock or unlock
     # commanded over BLE with this value.
@@ -273,10 +304,224 @@ class OpCode(Enum):
     def _missing_(cls, value: object) -> OpCode | None:
         if not isinstance(value, int):
             return None
-        member = object.__new__(cls)
-        member._name_ = f"UNKNOWN_{value:02X}"
-        member._value_ = value
-        return cast(OpCode, cls._value2member_map_.setdefault(value, member))
+        return _unknown_member(cls, object.__new__(cls), value)
+
+
+class Brand(Enum):
+    """The brand a lock is paired with, which sets its activity log's numbering."""
+
+    YALE = "yale"
+    AUGUST = "august"
+
+
+class LogType(IntEnum):
+    """The log_type at byte 4 of a GetLog reply, in Yale's numbering."""
+
+    LOCK_OPERATION = 0x00
+    KEYPAD_OPEN = 0x01
+    KEYPAD_WRONG_CODE = 0x02
+    CODE_ADDED = 0x03
+    KEYPAD_INFO = 0x04
+    CODE_DELETED = 0x05
+    ALL_CODES_DELETED = 0x06
+    CODE_OPERATION = 0x07
+    KEYPAD_CLOSE = 0x08
+    FACTORY_RESET = 0x09
+    CODE_ADDED_V2 = 0x0A
+    CODE_DELETED_V2 = 0x0B
+    CREDENTIAL_ADDED = 0x0C
+    CREDENTIAL_DELETED = 0x0D
+    CREDENTIAL_OPERATION = 0x0E
+    TAMPER = 0x0F
+    BCM_TEST = 0x10
+    ACCESSORY_EVENT = 0x11
+    HOMEKEY_OPERATION = 0x12
+    DPS_INFO = 0x13
+    BATTERY_INFO = 0x15
+    LOCAL_EVENT_NOTIFICATION = 0x16
+    PRODUCT_MESSAGE = 0x17
+    MATTER_MESSAGE = 0x18
+    DOOR_STATE_CHANGED = 0x20
+    DIALOG_REBOOT = 0x40
+    GET_LOG_ERROR = LOG_TYPE_GET_LOG_ERROR
+
+
+class AugustLogType(IntEnum):
+    """The log_type at byte 4 of a GetLog reply, in August's numbering."""
+
+    LOCK_OPERATION = 0x00
+    KEYPAD_OPEN = 0x01
+    KEYPAD_WRONG_CODE = 0x02
+    CODE_ADDED = 0x03
+    KEYPAD_INFO = 0x04
+    CODE_DELETED = 0x05
+    ALL_CODES_DELETED = 0x06
+    CODE_OPERATION = 0x07
+    KEYPAD_CLOSE = 0x08
+    FACTORY_RESET = 0x09
+    CODE_ADDED_V2 = 0x0A
+    CODE_DELETED_V2 = 0x0B
+    EXTERNAL_CREDENTIAL_ADDED = 0x0C
+    EXTERNAL_CREDENTIAL_DELETED = 0x0D
+    CREDENTIAL_OPERATION = 0x0E
+    TAMPER = 0x0F
+    BCM_TEST = 0x10
+    ACCESSORY_EVENT = 0x11
+    HOMEKEY_OPERATION = 0x12
+    DPS_INFO = 0x13
+    LOCK_OPERATING_MODE = 0x14
+    WIFI_INFO = 0x15
+    LOCK_DEADBOLT_JAM = 0x16
+    INVALID_CREDENTIAL_ENTRY = 0x17
+    MATTER_EVENT = 0x18
+    LOCK_OPERATION_BLAME = 0x19
+    OUT_OF_SCHEDULE_CREDENTIAL = 0x1D
+    BULK_OPERATION = 0x1E
+    DOOR_STATE_CHANGED = 0x20
+    DIALOG_REBOOT = 0x40
+    GET_LOG_ERROR = LOG_TYPE_GET_LOG_ERROR
+
+
+class LockCred(_OpenIntEnum):
+    """The credential type of a credential record."""
+
+    PIN = 0x00
+    RF = 0x01
+    FINGER = 0x02
+    FACE = 0x04
+    INSIDE_DOOR_PIN = 0x05
+    PALM = 0x06
+    ALIRO = 0x08
+    ALL = 0xFF
+
+
+class TamperType(_OpenIntEnum):
+    """The tamper type of a Tamper record."""
+
+    CLEAR = 0x00
+    TOO_MANY_AUTH_ERRORS = 0x01
+    FRONT_REMOVED = 0x02
+    DOOR_FORCED_OPEN = 0x03
+    HIGH_TEMPERATURE = 0x04
+    TOO_MANY_AUTH_ERRORS_PIN = 0x05
+    TOO_MANY_AUTH_ERRORS_PIN_CLEARED = 0x06
+    TOO_MANY_AUTH_ERRORS_RFID = 0x07
+    TOO_MANY_AUTH_ERRORS_RFID_CLEARED = 0x08
+    TOO_MANY_AUTH_ERRORS_FINGERPRINT = 0x09
+    TOO_MANY_AUTH_ERRORS_FINGERPRINT_CLEARED = 0x0A
+    TOO_MANY_AUTH_ERRORS_PALM = 0x0B
+    TOO_MANY_AUTH_ERRORS_PALM_CLEARED = 0x0C
+    TOO_MANY_AUTH_ERRORS_FACE_SCAN = 0x0D
+    TOO_MANY_AUTH_ERRORS_FACE_SCAN_CLEARED = 0x0E
+
+
+class OperatingMode(_OpenIntEnum):
+    """The operating mode of August's LockOperatingMode record."""
+
+    NORMAL = 0x00
+    VACATION = 0x01
+    PRIVACY = 0x02
+    PASSAGE = 0x03
+
+
+class JamState(_OpenIntEnum):
+    """The jam state of August's LockDeadboltJam record."""
+
+    OCCURS_DURING_LOCKING = 0x00
+    OCCURS_DURING_UNLOCKING = 0x01
+
+
+class CredType(_OpenIntEnum):
+    """The cred_type of August's InvalidCredentialEntry and OutOfScheduleCredential."""
+
+    ENTRY_KEYPAD_PINCODE = 0x0000
+    ENTRY_KEYPAD_FINGERPRINT = 0x0002
+    ENTRY_AUX_KEYPAD_PINCODE = 0x0100
+    ENTRY_AUX_KEYPAD_FINGERPRINT = 0x0102
+    ENTRY_APPLE_HOMEKEYS_NFC = 0x1001
+    ENTRY_SAMSUNG_WALLET_NFC = 0x1101
+    ENTRY_GOOGLE_WALLET_NFC = 0x1201
+    ENTRY_RFID_CARD_MIFARE_DESFIRE_EV1_NFC = 0x2101
+    ENTRY_RFID_CARD_MIFARE_DESFIRE_EV2_NFC = 0x2201
+    ENTRY_RFID_CARD_MIFARE_DESFIRE_EV3_NFC = 0x2301
+    ENTRY_MATTER_FABRIC_MATTER = 0x3003
+    ENTRY_UNKNOWN = 0xFFFF
+
+
+class OutOfScheduleType(_OpenIntEnum):
+    """The violation type of August's OutOfScheduleCredential record."""
+
+    PREMATURE = 0x00
+    EXPIRED = 0x01
+
+
+class MatterEventType(_OpenIntEnum):
+    """The event type of August's MatterEvent record."""
+
+    REGISTRATION = 0x00
+    FABRIC_ADDED = 0x01
+    FABRIC_REMOVED = 0x02
+
+
+class MatterRegistrationStatus(_OpenIntEnum):
+    """The registration status of August's MatterEvent record."""
+
+    OK = 0x00
+    FAIL = 0x01
+    UNKNOWN = 0xFF
+
+
+class LockOperationType(_OpenIntEnum):
+    """The operation type of August's LockOperationBlame record."""
+
+    LOCK = 0x00
+    UNLOCK = 0x01
+
+
+class AugustLockOperationSource(_OpenIntEnum):
+    """The operation source of August's LockOperationBlame record."""
+
+    BLE = 0x01
+    KEYPAD = 0x02
+    LOCK_BUTTON = 0x03
+    AUTORELOCK = 0x04
+    MANUAL = 0x05
+    MATTER = 0x06
+    ZWAVE = 0x07
+
+
+class LockOperationCredType(IntFlag):
+    """The credential types of August's LockOperationBlame and BulkOperation records."""
+
+    PIN = 0x02
+    RF_ID = 0x04
+    FINGERPRINT = 0x08
+    RF_ID_HID = 0x10
+    FACE = 0x20
+    INSIDE_DOOR_PIN = 0x40
+    BLE = 0x80
+
+
+class LockOperationStatus(_OpenIntEnum):
+    """The operation status of August's LockOperationBlame record."""
+
+    SUCCESS = 0x00
+    FAIL = 0x01
+    LOW_BATTERY = 0x02
+    JAMMED = 0x03
+    NON_CALIBRATED = 0x04
+    TIMEOUT = 0x05
+    INVALID_CRED = 0x06
+    DISABLED_USER = 0x07
+    OUTSIDE_SCHEDULE = 0x08
+    NON_ACCESS = 0x09
+
+
+class BulkOperationType(_OpenIntEnum):
+    """The operation type of August's BulkOperation record."""
+
+    USERS_CLEAR = 0x01
+    CREDS_CLEAR = 0x02
 
 
 @dataclass
@@ -316,6 +561,15 @@ class LockInfo:
         """Check if the lock answers battery status requests."""
         return not self._model_in(NO_BATTERY_SUPPORT_MODELS)
 
+    @property
+    def brand(self) -> Brand | None:
+        """The one brand the model ships under; None for a model sold under both."""
+        if self.model.startswith(AUGUST_MODEL_PREFIX):
+            return Brand.AUGUST
+        if self.model.startswith(YALE_MODEL_PREFIXES) or self._model_in(YALE_MODELS):
+            return Brand.YALE
+        return None
+
     def _model_in(self, models: set[str]) -> bool:
         """True for a listed model or a suffixed variant of one, not a longer number."""
         return any(
@@ -337,3 +591,6 @@ class YaleXSBLEDiscovery(TypedDict):
     serial: str
     key: str
     slot: int
+    # A Brand value: the app the lock is paired with, which alone tells the
+    # brand of a model that ships under both.
+    brand: NotRequired[str]
