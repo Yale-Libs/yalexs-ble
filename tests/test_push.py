@@ -17,6 +17,7 @@ from bleak_retry_connector import BleakNotFoundError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
+from yalexs_ble.activity_log import LogRecord
 from yalexs_ble.const import (
     ASSA_ABLOY_MFR_ID,
     YALE_MFR_ID,
@@ -3960,10 +3961,10 @@ def _count_reply(count: int) -> bytes:
 def _recorder(received: list[tuple[bytes, bool]]) -> LogRecordCallback:
     """A log record callback that keeps each record with its backlog flag."""
 
-    async def record(reply: bytes, backlog: bool) -> None:
-        received.append((reply, backlog))
+    async def keep(record: LogRecord, backlog: bool) -> None:
+        received.append((record.raw, backlog))
 
-    return record
+    return keep
 
 
 def _ready_to_drain(push_lock: PushLock) -> None:
@@ -4109,13 +4110,13 @@ async def test_the_next_get_log_waits_for_every_callback_in_registration_order()
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def slow(reply: bytes, _backlog: bool) -> None:
-        calls.append(("slow", reply))
+    async def slow(record: LogRecord, _backlog: bool) -> None:
+        calls.append(("slow", record.raw))
         started.set()
         await release.wait()
 
-    async def fast(reply: bytes, _backlog: bool) -> None:
-        calls.append(("fast", reply))
+    async def fast(record: LogRecord, _backlog: bool) -> None:
+        calls.append(("fast", record.raw))
 
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:c3", always_connected=False)
     push_lock.register_log_record_callback(slow)
@@ -4254,8 +4255,8 @@ async def test_no_get_log_follows_the_removal_of_the_last_callback(
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:c4", always_connected=False)
     received: list[bytes] = []
 
-    async def once(reply: bytes, _backlog: bool) -> None:
-        received.append(reply)
+    async def once(record: LogRecord, _backlog: bool) -> None:
+        received.append(record.raw)
         unregister()
         if replaced:
             push_lock.register_log_record_callback(AsyncMock())
@@ -4280,10 +4281,10 @@ async def test_a_callback_removed_during_a_record_receives_nothing_more() -> Non
     first: list[bytes] = []
     second: list[tuple[bytes, bool]] = []
 
-    async def remove_second(reply: bytes, _backlog: bool) -> None:
+    async def remove_second(record: LogRecord, _backlog: bool) -> None:
         if not first:
             unregister_second()
-        first.append(reply)
+        first.append(record.raw)
 
     push_lock.register_log_record_callback(remove_second)
     unregister_second = push_lock.register_log_record_callback(_recorder(second))
@@ -4305,8 +4306,8 @@ async def test_a_callback_removing_itself_skips_no_other_callback() -> None:
     first: list[bytes] = []
     second: list[tuple[bytes, bool]] = []
 
-    async def remove_self(reply: bytes, _backlog: bool) -> None:
-        first.append(reply)
+    async def remove_self(record: LogRecord, _backlog: bool) -> None:
+        first.append(record.raw)
         unregister_self()
 
     unregister_self = push_lock.register_log_record_callback(remove_self)
@@ -4617,7 +4618,7 @@ async def test_activity_status_change_during_drain_stays_pending() -> None:
         [[_RECORDS[0], _GET_LOG_ERROR], [_RECORDS[1], _GET_LOG_ERROR]]
     )
 
-    async def change_state(_reply: bytes, _backlog: bool) -> None:
+    async def change_state(_record: LogRecord, _backlog: bool) -> None:
         push_lock._update_any_state([LockStatus.LOCKED])
 
     push_lock._activity_callbacks.insert(0, change_state)

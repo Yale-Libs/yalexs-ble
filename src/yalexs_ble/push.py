@@ -21,6 +21,7 @@ from bleak_retry_connector import (
 )
 from lru import LRU  # pylint: disable=no-name-in-module
 
+from .activity_log import LogRecord, parse_log_event_packet
 from .const import (
     APPLE_MFR_ID,
     HAP_ENCRYPTED_FIRST_BYTE,
@@ -207,7 +208,7 @@ ACTIVITY_PRIME_DELAY = 10.0
 ACTIVITY_DRAIN_MAX_OVERRUNS = 8
 
 # Receives each activity log record's 18 bytes and its backlog flag.
-LogRecordCallback = Callable[[bytes, bool], Awaitable[None]]
+LogRecordCallback = Callable[[LogRecord, bool], Awaitable[None]]
 
 # How long to wait for the 0xBB settings response after the READSETTING ack
 # before treating the read as unresolved. The ack completes the solicited wait;
@@ -666,7 +667,8 @@ class PushLock:
     ) -> Callable[[], None]:
         """Register an async callback for every activity log record; return its remover.
 
-        The callback receives each record's 18 bytes and a backlog flag. After a
+        The callback receives each record, decoded with the lock's brand and
+        holding its 18 bytes in raw, and a backlog flag. After a
         callback registers into an empty list, the next drain reads the lock's
         unread count, and the flag is true for up to that many records. A drain
         awaits every callback, in registration order, before its next GetLog,
@@ -1865,6 +1867,7 @@ class PushLock:
                         backlog = self._backlog_remaining != 0
                         if self._backlog_remaining:
                             self._backlog_remaining -= 1
+                    record = parse_log_event_packet(reply, self.brand)
                     # A reply read while the last callback was removed is off
                     # the lock and reaches nobody.
                     for callback in tuple(self._activity_callbacks):
@@ -1872,7 +1875,7 @@ class PushLock:
                             # Removed while an earlier callback had the record.
                             continue
                         try:
-                            await callback(reply, backlog)
+                            await callback(record, backlog)
                         # The GetLog took the record off the lock, so this
                         # reader has lost it.
                         except Exception:  # pylint: disable=broad-except
@@ -1880,7 +1883,7 @@ class PushLock:
                                 "%s: Unexpected error in a log record callback"
                                 " (log_type 0x%02X)",
                                 self.name,
-                                reply[0x04],
+                                record.log_type,
                                 exc_info=True,
                             )
         except BaseException as err:
