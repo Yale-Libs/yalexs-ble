@@ -58,8 +58,13 @@ class Commands(IntEnum):
     KEYCODE_CLEAR = 0x28
     KEYCODE_ACCESS = 0x2B
     KEYCODE_COMMIT = 0x2C
-    LOCK_ACTIVITY = 0x2D
+    GETLOG = 0x2D
     KEYCODE_GET = 0x39
+
+
+# The log_type at byte 4 of the GETLOG reply that ends the log, the vendor's
+# GetLogError record.
+LOG_TYPE_GET_LOG_ERROR = 0x80
 
 
 class OperationError(IntEnum):
@@ -154,7 +159,13 @@ class LockStatus(Enum):
     JAMMED = 0x07  # STATICPOSITION
     UNLATCHING = 0x09
     UNLATCHED = 0x0A
+    INTEGRATED_OTHER_SYSTEM = 0x0B
     SECUREMODE = 0x0C
+    MASTER_CODE_NOT_SET = 0x0D
+    DEFAULT_MASTER_CODE_SET = 0x0E
+    LOCK_NOT_HANDED = 0x0F
+    SHABBAT_MODE = 0x10
+    INTERNAL_FORCED_LOCKED = 0x11
 
 
 VALUE_TO_LOCK_STATUS = {status.value: status for status in LockStatus}
@@ -192,7 +203,6 @@ class LockActivityType(Enum):
     KEYPAD_UNLOCK = 0x07
     DOOR = 0x20
     PIN = 0x0E
-    NONE = 0x80
 
 
 @dataclass

@@ -256,7 +256,7 @@ def test_parse_success_op_response_with_0200_trailer_is_no_update(
 def test_parse_lock_activity_is_no_update(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A LOCK_ACTIVITY (0xBB 0x2D) frame is recognized with no state update."""
+    """A GETLOG (0xBB 0x2D) frame is recognized with no state update."""
     lock = _make_lock()
 
     frame = bytes.fromhex("bb2d008000000000000000000000000000")
@@ -625,7 +625,7 @@ def test_parse_state_ack_for_other_opcode_is_unknown() -> None:
     """ACK recognition is scoped to the settings opcodes.
 
     An 0xAA frame for an opcode with no ack decode falls through to None, so a
-    new acknowledgment type still surfaces as an unknown frame. LOCK_ACTIVITY
+    new acknowledgment type still surfaces as an unknown frame. GETLOG
     carries no state on either flag, so its ack is recognised and ignored.
     """
     lock = _make_lock()
@@ -992,7 +992,7 @@ def _with_byte(frame: bytes, offset: int, value: int) -> bytes:
     return _with_checksum(edited.hex())
 
 
-# A LOCK_ACTIVITY reply carries one activity record: byte[2] is the record
+# A GETLOG reply holds one activity record: byte[2] is the record
 # index and byte[4] the record type. 0x80 ends the log and decodes to nothing;
 # 0x20 is a door state change, carrying a door status at byte[9], so it decodes
 # to a value no status frame can be mistaken for.
@@ -1035,11 +1035,11 @@ def test_poll_response_matcher_takes_only_the_requested_subtype() -> None:
 
 
 def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
-    """lock_activity's answer carries a record type at byte[4], not a status type.
+    """get_log's answer has a record type at byte[4], not a status type.
 
     So its matcher keys on the opcode alone and must accept any byte[4].
     """
-    matches = _poll_response_matcher(Commands.LOCK_ACTIVITY.value)
+    matches = _poll_response_matcher(Commands.GETLOG.value)
     assert matches(ACTIVITY_FRAME)
     assert matches(_with_checksum("bb2d00002000000000000000000000000000"))
     # Still opcode-gated.
@@ -1447,6 +1447,31 @@ def test_op_code_refuses_a_value_that_is_not_an_int() -> None:
         OpCode("0x0D")
 
 
+@pytest.mark.parametrize(
+    ("frame", "status"),
+    [
+        # Built: the captured lock-button record with currentLockState 0x11.
+        (
+            _with_byte(KEYPAD_LOCK_BUTTON, 0x06, 0x11),
+            LockStatus.INTERNAL_FORCED_LOCKED,
+        ),
+        # Built: the 0x0E record with lock state 0x0D.
+        (
+            _with_byte(CREDENTIAL_RECORD_SLOT_7, 0x0C, 0x1D),
+            LockStatus.MASTER_CODE_NOT_SET,
+        ),
+    ],
+    ids=["lock-record", "credential-record"],
+)
+def test_a_record_with_one_of_the_six_lock_states_gives_the_member(
+    frame: bytes, status: LockStatus
+) -> None:
+    """A record whose lock state is one of the six gives that member in status."""
+    activity = _make_lock()._parse_lock_activity(frame)
+    assert isinstance(activity, LockActivity)
+    assert activity.status is status
+
+
 def test_op_code_holds_the_vendor_table() -> None:
     """OpCode holds the vendor's opCode table, with no member for 0x0D or 0x16."""
     assert {member.name: member.value for member in OpCode} == {
@@ -1559,6 +1584,39 @@ async def test_drain_lock_activity_requires_a_connection() -> None:
     lock = _make_lock()
     with pytest.raises(DisconnectedError):
         await _drain(lock)
+
+
+@pytest.mark.asyncio
+async def test_a_get_log_error_record_ends_the_drain_and_reads_as_no_activity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A LOG_TYPE_GET_LOG_ERROR reply ends a drain and reads as no activity."""
+    assert yalexs_ble.LOG_TYPE_GET_LOG_ERROR == END_OF_LOG[0x04] == 0x80
+    assert "LOG_TYPE_GET_LOG_ERROR" in yalexs_ble.__all__
+
+    lock, write = _activity_lock([END_OF_LOG, KEYPAD_UNLOCK_SLOT_205])
+    assert await _drain(lock) == []
+    assert write.await_count == 1
+
+    lock, _ = _activity_lock([END_OF_LOG])
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.lock"):
+        assert await lock.lock_activity() is None
+    assert "No activity" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_log_sends_getlog_and_returns_the_matched_reply() -> None:
+    """One GETLOG is sent and the reply its matcher takes is returned unchanged."""
+    lock, session = _keycode_lock([KEYPAD_LOCK_BUTTON])
+    assert await lock.get_log() is KEYPAD_LOCK_BUTTON
+    assert [command[0x01] for command in session.sent] == [Commands.GETLOG.value]
+
+
+@pytest.mark.asyncio
+async def test_get_log_requires_a_connection() -> None:
+    """Reading a record from a disconnected lock raises."""
+    with pytest.raises(DisconnectedError):
+        await _make_lock().get_log()
 
 
 def test_ack_matcher_matches_only_the_written_operation() -> None:

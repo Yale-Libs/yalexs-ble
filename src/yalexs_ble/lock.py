@@ -19,6 +19,7 @@ from bleak_retry_connector import (
 from . import util
 from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
+    LOG_TYPE_GET_LOG_ERROR,
     MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
@@ -162,7 +163,7 @@ def _poll_response_matcher(
     byte read as a voltage, which is the recurring near-zero battery reading
     seen in the field. Typing every status-poll wait keeps a foreign frame on
     the state callback path where it belongs, and the response timeout is the
-    backstop for a poll the lock never answers. LOCK_ACTIVITY declares a record
+    backstop for a poll the lock never answers. GETLOG declares a record
     type in byte[4] rather than a status type, so it matches on the opcode
     alone; an acknowledgment carries back the request's own byte[4], which is
     zero for that command and reads as a lock operation record, so requiring
@@ -195,7 +196,7 @@ NO_STATE_OPCODES = frozenset(
         Commands.KEYCODE_ACCESS.value,
         Commands.KEYCODE_COMMIT.value,
         Commands.KEYCODE_GET.value,
-        Commands.LOCK_ACTIVITY.value,
+        Commands.GETLOG.value,
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
@@ -259,7 +260,7 @@ class ActivityLogOverrunError(ResponseError):
     """The activity log did not end within the read cap."""
 
 
-_LOCK_ACTIVITY_MATCHER = _poll_response_matcher(Commands.LOCK_ACTIVITY.value)
+_GETLOG_MATCHER = _poll_response_matcher(Commands.GETLOG.value)
 
 
 class Lock:
@@ -974,7 +975,7 @@ class Lock:
         # format seems to be specific to each individual activity type
         activity_type = response[0x04]
         _LOGGER.debug("%s: Activity type: 0x%02X", self.name, activity_type)
-        if activity_type == LockActivityType.NONE.value:
+        if activity_type == LOG_TYPE_GET_LOG_ERROR:
             _LOGGER.debug("%s: No activity", self.name)
             return None
 
@@ -1024,19 +1025,20 @@ class Lock:
         _LOGGER.debug("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
 
-    async def _read_lock_activity_response(self) -> bytes:
+    @raise_if_not_connected
+    async def get_log(self) -> bytes:
         """Pop the oldest record from the lock's activity log."""
         assert self.session is not None  # nosec
         return await self.session.execute(
-            self.session.build_command(Commands.LOCK_ACTIVITY.value),
-            "lock_activity",
-            _LOCK_ACTIVITY_MATCHER,
+            self.session.build_command(Commands.GETLOG.value),
+            "get_log",
+            _GETLOG_MATCHER,
         )
 
     @raise_if_not_connected
     async def lock_activity(self) -> DoorActivity | LockActivity | None:
         _LOGGER.debug("%s: Executing lock_activity", self.name)
-        response = await self._read_lock_activity_response()
+        response = await self.get_log()
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
         return self._parse_lock_activity(response)
 
@@ -1050,8 +1052,8 @@ class Lock:
             raise DisconnectedError("Lock is not connected")
         _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
         for _ in range(MAX_ACTIVITY_RECORDS):
-            response = await self._read_lock_activity_response()
-            if response[0x04] == LockActivityType.NONE.value:
+            response = await self.get_log()
+            if response[0x04] == LOG_TYPE_GET_LOG_ERROR:
                 _LOGGER.debug("%s: Finished drain_lock_activity", self.name)
                 return
             if (activity := self._parse_lock_activity(response)) is not None:
