@@ -170,7 +170,7 @@ def test_captured_code_operation_records(
 
 
 def test_captured_lock_operation_record() -> None:
-    """Captured frame: byte 15 is given as both error and battery_level_percent."""
+    """Captured frame: byte 15 is battery_level_percent (the vendor also says error)."""
     _assert_record(
         parse_log_event_packet(KEYPAD_LOCK_BUTTON),
         LockOperation(
@@ -432,8 +432,7 @@ def test_a_frame_that_is_no_get_log_reply_is_refused(frame: bytes) -> None:
 def test_a_bytearray_frame_decodes_to_a_record_holding_bytes() -> None:
     """Captured frame in a bytearray: the record keeps a bytes copy of it."""
     frame = bytearray(KEYPAD_LOCK_BUTTON)
-    # A bytearray is outside the bytes signature, and the copy keeps a later
-    # change to it out of the record.
+    # The copy keeps a later change to the caller's buffer out of the record.
     record = parse_log_event_packet(frame)
     assert type(record.raw) is bytes
     assert record.raw == KEYPAD_LOCK_BUTTON
@@ -908,8 +907,7 @@ def _public_record_classes(cls: type[LogRecord]) -> set[type[LogRecord]]:
 
 
 def test_the_package_exports_the_decoder() -> None:
-    """Every record class and enumeration is exported with the parser; the name
-    tables stay in yalexs_ble.const."""
+    """Every record class and enumeration is exported with the parser."""
     records = _public_record_classes(LogRecord)
     assert {cls.__name__ for cls in records} | {
         "LogRecord",

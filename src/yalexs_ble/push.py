@@ -460,7 +460,7 @@ class PushLock:
         idle_disconnect_delay: float = DISCONNECT_DELAY,
         always_connected: bool = False,
         idle_disconnect_delay_pending_update: float = DISCONNECT_DELAY_PENDING_UPDATE,
-        brand: Brand | None = None,
+        brand: Brand | str | None = None,
     ) -> None:
         """Init the lock watcher."""
         if local_name is None and address is None:
@@ -473,7 +473,8 @@ class PushLock:
         self._address = address
         self._name: str | None = None
         self._lock_info: LockInfo | None = None
-        self._brand = brand
+        # A str is a Brand value, as a stored discovery hands it back.
+        self._brand = Brand(brand) if brand is not None else None
         self._lock_state: LockState | None = None
         self._last_adv_value = -1
         self._last_hk_state = -1

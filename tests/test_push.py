@@ -331,10 +331,12 @@ def test_lock_info_brand_is_certain_for_single_brand_models(
         (Brand.YALE, "ASL-03", Brand.AUGUST),
         (Brand.AUGUST, "SL-103", Brand.YALE),
         (None, None, Brand.AUGUST),
+        # A stored discovery hands the brand back as its value.
+        ("yale", "YRD-256", Brand.YALE),
     ],
 )
 async def test_push_lock_brand_is_the_models_else_the_paired_else_august(
-    paired: Brand | None, model: str | None, brand: Brand
+    paired: Brand | str | None, model: str | None, brand: Brand
 ) -> None:
     push_lock = _named_push_lock(
         "aa:bb:cc:dd:ee:60", always_connected=False, brand=paired
