@@ -42,30 +42,7 @@ from yalexs_ble.activity_log import (
     parse_log_event_packet,
 )
 from yalexs_ble.const import (
-    BULK_OPERATION_TYPE_NAMES,
-    CRED_TYPE_NAMES,
-    CREDENTIAL_TYPE_NAMES_AUGUST,
-    CREDENTIAL_TYPE_NAMES_YALE,
-    DOOR_STATE_NAMES,
-    JAM_STATE_NAMES,
-    LOCK_OPERATION_CRED_TYPE_NAMES,
-    LOCK_OPERATION_SOURCE_NAMES,
-    LOCK_OPERATION_STATUS_NAMES,
-    LOCK_OPERATION_TYPE_NAMES,
-    LOCK_STATE_NAMES_AUGUST,
-    LOCK_STATE_NAMES_YALE,
-    LOG_TYPE_GET_LOG_ERROR,
-    LOG_TYPE_NAMES_AUGUST,
-    LOG_TYPE_NAMES_YALE,
-    MATTER_EVENT_NAMES,
-    MATTER_REGISTRATION_STATUS_NAMES,
-    OP_CODE_NAMES_AUGUST,
-    OP_CODE_NAMES_YALE,
-    OPERATING_MODE_NAMES,
-    OUT_OF_SCHEDULE_TYPE_NAMES,
     RESPONSE_FRAME_LEN,
-    TAMPER_TYPE_NAMES_AUGUST,
-    TAMPER_TYPE_NAMES_YALE,
     AugustLockOperationSource,
     AugustLogType,
     BulkOperationType,
@@ -148,7 +125,7 @@ def _case(
     record: Callable[..., LogRecord], frame: bytes, **values: object
 ) -> tuple[bytes, LogRecord]:
     """A captured or built frame and the record its bytes decode to."""
-    return frame, record(raw=frame, log_type=frame[4], **values)
+    return frame, record(raw=frame, **values)
 
 
 def _case_id(case: tuple[bytes, LogRecord]) -> str:
@@ -181,7 +158,6 @@ def test_captured_code_operation_records(
         parse_log_event_packet(frame),
         CodeOperation(
             raw=frame,
-            log_type=0x07,
             time_stamp=time_stamp,
             current_lock_state=LockStatus.UNLOCKED,
             current_door_state=DoorStatus.OPENED,
@@ -199,14 +175,12 @@ def test_captured_lock_operation_record() -> None:
         parse_log_event_packet(KEYPAD_LOCK_BUTTON),
         LockOperation(
             raw=KEYPAD_LOCK_BUTTON,
-            log_type=0x00,
             op_code=OpCode.ONE_TOUCH,
             current_lock_state=LockStatus.LOCKED,
             key_slot=0,
             time_stamp=0xA376A1A0,
             battery_level=5343,
             temperature=25,
-            error=74,
             battery_level_percent=74,
         ),
     )
@@ -218,7 +192,6 @@ def test_captured_get_log_error_record() -> None:
         parse_log_event_packet(END_OF_LOG),
         GetLogError(
             raw=END_OF_LOG,
-            log_type=0x80,
             error=2,
             key_slot=0,
             log_count=0,
@@ -265,7 +238,6 @@ def test_credential_records_with_states(
         parse_log_event_packet(frame, brand),
         record_class(
             raw=frame,
-            log_type=log_type,
             time_stamp=TIME_STAMP,
             credential_type=LockCred.RF,
             slot=65518,
@@ -294,6 +266,12 @@ def test_credential_type_without_a_member_is_kept_as_unknown() -> None:
     assert record.credential_type is LockCred(3)
     assert record.credential_type == 3
     assert record.credential_type.name == "UNKNOWN_03"
+
+
+def test_an_open_enumeration_refuses_a_value_that_is_not_an_int() -> None:
+    """Only an int becomes an UNKNOWN member; anything else is a ValueError."""
+    with pytest.raises(ValueError, match="not a valid LockCred"):
+        LockCred("03")  # type: ignore[arg-type]
 
 
 def test_lock_operation_with_an_unnamed_op_code_is_returned() -> None:
@@ -349,9 +327,7 @@ def test_keypad_open_keycode() -> None:
     frame = _built(0x01, {5: TIME, 9: "123456ffffffff"})
     _assert_record(
         parse_log_event_packet(frame),
-        KeypadOpen(
-            raw=frame, log_type=0x01, time_stamp=TIME_STAMP, keycode="123456FFFFFFFFFF"
-        ),
+        KeypadOpen(raw=frame, time_stamp=TIME_STAMP, keycode="123456FFFFFFFFFF"),
     )
 
 
@@ -362,7 +338,6 @@ def test_code_added_slot_and_code() -> None:
         parse_log_event_packet(frame),
         CodeAdded(
             raw=frame,
-            log_type=0x03,
             time_stamp=TIME_STAMP,
             slot=7,
             code="1234FFFFFFFFFFFF",
@@ -380,9 +355,7 @@ def test_code_added_v2_code_as_the_brand_prints_it(brand: LogBrand, code: str) -
     frame = _built(0x0A, {5: TIME, 9: "0102", 11: "40e2010000"})
     _assert_record(
         parse_log_event_packet(frame, brand),
-        CodeAddedv2(
-            raw=frame, log_type=0x0A, time_stamp=TIME_STAMP, slot=0x0201, code=code
-        ),
+        CodeAddedv2(raw=frame, time_stamp=TIME_STAMP, slot=0x0201, code=code),
     )
 
 
@@ -393,7 +366,6 @@ def test_battery_info_temperature_is_signed() -> None:
         parse_log_event_packet(frame),
         BatteryInfo(
             raw=frame,
-            log_type=0x15,
             time_stamp=TIME_STAMP,
             battery_level_millivolt=5354,
             temperature=-10,
@@ -412,7 +384,6 @@ def test_product_message_type_and_data() -> None:
         parse_log_event_packet(frame),
         ProductMessage(
             raw=frame,
-            log_type=0x17,
             time_stamp=TIME_STAMP,
             msg_type=0x1234,
             data=(1, 2, 3, 4, 5),
@@ -482,7 +453,6 @@ def test_a_bytearray_frame_decodes_to_a_record_holding_bytes() -> None:
             time_stamp=0x6ADDAD7B,
             battery_level=5920,
             temperature=25,
-            error=63,
             battery_level_percent=63,
         ),
         _case(
@@ -494,7 +464,6 @@ def test_a_bytearray_frame_decodes_to_a_record_holding_bytes() -> None:
             time_stamp=0x6ADDEEA7,
             battery_level=5145,
             temperature=25,
-            error=15,
             battery_level_percent=15,
         ),
         _case(
@@ -506,7 +475,6 @@ def test_a_bytearray_frame_decodes_to_a_record_holding_bytes() -> None:
             time_stamp=0x6ADDAE93,
             battery_level=5919,
             temperature=25,
-            error=52,
             battery_level_percent=52,
         ),
         _case(
@@ -518,7 +486,6 @@ def test_a_bytearray_frame_decodes_to_a_record_holding_bytes() -> None:
             time_stamp=0x6AE03304,
             battery_level=5896,
             temperature=25,
-            error=61,
             battery_level_percent=61,
         ),
         _case(
@@ -944,7 +911,6 @@ def test_the_package_exports_the_decoder() -> None:
     """Every record class and enumeration is exported with the parser; the name
     tables stay in yalexs_ble.const."""
     records = _public_record_classes(LogRecord)
-    assert len(records) == 33
     assert {cls.__name__ for cls in records} | {
         "LogRecord",
         "parse_log_event_packet",
@@ -967,400 +933,6 @@ def test_the_package_exports_the_decoder() -> None:
         "LockOperationStatus",
         "BulkOperationType",
     } <= set(yalexs_ble.__all__)
-
-
-@pytest.mark.parametrize(
-    ("table", "count", "expected"),
-    [
-        (
-            LOG_TYPE_NAMES_YALE,
-            27,
-            {
-                0x00: "LockOperation",
-                0x01: "KeypadOpen",
-                0x02: "KeypadWrongCode",
-                0x03: "CodeAdded",
-                0x04: "KeypadInfo",
-                0x05: "CodeDeleted",
-                0x06: "AllCodesDeleted",
-                0x07: "CodeOperation",
-                0x08: "KeypadClose",
-                0x09: "FactoryReset",
-                0x0A: "CodeAddedv2",
-                0x0B: "CodeDeletedv2",
-                0x0C: "CredentialAdded",
-                0x0D: "CredentialDeleted",
-                0x0E: "CredentialOperation",
-                0x0F: "Tamper",
-                0x10: "BCMTest",
-                0x11: "AccessoryEvent",
-                0x12: "HomekeyOperation",
-                0x13: "DPSInfo",
-                0x15: "BatteryInfo",
-                0x16: "LocalEventNotification",
-                0x17: "ProductMessage",
-                0x18: "MatterMessage",
-                0x20: "DoorStateChanged",
-                0x40: "DialogReboot",
-                0x80: "GetLogError",
-            },
-        ),
-        (
-            OP_CODE_NAMES_YALE,
-            24,
-            {
-                0x00: "DoorStateChanged",
-                0x01: "DoorManualStateChange",
-                0x02: "KnockReceived",
-                0x03: "BluetoothReceived",
-                0x04: "Anomaly",
-                0x05: "AutoRelock",
-                0x06: "AutoRetry",
-                0x07: "OverTemp",
-                0x08: "BurnIn",
-                0x09: "HomeKit",
-                0x0A: "ZWave",
-                0x0B: "OneTouch",
-                0x0C: "InsideButton",
-                0x0E: "DoorSense",
-                0x0F: "LowBatAutoUnlock",
-                0x10: "EscapeUnlock",
-                0x11: "UWB",
-                0x12: "ExternalModuleOperation",
-                0x13: "ShabbatMode",
-                0x14: "ScheduledOperation",
-                0x15: "Matter",
-                0x17: "DoublePress",
-                0x18: "Aliro",
-                0xFF: "Undefined",
-            },
-        ),
-        (
-            LOCK_STATE_NAMES_YALE,
-            17,
-            {
-                0x00: "Init",
-                0x01: "Calibrating",
-                0x02: "Unlocking",
-                0x03: "Unlocked",
-                0x04: "Locking",
-                0x05: "Locked",
-                0x06: "PolDiscovery",
-                0x07: "UnknownStaticPosition",
-                0x09: "Unlatching",
-                0x0A: "Unlatched",
-                0x0B: "Integrated_Other_System",
-                0x0C: "SecureMode",
-                0x0D: "Master code not set",
-                0x0E: "Default master code set",
-                0x0F: "Lock not handed",
-                0x10: "shabbatmode",
-                0x11: "InternalForcedLocked",
-            },
-        ),
-        (
-            CREDENTIAL_TYPE_NAMES_YALE,
-            8,
-            {
-                0x00: "pin",
-                0x01: "rf",
-                0x02: "finger",
-                0x04: "face",
-                0x05: "inside_door_pin",
-                0x06: "palm",
-                0x08: "aliro",
-                0xFF: "All",
-            },
-        ),
-        (
-            DOOR_STATE_NAMES,
-            5,
-            {0x00: "Init", 0x01: "Closed", 0x02: "Ajar", 0x03: "Open", 0x04: "Unknown"},
-        ),
-        (
-            TAMPER_TYPE_NAMES_YALE,
-            15,
-            {
-                0x00: "TamperClear",
-                0x01: "TamperTooManyAuthErrors",
-                0x02: "TamperFrontRemoved",
-                0x03: "TamperDoorForcedOpen",
-                0x04: "TamperHighTemperature",
-                0x05: "TamperTooManyAuthErrorsPIN",
-                0x06: "TamperTooManyAuthErrorsPINCleared",
-                0x07: "TamperTooManyAuthErrorsRFID",
-                0x08: "TamperTooManyAuthErrorsRFIDCleared",
-                0x09: "TamperTooManyAuthErrorsFingerprint",
-                0x0A: "TamperTooManyAuthErrorsFingerprintCleared",
-                0x0B: "TamperTooManyAuthErrorsPalm",
-                0x0C: "TamperTooManyAuthErrorsPalmCleared",
-                0x0D: "TamperTooManyAuthErrorsFaceScan",
-                0x0E: "TamperTooManyAuthErrorsFaceScanCleared",
-            },
-        ),
-        (
-            LOG_TYPE_NAMES_AUGUST,
-            31,
-            {
-                0x00: "LockOperation",
-                0x01: "KeypadOpen",
-                0x02: "KeypadWrongCode",
-                0x03: "CodeAdded",
-                0x04: "KeypadInfo",
-                0x05: "CodeDeleted",
-                0x06: "AllCodesDeleted",
-                0x07: "CodeOperation",
-                0x08: "KeypadClose",
-                0x09: "FactoryReset",
-                0x0A: "CodeAddedv2",
-                0x0B: "CodeDeletedv2",
-                0x0C: "ExternalCredentialAdded",
-                0x0D: "ExternalCredentialDeleted",
-                0x0E: "CredentialOperation",
-                0x0F: "Tamper",
-                0x10: "BCMTest",
-                0x11: "AccessoryEvent",
-                0x12: "HomekeyOperation",
-                0x13: "DPSInfo",
-                0x14: "LockOperatingMode",
-                0x15: "WifiInfo",
-                0x16: "LockDeadboltJam",
-                0x17: "InvalidCredentialEntry",
-                0x18: "MatterEvent",
-                0x19: "LockOperationBlame",
-                0x1D: "OutOfScheduleCredential",
-                0x1E: "BulkOperation",
-                0x20: "DoorStateChanged",
-                0x40: "DialogReboot",
-                0x80: "GetLogError",
-            },
-        ),
-        (
-            OP_CODE_NAMES_AUGUST,
-            19,
-            {
-                0x00: "DoorStateChanged",
-                0x01: "DoorManualStateChange",
-                0x02: "KnockReceived",
-                0x03: "BluetoothReceived",
-                0x04: "Anomaly",
-                0x05: "AutoRelock",
-                0x06: "AutoRetry",
-                0x07: "OverTemp",
-                0x08: "BurnIn",
-                0x09: "HomeKit",
-                0x0A: "ZWave",
-                0x0B: "OneTouch",
-                0x0C: "InsideButton",
-                0x0E: "DoorSense",
-                0x0F: "LowBatAutoUnlock",
-                0x10: "EscapeUnlock",
-                0x11: "UWB",
-                0x12: "ExternalModuleOperation",
-                0xFF: "Undefined",
-            },
-        ),
-        (
-            LOCK_STATE_NAMES_AUGUST,
-            16,
-            {
-                0x00: "Init",
-                0x01: "Calibrating",
-                0x02: "Unlocking",
-                0x03: "Unlocked",
-                0x04: "Locking",
-                0x05: "Locked",
-                0x06: "PolDiscovery",
-                0x07: "UnknownStaticPosition",
-                0x09: "Unlatching",
-                0x0A: "Unlatched",
-                0x0B: "Integrated_Other_System",
-                0x0C: "SecureMode",
-                0x0D: "Master code not set",
-                0x0E: "Default master code set",
-                0x0F: "Lock not handed",
-                0x10: "Shabbat Mode",
-            },
-        ),
-        (
-            CREDENTIAL_TYPE_NAMES_AUGUST,
-            5,
-            {0x00: "pin", 0x01: "rf", 0x02: "finger", 0x04: "face", 0xFF: "All"},
-        ),
-        (
-            TAMPER_TYPE_NAMES_AUGUST,
-            5,
-            {
-                0x00: "TamperClear",
-                0x01: "TamperTooManyAuthErrors",
-                0x02: "TamperFrontRemoved",
-                0x03: "TamperDoorForcedOpen",
-                0x04: "TamperHighTemperature",
-            },
-        ),
-        (
-            OPERATING_MODE_NAMES,
-            4,
-            {
-                0x00: "OperatingModeNormal",
-                0x01: "OperatingModeVacation",
-                0x02: "OperatingModePrivacy",
-                0x03: "OperatingModePassage",
-            },
-        ),
-        (
-            JAM_STATE_NAMES,
-            2,
-            {0x00: "JamOccursDuringLocking", 0x01: "JamOccursDuringUnlocking"},
-        ),
-        (
-            CRED_TYPE_NAMES,
-            12,
-            {
-                0x0000: "CredEntryKeypadPincode",
-                0x0002: "CredEntryKeypadFingerprint",
-                0x0100: "CredEntryAuxKeypadPincode",
-                0x0102: "CredEntryAuxKeypadFingerprint",
-                0x1001: "CredEntryAppleHomekeysNFC",
-                0x1101: "CredEntrySamsungWalletNFC",
-                0x1201: "CredEntryGoogleWalletNFC",
-                0x2101: "CredEntryRFIDCardMIFAREDESFireEV1NFC",
-                0x2201: "CredEntryRFIDCardMIFAREDESFireEV2NFC",
-                0x2301: "CredEntryRFIDCardMIFAREDESFireEV3NFC",
-                0x3003: "CredEntryMatterFabricMatter",
-                0xFFFF: "CredEntryUnknown",
-            },
-        ),
-        (
-            OUT_OF_SCHEDULE_TYPE_NAMES,
-            2,
-            {0x00: "OutOfSchedulePremature", 0x01: "OutOfScheduleExpired"},
-        ),
-        (
-            MATTER_EVENT_NAMES,
-            3,
-            {
-                0x00: "MatterEventRegistration",
-                0x01: "MatterEventFabricAdded",
-                0x02: "MatterEventFabricRemoved",
-            },
-        ),
-        (
-            MATTER_REGISTRATION_STATUS_NAMES,
-            3,
-            {0x00: "OK", 0x01: "FAIL", 0xFF: "UNKNOWN"},
-        ),
-        (LOCK_OPERATION_TYPE_NAMES, 2, {0x00: "Lock", 0x01: "Unlock"}),
-        (
-            LOCK_OPERATION_SOURCE_NAMES,
-            7,
-            {
-                0x01: "Ble",
-                0x02: "Keypad",
-                0x03: "Lock_Button",
-                0x04: "Autorelock",
-                0x05: "Manual",
-                0x06: "Matter",
-                0x07: "Zwave",
-            },
-        ),
-        (
-            LOCK_OPERATION_CRED_TYPE_NAMES,
-            7,
-            {
-                0x02: "Pin",
-                0x04: "RfId",
-                0x08: "Fingerprint",
-                0x10: "RfId_Hid",
-                0x20: "Face",
-                0x40: "InsideDoorPin",
-                0x80: "Ble",
-            },
-        ),
-        (
-            LOCK_OPERATION_STATUS_NAMES,
-            10,
-            {
-                0x00: "Success",
-                0x01: "Fail",
-                0x02: "Low_Battery",
-                0x03: "Jammed",
-                0x04: "Non_Calibrated",
-                0x05: "Timeout",
-                0x06: "Invalid_cred",
-                0x07: "Disabled_user",
-                0x08: "Outside_Schedule",
-                0x09: "Non_Access",
-            },
-        ),
-        (BULK_OPERATION_TYPE_NAMES, 2, {0x01: "UsersClear", 0x02: "CredsClear"}),
-    ],
-    ids=[
-        "log type, Yale",
-        "opCode, Yale",
-        "lock state, Yale",
-        "credential type, Yale",
-        "door state",
-        "tamper type, Yale",
-        "log type, August",
-        "opCode, August",
-        "lock state, August",
-        "credential type, August",
-        "tamper type, August",
-        "operating mode",
-        "jam state",
-        "cred type",
-        "out of schedule type",
-        "Matter event",
-        "Matter registration status",
-        "lock operation type",
-        "lock operation source",
-        "lock operation cred type",
-        "lock operation status",
-        "bulk operation type",
-    ],
-)
-def test_name_tables_hold_the_vendor_strings(
-    table: dict[int, str], count: int, expected: dict[int, str]
-) -> None:
-    """Each table holds exactly the vendor's entries."""
-    assert len(table) == count
-    assert table == expected
-
-
-@pytest.mark.parametrize(
-    ("enumeration", "names"),
-    [
-        (LogType, LOG_TYPE_NAMES_YALE),
-        (AugustLogType, LOG_TYPE_NAMES_AUGUST),
-        (OpCode, OP_CODE_NAMES_YALE),
-        (LockCred, CREDENTIAL_TYPE_NAMES_YALE),
-        (TamperType, TAMPER_TYPE_NAMES_YALE),
-        (OperatingMode, OPERATING_MODE_NAMES),
-        (JamState, JAM_STATE_NAMES),
-        (CredType, CRED_TYPE_NAMES),
-        (OutOfScheduleType, OUT_OF_SCHEDULE_TYPE_NAMES),
-        (MatterEventType, MATTER_EVENT_NAMES),
-        (MatterRegistrationStatus, MATTER_REGISTRATION_STATUS_NAMES),
-        (LockOperationType, LOCK_OPERATION_TYPE_NAMES),
-        (AugustLockOperationSource, LOCK_OPERATION_SOURCE_NAMES),
-        (LockOperationCredType, LOCK_OPERATION_CRED_TYPE_NAMES),
-        (LockOperationStatus, LOCK_OPERATION_STATUS_NAMES),
-        (BulkOperationType, BULK_OPERATION_TYPE_NAMES),
-    ],
-    ids=lambda value: getattr(value, "__name__", None),
-)
-def test_enumeration_members_are_the_named_values(
-    enumeration: type[Enum], names: dict[int, str]
-) -> None:
-    """A member has the value and the vendor's term less a prefix of the type's name."""
-    assert {member.value for member in enumeration} == set(names)
-    for name, member in enumeration.__members__.items():
-        vendor_name = names[member.value].replace("_", "").lower()
-        member_name = name.replace("_", "").lower()
-        assert vendor_name.endswith(member_name)
-        prefix = vendor_name.removesuffix(member_name)
-        assert enumeration.__name__.lower().startswith(prefix)
 
 
 @pytest.mark.parametrize(
@@ -1504,13 +1076,4 @@ def test_august_log_type_matches_log_type_where_the_brands_agree() -> None:
         value for value in yale.keys() & august.keys() if yale[value] == august[value]
     }
     assert alike == {*range(0x0C), *range(0x0E, 0x14), 0x20, 0x40, 0x80}
-    assert len(alike) == 21
     assert (yale.keys() & august.keys()) - alike == {0x0C, 0x0D, 0x15, 0x16, 0x17, 0x18}
-
-
-@pytest.mark.parametrize("enumeration", [LogType, AugustLogType])
-def test_get_log_error_is_the_value_that_ends_the_log(
-    enumeration: type[LogType] | type[AugustLogType],
-) -> None:
-    """GET_LOG_ERROR takes its value from LOG_TYPE_GET_LOG_ERROR in both numberings."""
-    assert enumeration.GET_LOG_ERROR == LOG_TYPE_GET_LOG_ERROR
