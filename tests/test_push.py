@@ -303,10 +303,12 @@ def test_door_sense(model: str, door_sense: bool) -> None:
         ("SL-103-EU", Brand.YALE),
         ("Yale Linus L2", Brand.YALE),
         ("CERES", Brand.YALE),
-        ("MD-04I", Brand.YALE),
         ("YUR/DEL/1/SIL", Brand.YALE),
-        # The Assure models ship under both brands.
-        ("YRD-256", None),
+        # Seen under both brands: the Assure locks and modules, the smart safe.
+        ("MD-01", None),
+        ("MD-04I", None),
+        ("YRSM-1", None),
+        ("AUGUST_MODEL_NUMBER_HERE", None),
         ("", None),
     ],
 )

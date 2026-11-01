@@ -35,14 +35,14 @@ FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 # such as "SL-103-EU", so the tables match an entry or a suffixed variant.
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
 
-# BLE model numbers seen in the field that ship under one brand alone. The Assure
-# models ship under both and are in neither list: only the pairing tells theirs.
+# BLE model numbers seen in the field that pair with one brand's app alone. The
+# Assure locks, the smart safe and the August-platform modules (MD-01, MD-04I)
+# pair with either and are in neither list: only the pairing tells theirs.
 AUGUST_MODEL_PREFIX = "ASL-"
 YALE_MODELS = {
     "SL-103",  # Linus L2
     "Yale Linus L2",  # Linus L2 Nordic
     "CERES",  # Smart code handle
-    "MD-04I",  # Conexis L1 and L2
 }
 YALE_MODEL_PREFIXES = ("YUR/",)  # Unity
 
