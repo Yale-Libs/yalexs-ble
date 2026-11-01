@@ -21,7 +21,6 @@ from yalexs_ble.activity_log import LogRecord
 from yalexs_ble.const import (
     ASSA_ABLOY_MFR_ID,
     YALE_MFR_ID,
-    ActivityLogDepth,
     AuthState,
     AutoLockMode,
     AutoLockState,
@@ -4002,7 +4001,7 @@ def _activity_push_lock(
 
     mock_lock = MagicMock()
     mock_lock.drain_lock_activity = MagicMock(side_effect=drain_lock_activity)
-    mock_lock.unread_event_count = AsyncMock(return_value=ActivityLogDepth(count or 0))
+    mock_lock.unread_event_count = AsyncMock(return_value=count or 0)
     if count is None:
         push_lock._backlog_remaining = 0
         push_lock._update_any_state([LockStatus.UNLOCKED])
@@ -4230,8 +4229,11 @@ async def test_a_drain_that_stops_early_leaves_the_rest_of_the_backlog() -> None
 async def test_a_count_that_is_not_a_depth_ends_the_drain_as_a_failure(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A negative count sends no GetLog, stays owed and counts as a failed drain."""
-    push_lock, mock_lock, received = _activity_push_lock([], count=-559038737)
+    """A refused count sends no GetLog, stays owed and counts as a failed drain."""
+    push_lock, mock_lock, received = _activity_push_lock([], count=0)
+    mock_lock.unread_event_count = AsyncMock(
+        side_effect=ResponseError("Unread count -559038737 is not a depth")
+    )
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
         for _ in range(ACTIVITY_DRAIN_FAILURE_THRESHOLD):
             await _run_update(push_lock, mock_lock)
@@ -4243,7 +4245,7 @@ async def test_a_count_that_is_not_a_depth_ends_the_drain_as_a_failure(
     assert [r.levelno for r in lines] == [logging.DEBUG] * (
         ACTIVITY_DRAIN_FAILURE_THRESHOLD - 1
     ) + [logging.WARNING]
-    assert all("ActivityLogDepth(unread=-559038737)" in r.getMessage() for r in lines)
+    assert all("-559038737 is not a depth" in r.getMessage() for r in lines)
 
 
 @pytest.mark.asyncio
@@ -4637,7 +4639,7 @@ async def test_a_failed_count_read_is_retried_by_the_next_drain() -> None:
     )
     mock_lock.unread_event_count.side_effect = [
         TimeoutError("slow"),
-        ActivityLogDepth(1),
+        1,
     ]
     await _run_update(push_lock, mock_lock)
     mock_lock.drain_lock_activity.assert_not_called()

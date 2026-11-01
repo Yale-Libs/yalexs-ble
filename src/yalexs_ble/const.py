@@ -148,8 +148,7 @@ class StatusType(IntEnum):
     DOOR_ONLY = 0x2E
     DOOR_AND_LOCK = 0x2F
     BATTERY = 0x0F
-    # The activity log's unread count: how many records no client has read
-    # yet. The read removes no record.
+    # The activity log's unread count: records no client has read yet.
     LOCK_EVENTS_UNREAD = 0x09
 
 
@@ -211,18 +210,6 @@ class AutoLockMode(IntEnum):
 class BatteryState:
     voltage: float
     percentage: int
-
-
-@dataclass
-class ActivityLogDepth:
-    """The activity log's unread count as the lock reports it."""
-
-    unread: int
-
-    @property
-    def is_depth(self) -> bool:
-        """True when the value is a count; a negative value is not one."""
-        return self.unread >= 0
 
 
 @dataclass

@@ -18,7 +18,6 @@ from yalexs_ble.const import (
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
-    ActivityLogDepth,
     AutoLockMode,
     AutoLockState,
     BatteryState,
@@ -1073,7 +1072,7 @@ def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
             LOCK_FRAME,
             LockStatus.UNLOCKED,
             DEPTH_FRAME,
-            ActivityLogDepth(242),
+            242,
         ),
     ],
 )
@@ -1111,14 +1110,17 @@ async def test_a_poll_is_not_answered_by_a_frame_of_another_subtype(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("frame", "unread", "is_depth"),
-    [(DEPTH_FRAME, 242, True), (NEGATIVE_DEPTH_FRAME, -559038737, False)],
+    ("frame", "unread"),
+    [(DEPTH_FRAME, 242), (NEGATIVE_DEPTH_FRAME, -559038737)],
     ids=["captured", "top-bit-set"],
 )
 async def test_unread_event_count_returns_the_signed_four_byte_count(
-    frame: bytes, unread: int, is_depth: bool
+    frame: bytes, unread: int
 ) -> None:
-    """The count read sends GETSTATUS LOCK_EVENTS_UNREAD and reads [8:12] signed."""
+    """The count read sends GETSTATUS LOCK_EVENTS_UNREAD and reads [8:12] signed.
+
+    A negative count is not a depth and raises instead of returning.
+    """
     lock, session = _connected_lock()
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
@@ -1127,10 +1129,11 @@ async def test_unread_event_count_returns_the_signed_four_byte_count(
     write = AsyncMock(side_effect=deliver)
     session.client.write_gatt_char = write
 
-    depth = await lock.unread_event_count()
-
-    assert depth == ActivityLogDepth(unread)
-    assert depth.is_depth is is_depth
+    if unread < 0:
+        with pytest.raises(ResponseError, match=f"{unread} is not a depth"):
+            await lock.unread_event_count()
+    else:
+        assert await lock.unread_event_count() == unread
     (write_call,) = write.await_args_list
     written = write_call.args[1]
     assert (written[0x01], written[0x04]) == (

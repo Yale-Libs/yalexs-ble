@@ -25,7 +25,6 @@ from .const import (
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_STATUS,
     VALUE_TO_OPERATION_ERROR,
-    ActivityLogDepth,
     AutoLockMode,
     AutoLockState,
     BatteryState,
@@ -417,8 +416,7 @@ class Lock:
                 if state[4] == StatusType.BATTERY.value:
                     return [self._parse_battery_state(state)]
                 if state[4] == StatusType.LOCK_EVENTS_UNREAD.value:
-                    # The count reaches its consumer as the return of
-                    # unread_event_count(), so the reply publishes nothing.
+                    # Answered through unread_event_count(); no state to publish.
                     return ()
             elif (
                 state[1] == Commands.WRITESETTING.value
@@ -880,17 +878,8 @@ class Lock:
 
     @raise_if_not_connected
     async def lock_status(self) -> LockStatus:
-        _LOGGER.debug("%s: Executing lock_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
-        response = await self._execute_command(
-            Commands.GETSTATUS,
-            StatusType.LOCK_ONLY,
-            "lock_status",
-            _poll_response_matcher(
-                Commands.GETSTATUS.value, StatusType.LOCK_ONLY.value
-            ),
-        )
-        _LOGGER.debug("%s: Finished executing lock_status", self.name)
+        response = await self._poll_status(StatusType.LOCK_ONLY, "lock_status")
         # The answering frame was already decoded and logged on the notify
         # path, so the bare lookup here keeps the unrecognized-code
         # diagnostic to one line per frame.
@@ -898,17 +887,8 @@ class Lock:
 
     @raise_if_not_connected
     async def door_status(self) -> DoorStatus:
-        _LOGGER.debug("%s: Executing door_status", self.name)
         # We used to use 0x2F here but it seems to be broken on some locks
-        response = await self._execute_command(
-            Commands.GETSTATUS,
-            StatusType.DOOR_ONLY,
-            "door_status",
-            _poll_response_matcher(
-                Commands.GETSTATUS.value, StatusType.DOOR_ONLY.value
-            ),
-        )
-        _LOGGER.debug("%s: Finished executing door_status", self.name)
+        response = await self._poll_status(StatusType.DOOR_ONLY, "door_status")
         # The answering frame was already decoded and logged on the notify
         # path, so the bare lookup here keeps the unrecognized-code
         # diagnostic to one line per frame.
@@ -925,38 +905,35 @@ class Lock:
         percentage = convert_voltage_to_percentage(voltage / 4)
         return BatteryState(voltage, percentage)
 
-    def _parse_activity_log_depth(self, response: bytes) -> ActivityLogDepth:
-        """Parse the unread count of a LOCK_EVENTS_UNREAD reply, signed at [8:12]."""
-        return ActivityLogDepth(util._bytes_to_signed_int(response[0x08:0x0C]))
-
-    @raise_if_not_connected
-    async def unread_event_count(self) -> ActivityLogDepth:
-        """Read the activity log's unread count; the read removes no record.
-
-        Raises TimeoutError when the lock does not answer within the session's wait.
-        """
-        _LOGGER.debug("%s: Executing unread_event_count", self.name)
+    async def _poll_status(self, status_type: StatusType, name: str) -> bytes:
+        """Send a GetStatus for status_type and return the reply of that subtype."""
+        _LOGGER.debug("%s: Executing %s", self.name, name)
         response = await self._execute_command(
             Commands.GETSTATUS,
-            StatusType.LOCK_EVENTS_UNREAD,
-            "unread_event_count",
-            _poll_response_matcher(
-                Commands.GETSTATUS.value, StatusType.LOCK_EVENTS_UNREAD.value
-            ),
+            status_type,
+            name,
+            _poll_response_matcher(Commands.GETSTATUS.value, status_type.value),
         )
-        _LOGGER.debug("%s: Finished executing unread_event_count", self.name)
-        return self._parse_activity_log_depth(response)
+        _LOGGER.debug("%s: Finished executing %s", self.name, name)
+        return response
+
+    @raise_if_not_connected
+    async def unread_event_count(self) -> int:
+        """Read the activity log's unread count; the read removes no record.
+
+        A negative count, signed at bytes 8 to 11, is not a depth and raises.
+        """
+        response = await self._poll_status(
+            StatusType.LOCK_EVENTS_UNREAD, "unread_event_count"
+        )
+        count = util._bytes_to_int(response[0x08:0x0C], signed=True)
+        if count < 0:
+            raise ResponseError(f"Unread count {count} is not a depth")
+        return count
 
     @raise_if_not_connected
     async def battery(self) -> BatteryState:
-        _LOGGER.debug("%s: Executing battery", self.name)
-        response = await self._execute_command(
-            Commands.GETSTATUS,
-            StatusType.BATTERY,
-            "battery",
-            _poll_response_matcher(Commands.GETSTATUS.value, StatusType.BATTERY.value),
-        )
-        _LOGGER.debug("%s: Finished executing battery", self.name)
+        response = await self._poll_status(StatusType.BATTERY, "battery")
         return self._parse_battery_state(response)
 
     @raise_if_not_connected
