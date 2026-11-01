@@ -970,6 +970,11 @@ class Lock:
                     "%s: Failed to disconnect from lock", self.name, exc_info=True
                 )
 
+    async def _wait_for_disconnect_after_failed_write(self) -> None:
+        """Wait for the session's disconnect after a failed write, if one started."""
+        if self.session is not None and (task := self.session._disconnect_task):
+            await asyncio.wait((task,))
+
     async def _shutdown_connection(self) -> None:
         """Shutdown the connection."""
         _LOGGER.debug("%s: Shutting down the connection", self.name)

@@ -4057,6 +4057,7 @@ def _mock_link(
     mock_lock.get_log = AsyncMock(side_effect=replies)
     mock_lock.unread_event_count = AsyncMock(return_value=count or 0)
     mock_lock.disconnect = AsyncMock()
+    mock_lock._wait_for_disconnect_after_failed_write = AsyncMock()
     if count is None:
         push_lock._backlog_remaining = 0
     push_lock._client = mock_lock
@@ -10028,7 +10029,7 @@ async def test_start_waits_for_the_disconnect_of_the_last_stop(
     assert (
         "yalexs_ble.push",
         logging.DEBUG,
-        "Test Lock: Waiting for the last stop's disconnect",
+        "Test Lock: Waiting for the last stop's teardown",
     ) in caplog.record_tuples
 
 
@@ -10189,10 +10190,10 @@ async def test_a_restart_after_a_stop_during_a_connect_keeps_the_next_link() -> 
         connecting.set()
         await asyncio.Event().wait()
 
-    old = MagicMock(is_connected=False)
+    old = MagicMock(spec=Lock, is_connected=False)
     old.connect = AsyncMock(side_effect=connect)
     old.disconnect = AsyncMock(side_effect=closing.wait)
-    new = MagicMock(is_connected=True, connect=AsyncMock(), disconnect=AsyncMock())
+    new = MagicMock(spec=Lock, is_connected=True)
 
     async def force_lock(
         write_success_callback: Callable[[], None],
@@ -10248,3 +10249,145 @@ async def test_a_restart_during_the_first_update_gets_its_own_first_update() -> 
     new.connect.assert_awaited_once()
     with pytest.raises(RuntimeError, match="Update was canceled"):
         await first_wait
+
+
+@pytest.mark.asyncio
+async def test_start_waits_for_the_disconnect_a_stopped_drain_write_started() -> None:
+    """start() waits for the disconnect the drain's cancelled GetLog write started."""
+    address = "AA:BB:CC:DD:EE:D9"
+    events: list[str] = []
+    writing = asyncio.Event()
+    closing = asyncio.Event()
+    stopped = _named_push_lock(address, always_connected=False)
+    lock, _ = _drain_on_a_real_session(stopped, [_count_reply(0)])
+    stopped.set_ble_device(BLEDevice(address, "Test Lock", None))
+    assert lock.session is not None
+    lock.session._notifications_started = True
+    client = cast(MagicMock, lock.client)
+    answer = client.write_gatt_char.side_effect
+
+    async def write(char: object, command: bytearray, response: bool) -> None:
+        if command[0x01] != Commands.GETLOG.value:
+            await answer(char, command, response)
+            return
+        writing.set()
+        await asyncio.Event().wait()
+
+    async def stop_notify(*_: object) -> None:
+        await asyncio.sleep(0)  # a GATT request, so other tasks run meanwhile
+
+    async def disconnect() -> None:
+        if not client.is_connected:
+            return  # the backend is already disconnecting
+        client.is_connected = False
+        await closing.wait()
+        events.append("disconnected")
+
+    client.write_gatt_char = AsyncMock(side_effect=write)
+    client.stop_notify = AsyncMock(side_effect=stop_notify)
+    client.disconnect = AsyncMock(side_effect=disconnect)
+    stopped.register_log_record_callback(_recorder([]))
+    await asyncio.wait_for(writing.wait(), 1)
+    stopped._cancel()
+    started = _named_push_lock(address, always_connected=False)
+
+    async def start() -> None:
+        await _start(started)
+        events.append("started")
+
+    starting = asyncio.create_task(start())
+    # Time enough for start() to return, were it not waiting.
+    await asyncio.wait({starting}, timeout=0.05)
+    closing.set()
+    await starting
+
+    assert events == ["disconnected", "started"]
+
+
+@pytest.mark.asyncio
+async def test_start_waits_for_a_stopped_drain_to_end() -> None:
+    """start() waits for a cancelled drain whose log record callback is still ending."""
+    address = "AA:BB:CC:DD:EE:DA"
+    events: list[str] = []
+    delivering = asyncio.Event()
+    finishing = asyncio.Event()
+    stopped = _named_push_lock(address, always_connected=False)
+    _drain_on_a_real_session(stopped, [_count_reply(0), _RECORDS[0], _GET_LOG_ERROR])
+    stopped.set_ble_device(BLEDevice(address, "Test Lock", None))
+
+    async def deliver(_record: LogRecord, _backlog: bool) -> None:
+        delivering.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await finishing.wait()  # the consumer ends its own work first
+            events.append("callback ended")
+            raise
+
+    stopped.register_log_record_callback(deliver)
+    await asyncio.wait_for(delivering.wait(), 1)
+    stopped._cancel()
+    started = _named_push_lock(address, always_connected=False)
+
+    async def start() -> None:
+        await _start(started)
+        events.append("started")
+
+    starting = asyncio.create_task(start())
+    # Time enough for start() to return, were it not waiting.
+    await asyncio.wait({starting}, timeout=0.05)
+    finishing.set()
+    await starting
+
+    assert events == ["callback ended", "started"]
+
+
+@pytest.mark.asyncio
+async def test_no_keep_alive_runs_after_a_stop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The keep-alive timer armed before a stop does not fire after it."""
+    push_lock = _connected_always_on_lock("AA:BB:CC:DD:EE:DB")
+    push_lock._client = MagicMock(spec=Lock, is_connected=True)
+    push_lock._schedule_next_keep_alive(0)
+
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        push_lock._cancel()
+        await asyncio.gather(*push_lock._background_tasks)
+        await asyncio.sleep(0)  # let a keep-alive timer still armed fire
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Test Lock: Executing forced disconnect: stopping" in messages
+    assert "Test Lock: Executing keep alive" not in messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [None, AuthError("Authentication error: key or slot (key index) is incorrect")],
+    ids=["answered", "raised-after-the-connect"],
+)
+async def test_validate_disconnects_its_client_before_it_returns(
+    error: Exception | None,
+) -> None:
+    """validate() returns or raises with its link closed and no disconnect timer."""
+    address = "AA:BB:CC:DD:EE:DC"
+    push_lock = _named_push_lock(address, always_connected=False)
+    push_lock.set_ble_device(BLEDevice(address, "Test Lock", None))
+    link = _first_link(push_lock, lambda: None)
+    link.disconnect = AsyncMock()
+    if error is not None:
+        # The first read after the handshake is the lock info probe.
+        link.lock_info = AsyncMock(side_effect=error)
+
+    with (
+        patch.object(push_lock, "_get_lock_instance", return_value=link),
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+        pytest.raises(DisconnectedError) if error is not None else nullcontext(),
+    ):
+        await push_lock.validate()
+
+    link.connect.assert_awaited_once()
+    link.disconnect.assert_awaited_once()
+    assert push_lock._disconnect_timer is None
+    _AUTH_FAILURE_HISTORY.auth_success(address)

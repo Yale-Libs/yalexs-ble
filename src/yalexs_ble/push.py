@@ -291,7 +291,7 @@ class AuthFailureHistory:
 
 _AUTH_FAILURE_HISTORY = AuthFailureHistory()
 
-# _PENDING_TEARDOWNS holds the forced-disconnect task of each address's last stop,
+# _PENDING_TEARDOWNS holds the teardown task of each address's last stop,
 # keyed by the address in upper case, until the task ends. Every PushLock shares it,
 # because a stopped instance's teardown can drop another instance's connection to
 # the same address.
@@ -1563,9 +1563,15 @@ class PushLock:
         )
 
     async def validate(self) -> None:
-        """Validate lock credentials."""
+        """Validate the lock credentials by running an update."""
         _LOGGER.debug("%s: Starting validate", self.name)
-        await self._update()
+        try:
+            await self._update()
+        finally:
+            # A later disconnect of this link by the timer can drop the next
+            # connection to the address.
+            self._cancel_disconnect_timer()
+            await self._execute_disconnect()
         self._clear_reconnect_backoff()
         _LOGGER.debug("%s: Finished validate", self.name)
 
@@ -2244,7 +2250,7 @@ class PushLock:
     async def start(self) -> Callable[[], None]:
         """Start watching for updates after the address's last teardown has ended."""
         if (teardown := _PENDING_TEARDOWNS.get(self.address.upper())) is not None:
-            _LOGGER.debug("%s: Waiting for the last stop's disconnect", self.name)
+            _LOGGER.debug("%s: Waiting for the last stop's teardown", self.name)
             # asyncio.wait leaves the teardown running if start() is canceled, and
             # raises neither its exception nor its cancellation here.
             await asyncio.wait((teardown,))
@@ -2263,6 +2269,7 @@ class PushLock:
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
+        self._cancel_keepalive_timer()
         if self._activity_drain_task is not None:
             self._activity_drain_task.cancel()
         if not self._operation_in_flight:
@@ -2270,9 +2277,21 @@ class PushLock:
             # still ends its attempts; the stopped exit resets it instead.
             self._reset_jam_state()
         address = self.address.upper()
-        teardown = self.background_task(self._execute_forced_disconnect("stopping"))
+        teardown = self.background_task(self._async_teardown(self._client))
         _PENDING_TEARDOWNS[address] = teardown
         teardown.add_done_callback(functools.partial(_forget_teardown, address))
+
+    async def _async_teardown(self, client: Lock | None) -> None:
+        """Disconnect, then wait for the drain and the disconnect after a failed write.
+
+        client is the Lock in _client at the stop, because the forced disconnect
+        clears _client. The second wait covers only its plain session.
+        """
+        await self._execute_forced_disconnect("stopping")
+        if (drain := self._activity_drain_task) is not None:
+            await asyncio.wait((drain,))
+        if client is not None:
+            await client._wait_for_disconnect_after_failed_write()
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         """Run fut as a logged background task and return the task."""
