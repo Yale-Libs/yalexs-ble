@@ -994,7 +994,7 @@ class Lock:
             return LockActivity(
                 timestamp,
                 lock_status,
-                source=util._named(OpCode, response[0x05]),
+                source=OpCode(response[0x05]),
             )
         if activity_type == LockActivityType.PIN.value:
             # Timestamp is at 0x05-0x08

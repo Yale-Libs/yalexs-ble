@@ -1430,13 +1430,15 @@ def test_the_end_marker_decodes_to_nothing() -> None:
 
 
 def test_a_lock_record_keeps_an_op_code_with_no_name() -> None:
-    """A type 0x00 record whose opCode has no OpCode member keeps the value."""
+    """A type 0x00 record whose opCode has no named member keeps the value."""
     # Built: the captured lock-button record with opCode 0x0D.
     frame = _with_byte(KEYPAD_LOCK_BUTTON, 0x05, 0x0D)
     activity = _make_lock()._parse_lock_activity(frame)
     assert isinstance(activity, LockActivity)
-    assert activity.source == 13
-    assert type(activity.source) is int
+    assert activity.source is OpCode(0x0D)
+    assert activity.source.name == "UNKNOWN_0D"
+    assert activity.source.value == 0x0D
+    assert activity.source not in list(OpCode)
 
 
 def test_op_code_holds_the_vendor_table() -> None:
@@ -1467,6 +1469,8 @@ def test_op_code_holds_the_vendor_table() -> None:
         "ALIRO": 0x18,
         "UNDEFINED": 0xFF,
     }
+    # A plain Enum, so DOOR_STATE_CHANGED (0) is truthy like every other member.
+    assert all(OpCode)
     assert "OpCode" in yalexs_ble.__all__
 
 

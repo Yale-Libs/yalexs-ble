@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, IntEnum
-from typing import TypedDict
+from typing import TypedDict, cast
 
 COMMAND_SERVICE_UUID = "0000fe24-0000-1000-8000-00805f9b34fb"
 WRITE_CHARACTERISTIC = "bd4ac611-0b45-11e3-8ffd-0800200c9a66"
@@ -225,8 +225,12 @@ class LockState:
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
 
 
-class OpCode(IntEnum):
-    """The opCode at byte 5 of a type 0x00 activity record."""
+class OpCode(Enum):
+    """The opCode at byte 5 of a type 0x00 activity record.
+
+    A value the table does not name becomes an UNKNOWN_xx member, so the record
+    keeps it and source stays an OpCode.
+    """
 
     # Based on the vendor's term. Locks have been observed to record a lock or unlock
     # commanded over BLE with this value.
@@ -255,14 +259,22 @@ class OpCode(IntEnum):
     ALIRO = 0x18
     UNDEFINED = 0xFF
 
+    @classmethod
+    def _missing_(cls, value: object) -> OpCode | None:
+        if not isinstance(value, int):
+            return None
+        member = object.__new__(cls)
+        member._name_ = f"UNKNOWN_{value:02X}"
+        member._value_ = value
+        return cast(OpCode, cls._value2member_map_.setdefault(value, member))
+
 
 @dataclass
 class LockActivity:
     timestamp: datetime
     status: LockStatus
-    # source is None for a 0x07 or 0x0E record, which has no opCode byte.
-    # OpCode.DOOR_STATE_CHANGED is 0, so a truth test cannot tell it from None.
-    source: OpCode | int | None
+    # A 0x07 or 0x0E record is a credential use at slot; it has no opCode byte.
+    source: OpCode | None
     slot: int | None = None
 
 
