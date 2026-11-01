@@ -295,42 +295,23 @@ def test_door_sense(model: str, door_sense: bool) -> None:
     assert _lock_info(model).door_sense is door_sense
 
 
-@pytest.mark.parametrize(
-    ("model", "brand"),
-    [
-        ("ASL-03", LogBrand.AUGUST),
-        ("ASL-05-XX", LogBrand.AUGUST),
-        ("YRD-456", LogBrand.YALE),
-        ("SL-103-EU", LogBrand.YALE),
-        ("YUR/DEL/1/SIL", LogBrand.YALE),
-        # An unknown model reads Yale's numbering, as the rest of the decoding does.
-        ("", LogBrand.YALE),
-    ],
-)
-def test_log_brand_follows_the_model(model: str, brand: LogBrand) -> None:
-    assert _lock_info(model).log_brand is brand
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("paired", "model", "brand"),
+    ("paired", "brand"),
     [
-        # Nothing known yet reads Yale's numbering.
-        (None, None, LogBrand.YALE),
-        (None, "ASL-03", LogBrand.AUGUST),
-        # The app the lock is paired with outranks the model.
-        (LogBrand.YALE, "ASL-03", LogBrand.YALE),
-        (LogBrand.AUGUST, "YRD-456", LogBrand.AUGUST),
+        (None, LogBrand.YALE),
+        (LogBrand.YALE, LogBrand.YALE),
+        (LogBrand.AUGUST, LogBrand.AUGUST),
     ],
 )
-async def test_push_lock_log_brand_is_the_paired_brand_else_the_models(
-    paired: LogBrand | None, model: str | None, brand: LogBrand
+async def test_push_lock_log_brand_is_the_paired_brand(
+    paired: LogBrand | None, brand: LogBrand
 ) -> None:
+    """The model says nothing: the same hardware ships under both brands."""
     push_lock = _named_push_lock(
         "aa:bb:cc:dd:ee:60", always_connected=False, brand=paired
     )
-    if model is not None:
-        push_lock._lock_info = _lock_info(model)
+    push_lock._lock_info = _lock_info("YRD-256")
     assert push_lock.log_brand is brand
 
 

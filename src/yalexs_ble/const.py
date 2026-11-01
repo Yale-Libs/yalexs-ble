@@ -35,9 +35,6 @@ FIRMWARE_REVISION_CHARACTERISTIC = "00002a26-0000-1000-8000-00805f9b34fb"
 # such as "SL-103-EU", so the tables match an entry or a suffixed variant.
 NO_DOOR_SENSE_MODELS = {"ASL-02", "ASL-01"}
 
-# August's own locks; every other model follows Yale's activity log numbering.
-AUGUST_MODEL_PREFIX = "ASL-"
-
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these exclusions
 NO_BATTERY_SUPPORT_MODELS = {
     "SL-103",  # Linus L2
@@ -552,13 +549,6 @@ class LockInfo:
         """Check if the lock answers battery status requests."""
         return not self._model_in(NO_BATTERY_SUPPORT_MODELS)
 
-    @property
-    def log_brand(self) -> LogBrand:
-        """The numbering the lock's activity log follows, told by its model."""
-        if self.model.startswith(AUGUST_MODEL_PREFIX):
-            return LogBrand.AUGUST
-        return LogBrand.YALE
-
     def _model_in(self, models: set[str]) -> bool:
         """True for a listed model or a suffixed variant of one, not a longer number."""
         return any(
@@ -580,5 +570,6 @@ class YaleXSBLEDiscovery(TypedDict):
     serial: str
     key: str
     slot: int
-    # A LogBrand value: the app the lock is paired with knows its numbering.
+    # A LogBrand value. Only the app a lock is paired with knows its numbering;
+    # the same hardware ships under both brands.
     brand: NotRequired[str]

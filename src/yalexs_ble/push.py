@@ -615,12 +615,8 @@ class PushLock:
 
     @property
     def log_brand(self) -> LogBrand:
-        """The activity log's numbering: as paired, else as the model tells."""
-        if self._brand is not None:
-            return self._brand
-        if self._lock_info is not None:
-            return self._lock_info.log_brand
-        return LogBrand.YALE
+        """The activity log's numbering, as paired; Yale's when not told."""
+        return self._brand or LogBrand.YALE
 
     @property
     def connection_info(self) -> ConnectionInfo | None:
