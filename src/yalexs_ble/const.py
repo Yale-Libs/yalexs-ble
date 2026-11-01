@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, IntEnum, IntFlag
-from typing import Self, TypedDict, TypeVar, cast
+from typing import NotRequired, Self, TypedDict, TypeVar, cast
 
 COMMAND_SERVICE_UUID = "0000fe24-0000-1000-8000-00805f9b34fb"
 WRITE_CHARACTERISTIC = "bd4ac611-0b45-11e3-8ffd-0800200c9a66"
@@ -580,3 +580,5 @@ class YaleXSBLEDiscovery(TypedDict):
     serial: str
     key: str
     slot: int
+    # A LogBrand value: the app the lock is paired with knows its numbering.
+    brand: NotRequired[str]

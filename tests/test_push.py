@@ -312,6 +312,29 @@ def test_log_brand_follows_the_model(model: str, brand: LogBrand) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("paired", "model", "brand"),
+    [
+        # Nothing known yet reads Yale's numbering.
+        (None, None, LogBrand.YALE),
+        (None, "ASL-03", LogBrand.AUGUST),
+        # The app the lock is paired with outranks the model.
+        (LogBrand.YALE, "ASL-03", LogBrand.YALE),
+        (LogBrand.AUGUST, "YRD-456", LogBrand.AUGUST),
+    ],
+)
+async def test_push_lock_log_brand_is_the_paired_brand_else_the_models(
+    paired: LogBrand | None, model: str | None, brand: LogBrand
+) -> None:
+    push_lock = _named_push_lock(
+        "aa:bb:cc:dd:ee:60", always_connected=False, brand=paired
+    )
+    if model is not None:
+        push_lock._lock_info = _lock_info(model)
+    assert push_lock.log_brand is brand
+
+
+@pytest.mark.asyncio
 async def test_background_task_logs_exception(caplog):
     """Background task failures should be logged with the lock name."""
     push_lock = PushLock(
