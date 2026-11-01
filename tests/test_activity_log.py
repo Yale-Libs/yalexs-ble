@@ -434,7 +434,7 @@ def test_a_bytearray_frame_decodes_to_a_record_holding_bytes() -> None:
     frame = bytearray(KEYPAD_LOCK_BUTTON)
     # A bytearray is outside the bytes signature, and the copy keeps a later
     # change to it out of the record.
-    record = parse_log_event_packet(frame)  # type: ignore[arg-type]
+    record = parse_log_event_packet(frame)
     assert type(record.raw) is bytes
     assert record.raw == KEYPAD_LOCK_BUTTON
     frame[0x08] ^= 0xFF

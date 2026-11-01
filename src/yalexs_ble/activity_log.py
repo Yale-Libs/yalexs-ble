@@ -747,7 +747,7 @@ _LOG_RECORDS: Mapping[Brand, Mapping[int, RecordDecoder]] = {
 
 
 def parse_log_event_packet(
-    response_packet: bytes, brand: Brand = Brand.AUGUST
+    response_packet: bytes | bytearray, brand: Brand = Brand.AUGUST
 ) -> LogRecord:
     """Decode a GetLog reply into its record, by the log_type at byte 4.
 
