@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, IntEnum, IntFlag
-from typing import TypedDict, cast
+from typing import Self, TypedDict, TypeVar, cast
 
 COMMAND_SERVICE_UUID = "0000fe24-0000-1000-8000-00805f9b34fb"
 WRITE_CHARACTERISTIC = "bd4ac611-0b45-11e3-8ffd-0800200c9a66"
@@ -235,6 +235,26 @@ class LockState:
 LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
 
 
+_EnumT = TypeVar("_EnumT", bound=Enum)
+
+
+def _unknown_member(cls: type[_EnumT], member: _EnumT, value: int) -> _EnumT:
+    """Register member as the UNKNOWN_xx of cls for value, or return the one made."""
+    member._name_ = f"UNKNOWN_{value:02X}"
+    member._value_ = value
+    return cast(_EnumT, cls._value2member_map_.setdefault(value, member))
+
+
+class _OpenIntEnum(IntEnum):
+    """An IntEnum that keeps a value it does not name as an UNKNOWN_xx member."""
+
+    @classmethod
+    def _missing_(cls, value: object) -> Self | None:
+        if not isinstance(value, int):
+            return None
+        return _unknown_member(cls, int.__new__(cls, value), value)
+
+
 class OpCode(Enum):
     """The opCode at byte 5 of a type 0x00 activity record.
 
@@ -273,10 +293,7 @@ class OpCode(Enum):
     def _missing_(cls, value: object) -> OpCode | None:
         if not isinstance(value, int):
             return None
-        member = object.__new__(cls)
-        member._name_ = f"UNKNOWN_{value:02X}"
-        member._value_ = value
-        return cast(OpCode, cls._value2member_map_.setdefault(value, member))
+        return _unknown_member(cls, object.__new__(cls), value)
 
 
 class LogBrand(Enum):
@@ -354,7 +371,7 @@ class AugustLogType(IntEnum):
     GET_LOG_ERROR = LOG_TYPE_GET_LOG_ERROR
 
 
-class LockCred(IntEnum):
+class LockCred(_OpenIntEnum):
     """The credential type of a credential record."""
 
     PIN = 0x00
@@ -367,7 +384,7 @@ class LockCred(IntEnum):
     ALL = 0xFF
 
 
-class TamperType(IntEnum):
+class TamperType(_OpenIntEnum):
     """The tamper type of a Tamper record."""
 
     CLEAR = 0x00
@@ -387,7 +404,7 @@ class TamperType(IntEnum):
     TOO_MANY_AUTH_ERRORS_FACE_SCAN_CLEARED = 0x0E
 
 
-class OperatingMode(IntEnum):
+class OperatingMode(_OpenIntEnum):
     """The operating mode of August's LockOperatingMode record."""
 
     NORMAL = 0x00
@@ -396,14 +413,14 @@ class OperatingMode(IntEnum):
     PASSAGE = 0x03
 
 
-class JamState(IntEnum):
+class JamState(_OpenIntEnum):
     """The jam state of August's LockDeadboltJam record."""
 
     OCCURS_DURING_LOCKING = 0x00
     OCCURS_DURING_UNLOCKING = 0x01
 
 
-class CredType(IntEnum):
+class CredType(_OpenIntEnum):
     """The cred_type of August's InvalidCredentialEntry and OutOfScheduleCredential."""
 
     ENTRY_KEYPAD_PINCODE = 0x0000
@@ -420,14 +437,14 @@ class CredType(IntEnum):
     ENTRY_UNKNOWN = 0xFFFF
 
 
-class OutOfScheduleType(IntEnum):
+class OutOfScheduleType(_OpenIntEnum):
     """The violation type of August's OutOfScheduleCredential record."""
 
     PREMATURE = 0x00
     EXPIRED = 0x01
 
 
-class MatterEventType(IntEnum):
+class MatterEventType(_OpenIntEnum):
     """The event type of August's MatterEvent record."""
 
     REGISTRATION = 0x00
@@ -435,7 +452,7 @@ class MatterEventType(IntEnum):
     FABRIC_REMOVED = 0x02
 
 
-class MatterRegistrationStatus(IntEnum):
+class MatterRegistrationStatus(_OpenIntEnum):
     """The registration status of August's MatterEvent record."""
 
     OK = 0x00
@@ -443,14 +460,14 @@ class MatterRegistrationStatus(IntEnum):
     UNKNOWN = 0xFF
 
 
-class LockOperationType(IntEnum):
+class LockOperationType(_OpenIntEnum):
     """The operation type of August's LockOperationBlame record."""
 
     LOCK = 0x00
     UNLOCK = 0x01
 
 
-class AugustLockOperationSource(IntEnum):
+class AugustLockOperationSource(_OpenIntEnum):
     """The operation source of August's LockOperationBlame record."""
 
     BLE = 0x01
@@ -474,7 +491,7 @@ class LockOperationCredType(IntFlag):
     BLE = 0x80
 
 
-class LockOperationStatus(IntEnum):
+class LockOperationStatus(_OpenIntEnum):
     """The operation status of August's LockOperationBlame record."""
 
     SUCCESS = 0x00
@@ -489,7 +506,7 @@ class LockOperationStatus(IntEnum):
     NON_ACCESS = 0x09
 
 
-class BulkOperationType(IntEnum):
+class BulkOperationType(_OpenIntEnum):
     """The operation type of August's BulkOperation record."""
 
     USERS_CLEAR = 0x01

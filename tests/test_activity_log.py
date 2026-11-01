@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from enum import IntEnum, IntFlag
+from enum import Enum
 
 import pytest
 
@@ -287,20 +287,22 @@ def test_credential_operation_with_an_error() -> None:
     assert record.current_door_state is None
 
 
-def test_credential_type_without_a_member_stays_an_integer() -> None:
+def test_credential_type_without_a_member_is_kept_as_unknown() -> None:
     """Built frame: credential type 3 has no name."""
     record = parse_log_event_packet(_built(0x0E, {9: "03"}))
     assert isinstance(record, CredentialOperation)
+    assert record.credential_type is LockCred(3)
     assert record.credential_type == 3
-    assert type(record.credential_type) is int
+    assert record.credential_type.name == "UNKNOWN_03"
 
 
 def test_lock_operation_with_an_unnamed_op_code_is_returned() -> None:
-    """Built frame: opCode 0x0D has no member and stays an integer."""
+    """Built frame: opCode 0x0D has no named member and is kept as UNKNOWN_0D."""
     record = parse_log_event_packet(_built(0x00, {5: "0d", 6: "05"}))
     assert isinstance(record, LockOperation)
-    assert record.op_code == 13
-    assert type(record.op_code) is int
+    assert record.op_code is OpCode(0x0D)
+    assert record.op_code.value == 13
+    assert record.op_code.name == "UNKNOWN_0D"
 
 
 @pytest.mark.parametrize(
@@ -582,7 +584,7 @@ def test_a_bytearray_frame_decodes_to_a_record_holding_bytes() -> None:
             Tamper,
             _built(0x0F, {5: TIME, 9: "0f01"}),
             time_stamp=TIME_STAMP,
-            tamper_type=0x10F,
+            tamper_type=TamperType(0x10F),
         ),
         _case(
             BCMTest,
@@ -733,7 +735,7 @@ def test_a_record_the_brands_number_differently_reads_in_the_brands_numbering(
             InvalidCredentialEntry,
             _built(0x17, {5: TIME, 9: "0300", 11: "df14"}),
             time_stamp=TIME_STAMP,
-            cred_type=0x0003,
+            cred_type=CredType(0x0003),
             battery_level=5343,
         ),
         _case(
@@ -805,14 +807,14 @@ def test_a_value_only_yales_app_names_keeps_its_member_under_august() -> None:
         (0x05, AugustLockOperationSource.MANUAL),
         (0x06, AugustLockOperationSource.MATTER),
         (0x07, AugustLockOperationSource.ZWAVE),
-        (0x08, 0x08),
+        (0x08, AugustLockOperationSource(0x08)),
     ],
     ids=["1", "2", "3", "4", "5", "6", "7", "8"],
 )
 def test_lock_operation_blame_op_source_is_its_member(
-    value: int, op_source: AugustLockOperationSource | int
+    value: int, op_source: AugustLockOperationSource
 ) -> None:
-    """Built frames: byte 10 is the member, or the integer when it has none."""
+    """Built frames: byte 10 is the member, or UNKNOWN_xx when it has no name."""
     frame = _built(0x19, {10: f"{value:02x}"})
     record = parse_log_event_packet(frame, LogBrand.AUGUST)
     assert isinstance(record, LockOperationBlame)
@@ -901,7 +903,7 @@ def test_matter_event_fields_follow_event_type(
         ("01ff050000", None, None, 5),
         ("0204030102", 3, LockOperationCredType.RF_ID, 0x0201),
         ("0204ff0500", None, LockOperationCredType.RF_ID, 5),
-        ("0201030500", 3, 1, 5),
+        ("0201030500", 3, LockOperationCredType(1), 5),
         ("0302020500", None, None, None),
     ],
     ids=[
@@ -916,7 +918,7 @@ def test_matter_event_fields_follow_event_type(
 def test_bulk_operation_fields_follow_bulk_op_type(
     body: str,
     fabric_index: int | None,
-    lock_cred_type: LockOperationCredType | int | None,
+    lock_cred_type: LockOperationCredType | None,
     number_of_removed_users: int | None,
 ) -> None:
     """Built frames: body is bytes 9 to 13, starting with bulk_op_type."""
@@ -939,7 +941,8 @@ def _public_record_classes(cls: type[LogRecord]) -> set[type[LogRecord]]:
 
 
 def test_the_package_exports_the_decoder() -> None:
-    """Every record class, enumeration, and name table is exported, with the parser."""
+    """Every record class and enumeration is exported with the parser; the name
+    tables stay in yalexs_ble.const."""
     records = _public_record_classes(LogRecord)
     assert len(records) == 33
     assert {cls.__name__ for cls in records} | {
@@ -963,28 +966,6 @@ def test_the_package_exports_the_decoder() -> None:
         "LockOperationCredType",
         "LockOperationStatus",
         "BulkOperationType",
-        "LOG_TYPE_NAMES_YALE",
-        "LOG_TYPE_NAMES_AUGUST",
-        "OP_CODE_NAMES_YALE",
-        "OP_CODE_NAMES_AUGUST",
-        "LOCK_STATE_NAMES_YALE",
-        "LOCK_STATE_NAMES_AUGUST",
-        "CREDENTIAL_TYPE_NAMES_YALE",
-        "CREDENTIAL_TYPE_NAMES_AUGUST",
-        "DOOR_STATE_NAMES",
-        "TAMPER_TYPE_NAMES_YALE",
-        "TAMPER_TYPE_NAMES_AUGUST",
-        "OPERATING_MODE_NAMES",
-        "JAM_STATE_NAMES",
-        "CRED_TYPE_NAMES",
-        "OUT_OF_SCHEDULE_TYPE_NAMES",
-        "MATTER_EVENT_NAMES",
-        "MATTER_REGISTRATION_STATUS_NAMES",
-        "LOCK_OPERATION_TYPE_NAMES",
-        "LOCK_OPERATION_SOURCE_NAMES",
-        "LOCK_OPERATION_CRED_TYPE_NAMES",
-        "LOCK_OPERATION_STATUS_NAMES",
-        "BULK_OPERATION_TYPE_NAMES",
     } <= set(yalexs_ble.__all__)
 
 
@@ -1370,12 +1351,12 @@ def test_name_tables_hold_the_vendor_strings(
     ids=lambda value: getattr(value, "__name__", None),
 )
 def test_enumeration_members_are_the_named_values(
-    enumeration: type[IntEnum] | type[IntFlag], names: dict[int, str]
+    enumeration: type[Enum], names: dict[int, str]
 ) -> None:
     """A member has the value and the vendor's term less a prefix of the type's name."""
     assert {member.value for member in enumeration} == set(names)
     for name, member in enumeration.__members__.items():
-        vendor_name = names[member].replace("_", "").lower()
+        vendor_name = names[member.value].replace("_", "").lower()
         member_name = name.replace("_", "").lower()
         assert vendor_name.endswith(member_name)
         prefix = vendor_name.removesuffix(member_name)
@@ -1509,7 +1490,7 @@ def test_enumeration_members_are_the_named_values(
     ids=lambda value: getattr(value, "__name__", None),
 )
 def test_august_enumerations_hold_the_vendor_values(
-    enumeration: type[IntEnum] | type[IntFlag], expected: dict[str, int]
+    enumeration: type[Enum], expected: dict[str, int]
 ) -> None:
     """Each enumeration has exactly these members."""
     assert {member.name: member.value for member in enumeration} == expected
