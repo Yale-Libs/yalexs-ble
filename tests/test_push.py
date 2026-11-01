@@ -40,6 +40,7 @@ from yalexs_ble.lock import Lock
 from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
     _LOCK_OPERATION,
+    _PENDING_TEARDOWNS,
     _SECUREMODE_OPERATION,
     _UNLOCK_OPERATION,
     ACTIVITY_DRAIN_FAILURE_BACKOFF,
@@ -9926,3 +9927,324 @@ async def test_an_op_response_the_lock_parses_holds_the_next_read_off():
     lock._parse_state(bytes(_with_checksum(_OP_RESPONSE_OK)))
 
     assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+async def _started_on_a_real_lock(
+    address: str, disconnect: Callable[[], Awaitable[None]]
+) -> PushLock:
+    """A started PushLock whose real Lock has a mock BLE client running disconnect."""
+    push_lock = _named_push_lock(address, always_connected=False)
+    await _start(push_lock)
+    lock = _real_decoder(push_lock)
+    lock.client = MagicMock(
+        is_connected=True, disconnect=AsyncMock(side_effect=disconnect)
+    )
+    push_lock._client = lock
+    return push_lock
+
+
+def _held_disconnect(
+    events: list[str], closing: asyncio.Event, disconnecting: asyncio.Event
+) -> Callable[[], Awaitable[None]]:
+    """A disconnect that sets disconnecting and returns once closing is set."""
+
+    async def disconnect() -> None:
+        disconnecting.set()
+        await closing.wait()
+        events.append("disconnected")
+
+    return disconnect
+
+
+async def _start_on_a_known_device(push_lock: PushLock) -> None:
+    """Run start() with get_device returning a device, so an update is scheduled."""
+    device = BLEDevice(push_lock.address, "Test Lock", None)
+    with patch("yalexs_ble.push.get_device", AsyncMock(return_value=device)):
+        await push_lock.start()
+
+
+def _first_link(push_lock: PushLock, connected: Callable[[], None]) -> MagicMock:
+    """A mock Lock for push_lock's next connect that answers a first update cycle."""
+    link = MagicMock(is_connected=True)
+    link.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
+    link.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    link.auto_lock_status = AsyncMock()
+    link.connect = AsyncMock(side_effect=lambda _max_attempts: connected())
+    link.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
+    link.battery = AsyncMock()
+    return link
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stopped_address", "restarted"),
+    [
+        ("AA:BB:CC:DD:EE:D2", "AA:BB:CC:DD:EE:D2"),
+        ("AA:BB:CC:DD:EE:D2", "aa:bb:cc:dd:ee:d2"),
+        ("aa:bb:cc:dd:ee:d2", "AA:BB:CC:DD:EE:D2"),
+        ("AA:BB:CC:DD:EE:D2", None),
+    ],
+    ids=[
+        "another-instance",
+        "another-instance-lower-case",
+        "a-stopped-instance-lower-case",
+        "the-same-instance",
+    ],
+)
+async def test_start_waits_for_the_disconnect_of_the_last_stop(
+    caplog: pytest.LogCaptureFixture, stopped_address: str, restarted: str | None
+) -> None:
+    """start() returns after its address's last teardown, before the first connect."""
+    events: list[str] = []
+    closing = asyncio.Event()
+    disconnecting = asyncio.Event()
+    stopped = await _started_on_a_real_lock(
+        stopped_address, _held_disconnect(events, closing, disconnecting)
+    )
+    stopped._cancel()
+    await disconnecting.wait()
+    started = (
+        stopped
+        if restarted is None
+        else _named_push_lock(restarted, always_connected=False)
+    )
+    link = _first_link(started, lambda: events.append("connected"))
+
+    async def start() -> None:
+        await _start_on_a_known_device(started)
+        events.append("started")
+
+    with (
+        patch.object(started, "_get_lock_instance", return_value=link),
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+    ):
+        starting = asyncio.create_task(start())
+        await asyncio.sleep(0)  # start() runs up to its wait
+        closing.set()
+        await starting
+        await started.wait_for_first_update(1)
+
+    assert events == ["disconnected", "started", "connected"]
+    assert (
+        "yalexs_ble.push",
+        logging.DEBUG,
+        "Test Lock: Waiting for the last stop's disconnect",
+    ) in caplog.record_tuples
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stopped_address",
+    [None, "AA:BB:CC:DD:EE:D4"],
+    ids=["no-stop", "a-stop-of-another-address"],
+)
+async def test_start_does_not_wait_without_a_stop_of_its_address(
+    stopped_address: str | None,
+) -> None:
+    """start() does not wait when no teardown of its address is running."""
+    events: list[str] = []
+    closing = asyncio.Event()
+    disconnecting = asyncio.Event()
+    if stopped_address is not None:
+        stopped = await _started_on_a_real_lock(
+            stopped_address, _held_disconnect(events, closing, disconnecting)
+        )
+        stopped._cancel()
+        await disconnecting.wait()
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:D3", always_connected=False)
+
+    await asyncio.wait_for(_start_on_a_known_device(push_lock), 1)
+
+    assert _update_scheduled(push_lock)
+    assert events == []
+    if stopped_address is not None:
+        closing.set()
+        await asyncio.gather(*stopped._background_tasks)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_another_keeps_its_entry_until_its_own_teardown_ends() -> (
+    None
+):
+    """Of two stops of one address, start() waits for the later one's teardown."""
+    address = "AA:BB:CC:DD:EE:D5"
+    events: list[str] = []
+    closing = {"first": asyncio.Event(), "second": asyncio.Event()}
+
+    def disconnect(name: str) -> Callable[[], Awaitable[None]]:
+        async def _disconnect() -> None:
+            await closing[name].wait()
+            events.append(f"{name} disconnected")
+
+        return _disconnect
+
+    first = await _started_on_a_real_lock(address, disconnect("first"))
+    second = await _started_on_a_real_lock(address, disconnect("second"))
+    first._cancel()
+    second._cancel()
+    closing["first"].set()
+    await asyncio.gather(*first._background_tasks)
+    started = _named_push_lock(address, always_connected=False)
+
+    async def start() -> None:
+        await _start(started)
+        events.append("started")
+
+    starting = asyncio.create_task(start())
+    await asyncio.sleep(0)  # start() runs up to its wait
+    closing["second"].set()
+    await starting
+
+    assert events == ["first disconnected", "second disconnected", "started"]
+    assert address not in _PENDING_TEARDOWNS
+
+
+@pytest.mark.asyncio
+async def test_a_start_cancelled_while_it_waits_leaves_the_teardown_to_finish() -> None:
+    """A start() cancelled while it waits leaves the teardown to finish."""
+    address = "AA:BB:CC:DD:EE:D6"
+    events: list[str] = []
+    closing = asyncio.Event()
+    disconnecting = asyncio.Event()
+    stopped = await _started_on_a_real_lock(
+        address, _held_disconnect(events, closing, disconnecting)
+    )
+    stopped._cancel()
+    (teardown,) = stopped._background_tasks
+    await disconnecting.wait()
+    starting = asyncio.create_task(
+        _start(_named_push_lock(address, always_connected=False))
+    )
+    await asyncio.sleep(0)  # start() runs up to its wait
+
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    closing.set()
+    await asyncio.wait({teardown})
+
+    assert events == ["disconnected"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("background_task_failure_expected")
+@pytest.mark.parametrize(
+    ("ending", "ended"),
+    [("raised", "disconnect raised"), ("cancelled", "disconnect cancelled")],
+    ids=["raised", "cancelled"],
+)
+async def test_start_goes_on_after_a_teardown_that_failed(
+    ending: str, ended: str
+) -> None:
+    """start() goes on after a teardown that raised or was cancelled."""
+    address = "AA:BB:CC:DD:EE:D7"
+    events: list[str] = []
+    closing = asyncio.Event()
+    disconnecting = asyncio.Event()
+
+    async def disconnect() -> None:
+        disconnecting.set()
+        try:
+            await closing.wait()
+        except asyncio.CancelledError:
+            events.append("disconnect cancelled")
+            raise
+        events.append("disconnect raised")
+        raise RuntimeError("backend fault")
+
+    stopped = await _started_on_a_real_lock(address, disconnect)
+    stopped._cancel()
+    (teardown,) = stopped._background_tasks
+    await disconnecting.wait()
+    started = _named_push_lock(address, always_connected=False)
+
+    async def start() -> None:
+        await _start(started)
+        events.append("started")
+
+    starting = asyncio.create_task(start())
+    await asyncio.sleep(0)  # start() runs up to its wait
+    if ending == "raised":
+        closing.set()
+    else:
+        teardown.cancel()
+    await starting
+
+    assert events == [ended, "started"]
+
+
+@pytest.mark.asyncio
+async def test_a_restart_after_a_stop_during_a_connect_keeps_the_next_link() -> None:
+    """A lock stopped mid-connect and restarted keeps the link its lock() connects."""
+    # The lock is always connected, so no idle disconnect timer makes the old
+    # teardown skip disconnecting the link the restarted lock connects.
+    push_lock = _backoff_lock("AA:BB:CC:DD:EE:D8")
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
+    connecting = asyncio.Event()
+    closing = asyncio.Event()
+
+    async def connect(_max_attempts: int) -> None:
+        connecting.set()
+        await asyncio.Event().wait()
+
+    old = MagicMock(is_connected=False)
+    old.connect = AsyncMock(side_effect=connect)
+    old.disconnect = AsyncMock(side_effect=closing.wait)
+    new = MagicMock(is_connected=True, connect=AsyncMock(), disconnect=AsyncMock())
+
+    async def force_lock(
+        write_success_callback: Callable[[], None],
+        result_callback: Callable[[bool], None],
+    ) -> None:
+        write_success_callback()
+        result_callback(True)
+
+    new.force_lock = force_lock
+
+    async def restart_and_lock() -> None:
+        await _start_on_a_known_device(push_lock)
+        await push_lock.lock()
+
+    with patch.object(push_lock, "_get_lock_instance", side_effect=[old, new]):
+        push_lock._deferred_update()
+        await asyncio.wait_for(connecting.wait(), 1)
+        push_lock._cancel()
+        restarting = asyncio.create_task(restart_and_lock())
+        for _ in range(3):
+            await asyncio.sleep(0)  # restart_and_lock() runs until it waits
+        closing.set()
+        await restarting
+
+    assert push_lock.lock_status is LockStatus.LOCKED
+    new.connect.assert_awaited_once()
+    new.disconnect.assert_not_awaited()
+    assert old.disconnect.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_restart_during_the_first_update_gets_its_own_first_update() -> None:
+    """A lock restarted during its first update gets the restart's own first update."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:DD", always_connected=False)
+    connecting = asyncio.Event()
+
+    async def connect(_max_attempts: int) -> None:
+        connecting.set()
+        await asyncio.Event().wait()
+
+    old = MagicMock(spec=Lock, is_connected=False)
+    old.connect = AsyncMock(side_effect=connect)
+    new = _first_link(push_lock, lambda: None)
+
+    with patch.object(push_lock, "_get_lock_instance", side_effect=[old, new]):
+        await _start_on_a_known_device(push_lock)
+        first_wait = asyncio.create_task(push_lock.wait_for_first_update(5))
+        await asyncio.wait_for(connecting.wait(), 1)
+        push_lock._cancel()
+        await _start_on_a_known_device(push_lock)
+        await push_lock.wait_for_first_update(1)
+
+    new.connect.assert_awaited_once()
+    with pytest.raises(RuntimeError, match="Update was canceled"):
+        await first_wait

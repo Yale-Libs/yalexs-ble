@@ -291,6 +291,18 @@ class AuthFailureHistory:
 
 _AUTH_FAILURE_HISTORY = AuthFailureHistory()
 
+# _PENDING_TEARDOWNS holds the forced-disconnect task of each address's last stop,
+# keyed by the address in upper case, until the task ends. Every PushLock shares it,
+# because a stopped instance's teardown can drop another instance's connection to
+# the same address.
+_PENDING_TEARDOWNS: dict[str, asyncio.Task[None]] = {}
+
+
+def _forget_teardown(address: str, task: asyncio.Task[None]) -> None:
+    """Remove the address's entry if it still holds task."""
+    if _PENDING_TEARDOWNS.get(address) is task:
+        del _PENDING_TEARDOWNS[address]
+
 
 def retry_bluetooth_connection_error(
     func: WrapFuncType | None = None,
@@ -2230,7 +2242,12 @@ class PushLock:
         self._schedule_future_update_with_debounce(next_update)
 
     async def start(self) -> Callable[[], None]:
-        """Start watching for updates."""
+        """Start watching for updates after the address's last teardown has ended."""
+        if (teardown := _PENDING_TEARDOWNS.get(self.address.upper())) is not None:
+            _LOGGER.debug("%s: Waiting for the last stop's disconnect", self.name)
+            # asyncio.wait leaves the teardown running if start() is canceled, and
+            # raises neither its exception nor its cancellation here.
+            await asyncio.wait((teardown,))
         _LOGGER.debug("Waiting for advertisement callbacks for %s", self.name)
         if self._running:
             raise RuntimeError("Already running")
@@ -2252,11 +2269,16 @@ class PushLock:
             # Kept while a command is in flight so a jam reported during it
             # still ends its attempts; the stopped exit resets it instead.
             self._reset_jam_state()
-        self.background_task(self._execute_forced_disconnect("stopping"))
+        address = self.address.upper()
+        teardown = self.background_task(self._execute_forced_disconnect("stopping"))
+        _PENDING_TEARDOWNS[address] = teardown
+        teardown.add_done_callback(functools.partial(_forget_teardown, address))
 
-    def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:
-        """Execute a background task."""
-        self._background_tasks.add(self._logged_task(fut))
+    def background_task(self, fut: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        """Run fut as a logged background task and return the task."""
+        task = self._logged_task(fut)
+        self._background_tasks.add(task)
+        return task
 
     def _logged_task(self, coro: Coroutine[Any, Any, _T]) -> asyncio.Task[_T]:
         """Run coro as a task whose unexpected exception is logged."""
