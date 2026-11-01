@@ -876,7 +876,7 @@ class Lock:
             "get_parameter",
             _settings_response_matcher(Commands.READSETTING.value, parameter),
         )
-        # Byte 5 is not read, because its meaning is known for one parameter only.
+        # Byte 5 is not read, because its meaning in a parameter response is not known.
         value = util._bytes_to_int(response[0x08:0x0C])
         _LOGGER.debug("%s: Parameter 0x%02X reads 0x%08X", self.name, parameter, value)
         return value

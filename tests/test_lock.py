@@ -1765,11 +1765,11 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
         pytest.param(
             "get_parameter",
             (0xB2,),
-            # Captured answer to a read of a parameter the lock has never stored.
+            # Captured answer to a LATCH_PULL_TIME read on a lock without unlatch.
             [bytes.fromhex("bb04008db20200005aa55aa5000000000200")],
             0xA55AA55A,
             [],
-            id="read-never-stored-parameter",
+            id="read-latch-pull-time-without-unlatch",
         ),
     ],
 )
