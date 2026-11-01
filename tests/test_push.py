@@ -295,6 +295,26 @@ def test_door_sense(model: str, door_sense: bool) -> None:
     assert _lock_info(model).door_sense is door_sense
 
 
+@pytest.mark.parametrize(
+    ("model", "supported"),
+    [
+        ("SL-103", True),
+        ("Yale Linus L2", True),
+        # Regional/firmware suffixes must still match the family.
+        ("SL-103-EU", True),
+        ("Yale Linus L2 X", True),
+        # A longer model number is a different model, not a variant.
+        ("SL-1030", False),
+        ("CERES", False),
+        ("ASL-03", False),
+        ("MD-04I", False),
+        ("", False),
+    ],
+)
+def test_privacy_mode_supported(model: str, supported: bool) -> None:
+    assert _lock_info(model).privacy_mode_supported is supported
+
+
 @pytest.mark.asyncio
 async def test_background_task_logs_exception(caplog):
     """Background task failures should be logged with the lock name."""
@@ -7986,3 +8006,27 @@ async def test_an_op_response_the_lock_parses_holds_the_next_read_off():
     lock._parse_state(bytes(_with_checksum(_OP_RESPONSE_OK)))
 
     assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
+
+
+@pytest.mark.asyncio
+async def test_push_lock_privacy_mode() -> None:
+    """PushLock delegates get/set_privacy_mode and clears seen lock/door status."""
+    push_lock, mock_lock = _keycode_push_lock()
+    mock_lock.get_privacy_mode = AsyncMock(return_value=True)
+    mock_lock.set_privacy_mode = AsyncMock(return_value=None)
+    push_lock._seen_this_session.update({LockStatus, DoorStatus})
+
+    with patch.object(
+        push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)
+    ):
+        assert await push_lock.get_privacy_mode() is True
+        mock_lock.get_privacy_mode.assert_awaited_once_with()
+
+        await push_lock.set_privacy_mode(True)
+        mock_lock.set_privacy_mode.assert_awaited_once_with(True)
+        assert LockStatus not in push_lock._seen_this_session
+        assert DoorStatus not in push_lock._seen_this_session
+
+    push_lock._state_callback([LockStatus.PRIVACY_MODE])
+    assert push_lock.lock_status is LockStatus.PRIVACY_MODE
+    assert push_lock.secure_status is LockStatus.UNLOCKED
