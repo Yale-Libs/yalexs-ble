@@ -2311,20 +2311,21 @@ class PushLock:
         """Wait for the first update."""
         if not self._running:
             raise RuntimeError("Not running")
-        if not self._first_update_future:
+        if (future := self._first_update_future) is None:
             raise RuntimeError("Already waited for first update")
+        # The timeout and the caller's cancellation both cancel future, and a
+        # start() after a stop can replace _first_update_future while this waits,
+        # so the attribute is cleared only while it still holds future.
         try:
             async with asyncio_timeout(timeout):
-                await self._first_update_future
-        except (TimeoutError, asyncio.CancelledError) as ex:
-            self._first_update_future.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._first_update_future
+                await future
+        except TimeoutError as ex:
             raise NoAdvertisementError(
                 "No advertisement received before timeout"
             ) from ex
         finally:
-            self._first_update_future = None
+            if self._first_update_future is future:
+                self._first_update_future = None
 
     def _hold_update(self) -> None:
         """Hold update cycles off for the stale-state debounce from now."""
@@ -2410,13 +2411,14 @@ class PushLock:
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 
     def _set_update_state(self, exception: Exception | None) -> None:
-        """Set the update state."""
-        if not self._first_update_future:
+        """Resolve _first_update_future with the outcome while it is pending."""
+        future = self._first_update_future
+        if future is None or future.done():
             return
         if exception:
-            self._first_update_future.set_exception(exception)
+            future.set_exception(exception)
         else:
-            self._first_update_future.set_result(None)
+            future.set_result(None)
 
     async def _execute_deferred_update(self) -> None:  # noqa: PLR0915
         """Execute deferred update."""

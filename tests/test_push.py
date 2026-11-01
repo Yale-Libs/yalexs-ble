@@ -83,6 +83,7 @@ from yalexs_ble.session import (
     AuthError,
     DisconnectedError,
     KeycodeError,
+    NoAdvertisementError,
     OperationFailedError,
     OperationIncompleteError,
     ResponseError,
@@ -10759,3 +10760,94 @@ async def test_disconnect_logs_a_disconnect_request_that_raises(
     ]
     assert record.levelno == logging.DEBUG
     assert isinstance(record.exc_info[1], BleakError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "restarted_wait_first", [True, False], ids=["waiting", "after"]
+)
+@pytest.mark.parametrize(
+    ("first_wait_timeout", "ended"),
+    [(0.02, NoAdvertisementError), (5.0, asyncio.CancelledError)],
+    ids=["timeout", "cancelled"],
+)
+async def test_a_first_wait_ending_after_a_restart_leaves_the_restart_its_update(
+    first_wait_timeout: float,
+    ended: type[BaseException],
+    restarted_wait_first: bool,
+) -> None:
+    """A first wait ending after a restart leaves the restarted wait its own update."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E7", always_connected=False)
+    link = _first_link(push_lock, lambda: None)
+
+    with patch.object(push_lock, "_get_lock_instance", return_value=link):
+        await _start_on_a_known_device(push_lock)
+        first_wait = asyncio.create_task(
+            push_lock.wait_for_first_update(first_wait_timeout)
+        )
+        await asyncio.sleep(0)  # the first wait awaits its future
+        push_lock._cancel()  # before ADV_UPDATE_COALESCE_SECONDS, so no update ran
+        await _start_on_a_known_device(push_lock)
+        if restarted_wait_first:
+            restarted_wait = asyncio.create_task(push_lock.wait_for_first_update(1))
+            await asyncio.sleep(0)  # the restarted wait awaits its future
+        if ended is asyncio.CancelledError:
+            first_wait.cancel()
+        await asyncio.wait({first_wait})
+        if not restarted_wait_first:
+            restarted_wait = asyncio.create_task(push_lock.wait_for_first_update(1))
+        await restarted_wait
+
+    link.connect.assert_awaited_once()
+    with pytest.raises(ended):
+        await first_wait
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_first_wait_ends_cancelled_and_clears_the_future() -> None:
+    """A cancelled first wait raises CancelledError and clears _first_update_future."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E8", always_connected=False)
+    await _start(push_lock)
+    waiting = asyncio.create_task(push_lock.wait_for_first_update(5))
+    await asyncio.sleep(0)  # the wait awaits its future
+
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    with pytest.raises(RuntimeError, match="Already waited for first update"):
+        await push_lock.wait_for_first_update(1)
+
+
+@pytest.mark.asyncio
+async def test_a_second_update_leaves_a_resolved_first_update_future_alone() -> None:
+    """A second update raises nothing and leaves the resolved future as it was."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E9", always_connected=False)
+    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
+    await _start(push_lock)
+    link = _first_link(push_lock, lambda: None)
+
+    with patch.object(push_lock, "_get_lock_instance", return_value=link):
+        await push_lock._execute_deferred_update()
+        await push_lock._execute_deferred_update()
+
+    await asyncio.wait_for(push_lock.wait_for_first_update(1), 1)
+
+
+@pytest.mark.asyncio
+async def test_two_waits_for_one_first_update_both_return() -> None:
+    """Two waits for one first update both return once it has run."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:EA", always_connected=False)
+    link = _first_link(push_lock, lambda: None)
+
+    with patch.object(push_lock, "_get_lock_instance", return_value=link):
+        await _start_on_a_known_device(push_lock)
+        await asyncio.wait_for(
+            asyncio.gather(
+                push_lock.wait_for_first_update(1),
+                push_lock.wait_for_first_update(1),
+            ),
+            2,
+        )
+
+    link.connect.assert_awaited_once()
