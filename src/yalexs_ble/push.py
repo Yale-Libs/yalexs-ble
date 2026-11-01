@@ -32,6 +32,7 @@ from .const import (
     AutoLockMode,
     AutoLockState,
     BatteryState,
+    Brand,
     ConnectionInfo,
     DoorActivity,
     DoorStatus,
@@ -40,7 +41,6 @@ from .const import (
     LockState,
     LockStateValue,
     LockStatus,
-    LogBrand,
 )
 from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
 from .session import (
@@ -460,7 +460,7 @@ class PushLock:
         idle_disconnect_delay: float = DISCONNECT_DELAY,
         always_connected: bool = False,
         idle_disconnect_delay_pending_update: float = DISCONNECT_DELAY_PENDING_UPDATE,
-        brand: LogBrand | None = None,
+        brand: Brand | None = None,
     ) -> None:
         """Init the lock watcher."""
         if local_name is None and address is None:
@@ -614,9 +614,9 @@ class PushLock:
         return self._lock_info
 
     @property
-    def log_brand(self) -> LogBrand:
-        """The activity log's numbering, as paired; Yale's when not told."""
-        return self._brand or LogBrand.YALE
+    def brand(self) -> Brand:
+        """The brand the lock is paired with; August, the common one, when not told."""
+        return self._brand or Brand.AUGUST
 
     @property
     def connection_info(self) -> ConnectionInfo | None:

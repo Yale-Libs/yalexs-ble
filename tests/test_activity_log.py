@@ -45,6 +45,7 @@ from yalexs_ble.const import (
     RESPONSE_FRAME_LEN,
     AugustLockOperationSource,
     AugustLogType,
+    Brand,
     BulkOperationType,
     CredType,
     DoorStatus,
@@ -54,7 +55,6 @@ from yalexs_ble.const import (
     LockOperationStatus,
     LockOperationType,
     LockStatus,
-    LogBrand,
     LogType,
     MatterEventType,
     MatterRegistrationStatus,
@@ -215,11 +215,11 @@ def test_code_operation_reads_both_states_and_the_error() -> None:
 @pytest.mark.parametrize(
     ("log_type", "brand", "record_class"),
     [
-        (0x0C, LogBrand.YALE, CredentialAdded),
-        (0x0D, LogBrand.YALE, CredentialDeleted),
-        (0x0E, LogBrand.YALE, CredentialOperation),
-        (0x0C, LogBrand.AUGUST, CredentialAdded),
-        (0x0D, LogBrand.AUGUST, CredentialDeleted),
+        (0x0C, Brand.YALE, CredentialAdded),
+        (0x0D, Brand.YALE, CredentialDeleted),
+        (0x0E, Brand.YALE, CredentialOperation),
+        (0x0C, Brand.AUGUST, CredentialAdded),
+        (0x0D, Brand.AUGUST, CredentialDeleted),
     ],
     ids=[
         "CredentialAdded, Yale",
@@ -230,7 +230,7 @@ def test_code_operation_reads_both_states_and_the_error() -> None:
     ],
 )
 def test_credential_records_with_states(
-    log_type: int, brand: LogBrand, record_class: Callable[..., LogRecord]
+    log_type: int, brand: Brand, record_class: Callable[..., LogRecord]
 ) -> None:
     """Built frames: byte 12 holds the two states and the slot is two bytes."""
     frame = _built(log_type, CREDENTIAL_FIELDS)
@@ -347,10 +347,10 @@ def test_code_added_slot_and_code() -> None:
 
 @pytest.mark.parametrize(
     ("brand", "code"),
-    [(LogBrand.YALE, "000000000001E240"), (LogBrand.AUGUST, "123456")],
+    [(Brand.YALE, "000000000001E240"), (Brand.AUGUST, "123456")],
     ids=["Yale", "August"],
 )
-def test_code_added_v2_code_as_the_brand_prints_it(brand: LogBrand, code: str) -> None:
+def test_code_added_v2_code_as_the_brand_prints_it(brand: Brand, code: str) -> None:
     """Built frame: the five code bytes are one little-endian number, hex or decimal."""
     frame = _built(0x0A, {5: TIME, 9: "0102", 11: "40e2010000"})
     _assert_record(
@@ -363,7 +363,7 @@ def test_battery_info_temperature_is_signed() -> None:
     """Built frame: byte 11 is a signed number."""
     frame = _built(0x15, {5: TIME, 9: "ea14", 11: "f6", 12: "50640102"})
     _assert_record(
-        parse_log_event_packet(frame),
+        parse_log_event_packet(frame, Brand.YALE),
         BatteryInfo(
             raw=frame,
             time_stamp=TIME_STAMP,
@@ -381,7 +381,7 @@ def test_product_message_type_and_data() -> None:
     """Built frame: a two-byte message type and five data bytes."""
     frame = _built(0x17, {5: TIME, 9: "3412", 11: "0102030405"})
     _assert_record(
-        parse_log_event_packet(frame),
+        parse_log_event_packet(frame, Brand.YALE),
         ProductMessage(
             raw=frame,
             time_stamp=TIME_STAMP,
@@ -394,16 +394,16 @@ def test_product_message_type_and_data() -> None:
 @pytest.mark.parametrize(
     ("brand", "log_type"),
     [
-        (LogBrand.YALE, 0x11),
-        (LogBrand.YALE, 0x14),
-        (LogBrand.YALE, 0x19),
-        (LogBrand.AUGUST, 0x11),
-        (LogBrand.AUGUST, 0x1A),
+        (Brand.YALE, 0x11),
+        (Brand.YALE, 0x14),
+        (Brand.YALE, 0x19),
+        (Brand.AUGUST, 0x11),
+        (Brand.AUGUST, 0x1A),
     ],
     ids=["Yale 0x11", "Yale 0x14", "Yale 0x19", "August 0x11", "August 0x1A"],
 )
 def test_a_log_type_with_no_decoder_gives_a_plain_record(
-    brand: LogBrand, log_type: int
+    brand: Brand, log_type: int
 ) -> None:
     """Built frames: AccessoryEvent has a name and no decoder, the others no name."""
     frame = _built(log_type, {5: TIME, 12: "10"})
@@ -630,16 +630,16 @@ def test_a_bytearray_frame_decodes_to_a_record_holding_bytes() -> None:
 def test_each_other_record_reads_its_layout(case: tuple[bytes, LogRecord]) -> None:
     """Captured frames where a lock sent one, built frames otherwise."""
     frame, expected = case
-    _assert_record(parse_log_event_packet(frame), expected)
+    _assert_record(parse_log_event_packet(frame, Brand.YALE), expected)
 
 
-def test_with_no_brand_a_record_reads_in_yales_numbering() -> None:
-    """Captured and built frames decode alike with no brand and with LogBrand.YALE."""
+def test_with_no_brand_a_record_reads_in_augusts_numbering() -> None:
+    """Captured and built frames decode alike with no brand and with Brand.AUGUST."""
     frames = [*CAPTURED, *(_built(log_type, {5: BODY}) for log_type in range(0x100))]
     for frame in frames:
         _assert_record(
             parse_log_event_packet(frame),
-            parse_log_event_packet(frame, LogBrand.YALE),
+            parse_log_event_packet(frame, Brand.AUGUST),
         )
 
 
@@ -650,23 +650,23 @@ def test_a_log_type_with_the_same_decoder_in_both_brands_reads_alike() -> None:
     frames += [_built(log_type, {5: BODY}) for log_type in alike]
     for frame in frames:
         _assert_record(
-            parse_log_event_packet(frame, LogBrand.AUGUST),
-            parse_log_event_packet(frame, LogBrand.YALE),
+            parse_log_event_packet(frame, Brand.AUGUST),
+            parse_log_event_packet(frame, Brand.YALE),
         )
 
 
 @pytest.mark.parametrize(
     ("log_type", "brand", "record_class"),
     [
-        (0x17, LogBrand.YALE, ProductMessage),
-        (0x17, LogBrand.AUGUST, InvalidCredentialEntry),
-        (0x15, LogBrand.YALE, BatteryInfo),
-        (0x15, LogBrand.AUGUST, LogRecord),
+        (0x17, Brand.YALE, ProductMessage),
+        (0x17, Brand.AUGUST, InvalidCredentialEntry),
+        (0x15, Brand.YALE, BatteryInfo),
+        (0x15, Brand.AUGUST, LogRecord),
     ],
     ids=["0x17, Yale", "0x17, August", "0x15, Yale", "0x15, August"],
 )
 def test_a_record_the_brands_number_differently_reads_in_the_brands_numbering(
-    log_type: int, brand: LogBrand, record_class: type[LogRecord]
+    log_type: int, brand: Brand, record_class: type[LogRecord]
 ) -> None:
     """Built frames: 0x17 is one record under Yale and another under August."""
     frame = _built(log_type, {5: BODY})
@@ -753,12 +753,12 @@ def test_a_record_the_brands_number_differently_reads_in_the_brands_numbering(
 def test_each_august_record_reads_its_layout(case: tuple[bytes, LogRecord]) -> None:
     """Built frames for the seven records only August's numbering decodes."""
     frame, expected = case
-    _assert_record(parse_log_event_packet(frame, LogBrand.AUGUST), expected)
+    _assert_record(parse_log_event_packet(frame, Brand.AUGUST), expected)
 
 
 def test_a_value_only_yales_app_names_keeps_its_member_under_august() -> None:
     """Built frame: opCode 0x13 and lock state 0x11 have no name in August's app."""
-    record = parse_log_event_packet(_built(0x00, {5: "13", 6: "11"}), LogBrand.AUGUST)
+    record = parse_log_event_packet(_built(0x00, {5: "13", 6: "11"}), Brand.AUGUST)
     assert isinstance(record, LockOperation)
     assert record.op_code is OpCode.SHABBAT_MODE
     assert record.current_lock_state is LockStatus.INTERNAL_FORCED_LOCKED
@@ -783,7 +783,7 @@ def test_lock_operation_blame_op_source_is_its_member(
 ) -> None:
     """Built frames: byte 10 is the member, or UNKNOWN_xx when it has no name."""
     frame = _built(0x19, {10: f"{value:02x}"})
-    record = parse_log_event_packet(frame, LogBrand.AUGUST)
+    record = parse_log_event_packet(frame, Brand.AUGUST)
     assert isinstance(record, LockOperationBlame)
     assert record.op_source == op_source
     assert type(record.op_source) is type(op_source)
@@ -809,7 +809,7 @@ def test_lock_operation_blame_slot_fields_follow_op_source(
 ) -> None:
     """Built frames: op_source decides how bytes 12 to 14 are read."""
     frame = _built(0x19, {10: f"{op_source:02x}", 12: "341207"})
-    record = parse_log_event_packet(frame, LogBrand.AUGUST)
+    record = parse_log_event_packet(frame, Brand.AUGUST)
     assert isinstance(record, LockOperationBlame)
     assert (
         record.key_slot,
@@ -832,7 +832,7 @@ def test_lock_operation_blame_credential_types_are_a_bit_mask(
 ) -> None:
     """Built frames: bits 1 to 7 of byte 11, and None when none of them is set."""
     frame = _built(0x19, {11: cred_types})
-    record = parse_log_event_packet(frame, LogBrand.AUGUST)
+    record = parse_log_event_packet(frame, Brand.AUGUST)
     assert isinstance(record, LockOperationBlame)
     assert record.op_lock_cred_types == expected
     assert type(record.op_lock_cred_types) is type(expected)
@@ -855,7 +855,7 @@ def test_matter_event_fields_follow_event_type(
 ) -> None:
     """Built frames: event_type decides how bytes 10 to 12 are read."""
     frame = _built(0x18, {9: f"{event_type:02x}", 10: "013412"})
-    record = parse_log_event_packet(frame, LogBrand.AUGUST)
+    record = parse_log_event_packet(frame, Brand.AUGUST)
     assert isinstance(record, MatterEvent)
     assert record.event_type == event_type
     assert record.fabric_index == fabric_index
@@ -889,7 +889,7 @@ def test_bulk_operation_fields_follow_bulk_op_type(
     number_of_removed_users: int | None,
 ) -> None:
     """Built frames: body is bytes 9 to 13, starting with bulk_op_type."""
-    record = parse_log_event_packet(_built(0x1E, {9: body}), LogBrand.AUGUST)
+    record = parse_log_event_packet(_built(0x1E, {9: body}), Brand.AUGUST)
     assert isinstance(record, BulkOperation)
     assert record.bulk_op_type == int(body[:2], 16)
     assert record.fabric_index == fabric_index
@@ -914,7 +914,7 @@ def test_the_package_exports_the_decoder() -> None:
     assert {cls.__name__ for cls in records} | {
         "LogRecord",
         "parse_log_event_packet",
-        "LogBrand",
+        "Brand",
         "LogType",
         "AugustLogType",
         "LockCred",

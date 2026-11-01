@@ -295,8 +295,8 @@ class OpCode(Enum):
         return _unknown_member(cls, object.__new__(cls), value)
 
 
-class LogBrand(Enum):
-    """The brand whose numbering and names an activity log record follows."""
+class Brand(Enum):
+    """The brand a lock is paired with, which sets its activity log's numbering."""
 
     YALE = "yale"
     AUGUST = "august"
@@ -570,6 +570,6 @@ class YaleXSBLEDiscovery(TypedDict):
     serial: str
     key: str
     slot: int
-    # A LogBrand value. Only the app a lock is paired with knows its numbering;
+    # A Brand value. Only the app a lock is paired with knows its numbering;
     # the same hardware ships under both brands.
     brand: NotRequired[str]

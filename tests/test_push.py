@@ -25,13 +25,13 @@ from yalexs_ble.const import (
     AutoLockMode,
     AutoLockState,
     BatteryState,
+    Brand,
     DoorActivity,
     DoorStatus,
     LockActivity,
     LockInfo,
     LockState,
     LockStatus,
-    LogBrand,
     OperationError,
 )
 from yalexs_ble.lock import ActivityLogOverrunError, Lock
@@ -299,20 +299,21 @@ def test_door_sense(model: str, door_sense: bool) -> None:
 @pytest.mark.parametrize(
     ("paired", "brand"),
     [
-        (None, LogBrand.YALE),
-        (LogBrand.YALE, LogBrand.YALE),
-        (LogBrand.AUGUST, LogBrand.AUGUST),
+        # Most locks in the field are August's.
+        (None, Brand.AUGUST),
+        (Brand.YALE, Brand.YALE),
+        (Brand.AUGUST, Brand.AUGUST),
     ],
 )
-async def test_push_lock_log_brand_is_the_paired_brand(
-    paired: LogBrand | None, brand: LogBrand
+async def test_push_lock_brand_is_the_paired_brand(
+    paired: Brand | None, brand: Brand
 ) -> None:
     """The model says nothing: the same hardware ships under both brands."""
     push_lock = _named_push_lock(
         "aa:bb:cc:dd:ee:60", always_connected=False, brand=paired
     )
     push_lock._lock_info = _lock_info("YRD-256")
-    assert push_lock.log_brand is brand
+    assert push_lock.brand is brand
 
 
 @pytest.mark.asyncio

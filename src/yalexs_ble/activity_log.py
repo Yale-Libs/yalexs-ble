@@ -13,6 +13,7 @@ from .const import (
     VALUE_TO_LOCK_STATUS,
     AugustLockOperationSource,
     AugustLogType,
+    Brand,
     BulkOperationType,
     Commands,
     CredType,
@@ -23,7 +24,6 @@ from .const import (
     LockOperationStatus,
     LockOperationType,
     LockStatus,
-    LogBrand,
     LogType,
     MatterEventType,
     MatterRegistrationStatus,
@@ -740,19 +740,19 @@ AUGUST_LOG_RECORDS: Mapping[int, RecordDecoder] = {
     AugustLogType.BULK_OPERATION: BulkOperation.decode,
 }
 
-_LOG_RECORDS: Mapping[LogBrand, Mapping[int, RecordDecoder]] = {
-    LogBrand.YALE: YALE_LOG_RECORDS,
-    LogBrand.AUGUST: AUGUST_LOG_RECORDS,
+_LOG_RECORDS: Mapping[Brand, Mapping[int, RecordDecoder]] = {
+    Brand.YALE: YALE_LOG_RECORDS,
+    Brand.AUGUST: AUGUST_LOG_RECORDS,
 }
 
 
 def parse_log_event_packet(
-    response_packet: bytes, brand: LogBrand = LogBrand.YALE
+    response_packet: bytes, brand: Brand = Brand.AUGUST
 ) -> LogRecord:
     """Decode a GetLog reply into its record, by the log_type at byte 4.
 
-    brand selects Yale's or August's numbering. A log_type with no decoder in
-    that numbering gives a plain LogRecord.
+    brand selects August's or Yale's numbering; most locks in the field are
+    August's. A log_type with no decoder in that numbering gives a plain LogRecord.
     """
     response_packet = bytes(response_packet)
     if (
