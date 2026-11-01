@@ -21,11 +21,13 @@ import yalexs_ble
 from yalexs_ble.const import (
     ASSA_ABLOY_MFR_ID,
     YALE_MFR_ID,
+    ActivityValue,
     AuthState,
     AutoLockMode,
     AutoLockState,
     BatteryState,
     DoorActivity,
+    DoorbellActivity,
     DoorStatus,
     LockActivity,
     LockInfo,
@@ -3813,7 +3815,7 @@ async def test_push_lock_keycode_failure_logs_one_warning_without_the_pin(
 
 def _activity_push_lock(
     drains: list[list[Any]], *, primed: bool = False
-) -> tuple[PushLock, MagicMock, list[LockActivity | DoorActivity]]:
+) -> tuple[PushLock, MagicMock, list[ActivityValue]]:
     """A PushLock whose only read in _update is the activity drain.
 
     Lock, door and battery are marked seen so a cycle reads nothing else.
@@ -3822,7 +3824,7 @@ def _activity_push_lock(
     already primed and a lock status change has marked it for a drain.
     """
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:ff", always_connected=False)
-    received: list[LockActivity | DoorActivity] = []
+    received: list[ActivityValue] = []
     # Registered before the lock is up, so no priming update is armed here.
     push_lock.register_activity_callback(received.append)
     push_lock._lock_info = TEST_LOCK_INFO
@@ -3905,6 +3907,22 @@ async def test_activity_delivered_after_a_status_change() -> None:
 
 
 @pytest.mark.asyncio
+async def test_activity_delivered_after_the_advertised_flag_changes() -> None:
+    """A flag change with no status change, such as a doorbell press, drains the log."""
+    ring = DoorbellActivity(datetime(2026, 1, 1))
+    push_lock, mock_lock, received = _activity_push_lock([[ring]])
+    push_lock._activity_primed = True
+    push_lock._activity_drain_pending = False
+    ble_device = BLEDevice(push_lock.address, "Test Lock", None)
+    push_lock.update_advertisement(ble_device, _advertisement({YALE_MFR_ID: b"\x00"}))
+    assert not push_lock._activity_drain_due()
+    push_lock.update_advertisement(ble_device, _advertisement({YALE_MFR_ID: b"\x01"}))
+    push_lock._cancel_future_update()
+    await _run_update(push_lock, mock_lock)
+    assert received == [ring]
+
+
+@pytest.mark.asyncio
 async def test_activity_drain_replaces_the_keep_alive_status_poll() -> None:
     """An always-connected cycle with a drain due does not also poll the status."""
     push_lock, mock_lock, _ = _activity_push_lock([[_unlock(1)]], primed=True)
@@ -3935,7 +3953,7 @@ async def test_activity_unregister_stops_delivery_and_reads() -> None:
     push_lock._activity_callbacks.clear()
     unregister_received = push_lock.register_activity_callback(received.append)
     await _run_update(push_lock, mock_lock)
-    other: list[LockActivity | DoorActivity] = []
+    other: list[ActivityValue] = []
     unregister_other = push_lock.register_activity_callback(other.append)
     unregister_other()
     unregister_received()
@@ -4137,7 +4155,7 @@ async def test_activity_status_change_during_drain_stays_pending() -> None:
         [[first], [first]], primed=True
     )
 
-    def change_state(_activity: LockActivity | DoorActivity) -> None:
+    def change_state(_activity: ActivityValue) -> None:
         push_lock._update_any_state([LockStatus.LOCKED])
 
     push_lock._activity_callbacks.insert(0, change_state)

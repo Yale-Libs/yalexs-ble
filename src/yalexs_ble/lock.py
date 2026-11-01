@@ -27,11 +27,13 @@ from .const import (
     VALUE_TO_LOCK_OPERATION_SOURCE,
     VALUE_TO_LOCK_STATUS,
     VALUE_TO_OPERATION_ERROR,
+    ActivityValue,
     AutoLockMode,
     AutoLockState,
     BatteryState,
     Commands,
     DoorActivity,
+    DoorbellActivity,
     DoorStatus,
     LockActivity,
     LockActivityType,
@@ -998,9 +1000,7 @@ class Lock:
 
         return source_enum, remote_type_enum
 
-    def _parse_lock_activity(
-        self, response: bytes
-    ) -> DoorActivity | LockActivity | None:
+    def _parse_lock_activity(self, response: bytes) -> ActivityValue | None:
         """Parse the lock activity from the response."""
         # We only know a subset of lock activities currently
         # response[0x04] seems to be the activity type
@@ -1060,6 +1060,9 @@ class Lock:
                 source=LockOperationSource.PIN,
                 slot=slot,
             )
+        if activity_type == LockActivityType.DOORBELL.value and response[0x0C] == 0x10:
+            # Timestamp is at 0x05-0x08; 0x10 at 0x0C marks a doorbell press
+            return DoorbellActivity(self._parse_unix_timestamp(response[0x05:0x09]))
         _LOGGER.debug("%s: Unknown activity type: 0x%02X", self.name, activity_type)
         return None
 
@@ -1073,13 +1076,13 @@ class Lock:
         )
 
     @raise_if_not_connected
-    async def lock_activity(self) -> DoorActivity | LockActivity | None:
+    async def lock_activity(self) -> ActivityValue | None:
         _LOGGER.debug("%s: Executing lock_activity", self.name)
         response = await self._read_lock_activity_response()
         _LOGGER.debug("%s: Finished executing lock_activity", self.name)
         return self._parse_lock_activity(response)
 
-    async def drain_lock_activity(self) -> AsyncIterator[DoorActivity | LockActivity]:
+    async def drain_lock_activity(self) -> AsyncIterator[ActivityValue]:
         """Pop and yield records until the end marker; raise past the read cap.
 
         Each read pops the lock's oldest record, so records are yielded as

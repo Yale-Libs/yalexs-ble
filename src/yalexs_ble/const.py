@@ -192,6 +192,7 @@ class LockActivityType(Enum):
     KEYPAD_UNLOCK = 0x07
     DOOR = 0x20
     PIN = 0x0E
+    DOORBELL = 0x11
     NONE = 0x80
 
 
@@ -261,6 +262,14 @@ class LockActivity:
 class DoorActivity:
     timestamp: datetime
     status: DoorStatus
+
+
+@dataclass
+class DoorbellActivity:
+    timestamp: datetime
+
+
+ActivityValue = LockActivity | DoorActivity | DoorbellActivity
 
 
 @dataclass

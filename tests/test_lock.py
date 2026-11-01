@@ -19,11 +19,13 @@ from yalexs_ble.const import (
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
+    ActivityValue,
     AutoLockMode,
     AutoLockState,
     BatteryState,
     Commands,
     DoorActivity,
+    DoorbellActivity,
     DoorStatus,
     LockActivity,
     LockInfo,
@@ -1405,6 +1407,7 @@ KEYPAD_UNLOCK_SLOT_UNKNOWN = bytes.fromhex("bb2d00d007299c76a3330049e414eeff0200
 KEYPAD_LOCK_BUTTON = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
 END_OF_LOG = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
 UNKNOWN_ACTIVITY = _with_checksum("bb2d00005500000000000000000000000000")
+DOORBELL_PRESS = _with_checksum("bb2d000011803bb16a000000100000000000")
 
 
 @pytest.mark.parametrize(
@@ -1439,6 +1442,20 @@ def test_parse_keypad_lock_button_and_end_marker() -> None:
     assert lock._parse_lock_activity(END_OF_LOG) is None
 
 
+def test_parse_doorbell_activity() -> None:
+    """A type 0x11 record with 0x10 at byte 12 is a doorbell press."""
+    activity = _make_lock()._parse_lock_activity(DOORBELL_PRESS)
+    assert isinstance(activity, DoorbellActivity)
+    assert int(activity.timestamp.timestamp()) == 1790000000
+
+
+def test_parse_type_0x11_without_the_doorbell_marker_is_unknown() -> None:
+    """A type 0x11 record without the doorbell marker is not reported."""
+    frame = bytearray(DOORBELL_PRESS)
+    frame[0x0C] = 0x00
+    assert _make_lock()._parse_lock_activity(bytes(frame)) is None
+
+
 def _activity_lock(frames: list[bytes | Exception]) -> tuple[Lock, AsyncMock]:
     """A connected Lock whose activity reads answer with frames in order."""
     lock, session = _connected_lock()
@@ -1455,7 +1472,7 @@ def _activity_lock(frames: list[bytes | Exception]) -> tuple[Lock, AsyncMock]:
     return lock, write
 
 
-async def _drain(lock: Lock) -> list[DoorActivity | LockActivity]:
+async def _drain(lock: Lock) -> list[ActivityValue]:
     return [activity async for activity in lock.drain_lock_activity()]
 
 
@@ -1466,7 +1483,9 @@ async def test_drain_lock_activity_stops_at_the_end_marker() -> None:
         [KEYPAD_UNLOCK_SLOT_205, KEYPAD_LOCK_BUTTON, END_OF_LOG, KEYPAD_UNLOCK_SLOT_200]
     )
     activities = await _drain(lock)
-    assert [(a.status, getattr(a, "slot", None)) for a in activities] == [
+    assert [
+        (getattr(a, "status", None), getattr(a, "slot", None)) for a in activities
+    ] == [
         (LockStatus.UNLOCKED, 205),
         (LockStatus.LOCKED, None),
     ]
@@ -1493,7 +1512,7 @@ async def test_drain_lock_activity_skips_unknown_types(
 async def test_drain_lock_activity_yields_each_record_as_it_is_read() -> None:
     """Records read before a failure have already been yielded."""
     lock, _ = _activity_lock([KEYPAD_UNLOCK_SLOT_205, BleakError("gone")])
-    seen: list[DoorActivity | LockActivity] = []
+    seen: list[ActivityValue] = []
     with pytest.raises(BleakError):
         async for activity in lock.drain_lock_activity():
             seen.append(activity)
@@ -1504,7 +1523,7 @@ async def test_drain_lock_activity_yields_each_record_as_it_is_read() -> None:
 async def test_drain_lock_activity_raises_past_the_cap() -> None:
     """Without an end marker the drain raises after max_records reads."""
     lock, write = _activity_lock([KEYPAD_UNLOCK_SLOT_205] * (MAX_ACTIVITY_RECORDS + 5))
-    seen: list[DoorActivity | LockActivity] = []
+    seen: list[ActivityValue] = []
     with pytest.raises(ResponseError, match=f"within {MAX_ACTIVITY_RECORDS} reads"):
         async for activity in lock.drain_lock_activity():
             seen.append(activity)
