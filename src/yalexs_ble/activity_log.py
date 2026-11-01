@@ -31,15 +31,11 @@ from .const import (
     OutOfScheduleType,
     TamperType,
 )
-from .util import _bytes_to_int, _named
+from .util import _bytes_to_int
 
 # August's app emits no fabricIndex for a BulkOperation whose fabric byte
 # is 0xFF.
 _NO_FABRIC_INDEX = 0xFF
-
-# LockOperationCredType is an IntFlag, which answers an unnamed value with a
-# pseudo-member and no ValueError, so _named cannot serve it.
-_LOCK_OPERATION_CRED_TYPES = {member.value: member for member in LockOperationCredType}
 
 
 def _u16(raw: bytes, offset: int) -> int:
@@ -81,7 +77,7 @@ class LogRecord:
 class LockOperation(LogRecord):
     """A LockOperation record (log_type 0x00)."""
 
-    op_code: OpCode | int
+    op_code: OpCode
     current_lock_state: LockStatus
     key_slot: int
     time_stamp: int
@@ -95,7 +91,7 @@ class LockOperation(LogRecord):
         return cls(
             raw,
             raw[4],
-            op_code=_named(OpCode, raw[5]),
+            op_code=OpCode(raw[5]),
             current_lock_state=_lock_state(raw[6]),
             key_slot=raw[7],
             time_stamp=_u32(raw, 8),
@@ -277,7 +273,7 @@ class _Credential(LogRecord):
     """The layout of the three credential records, log_type 0x0C to 0x0E."""
 
     time_stamp: int
-    credential_type: LockCred | int
+    credential_type: LockCred
     slot: int
     credential_error: int | None
     current_lock_state: LockStatus | None
@@ -293,7 +289,7 @@ class _Credential(LogRecord):
             raw,
             raw[4],
             time_stamp=_u32(raw, 5),
-            credential_type=_named(LockCred, raw[9]),
+            credential_type=LockCred(raw[9]),
             slot=_u16(raw, 10),
             credential_error=raw[12] if is_error else None,
             current_lock_state=None if is_error else _lock_state(raw[12] & 0x0F),
@@ -329,7 +325,7 @@ class Tamper(LogRecord):
     """A Tamper record (log_type 0x0F)."""
 
     time_stamp: int
-    tamper_type: TamperType | int
+    tamper_type: TamperType
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
@@ -337,7 +333,7 @@ class Tamper(LogRecord):
             raw,
             raw[4],
             time_stamp=_u32(raw, 5),
-            tamper_type=_named(TamperType, _u16(raw, 9)),
+            tamper_type=TamperType(_u16(raw, 9)),
         )
 
 
@@ -540,7 +536,7 @@ class LockOperatingMode(LogRecord):
     """A LockOperatingMode record (log_type 0x14 in August's numbering)."""
 
     time_stamp: int
-    lock_op_mode: OperatingMode | int
+    lock_op_mode: OperatingMode
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
@@ -548,7 +544,7 @@ class LockOperatingMode(LogRecord):
             raw,
             raw[4],
             time_stamp=_u32(raw, 5),
-            lock_op_mode=_named(OperatingMode, raw[9]),
+            lock_op_mode=OperatingMode(raw[9]),
         )
 
 
@@ -558,7 +554,7 @@ class LockDeadboltJam(LogRecord):
 
     time_stamp: int
     battery_level: int
-    jam_state: JamState | int
+    jam_state: JamState
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
@@ -567,7 +563,7 @@ class LockDeadboltJam(LogRecord):
             raw[4],
             time_stamp=_u32(raw, 5),
             battery_level=_u16(raw, 9),
-            jam_state=_named(JamState, raw[11]),
+            jam_state=JamState(raw[11]),
         )
 
 
@@ -576,7 +572,7 @@ class InvalidCredentialEntry(LogRecord):
     """An InvalidCredentialEntry record (log_type 0x17 in August's numbering)."""
 
     time_stamp: int
-    cred_type: CredType | int
+    cred_type: CredType
     battery_level: int
 
     @classmethod
@@ -585,7 +581,7 @@ class InvalidCredentialEntry(LogRecord):
             raw,
             raw[4],
             time_stamp=_u32(raw, 5),
-            cred_type=_named(CredType, _u16(raw, 9)),
+            cred_type=CredType(_u16(raw, 9)),
             battery_level=_u16(raw, 11),
         )
 
@@ -595,12 +591,12 @@ class MatterEvent(LogRecord):
     """A MatterEvent record (log_type 0x18 in August's numbering)."""
 
     time_stamp: int
-    event_type: MatterEventType | int
+    event_type: MatterEventType
     fabric_index: int | None
     fabric_vendor_id: int | None
     # registration_status is None unless event_type is MatterEventType.REGISTRATION.
     # MatterRegistrationStatus.OK is 0, so a truth test cannot tell it from None.
-    registration_status: MatterRegistrationStatus | int | None
+    registration_status: MatterRegistrationStatus | None
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
@@ -614,11 +610,11 @@ class MatterEvent(LogRecord):
             raw,
             raw[4],
             time_stamp=_u32(raw, 5),
-            event_type=_named(MatterEventType, event_type),
+            event_type=MatterEventType(event_type),
             fabric_index=raw[10] if has_fabric else None,
             fabric_vendor_id=_u16(raw, 11) if has_fabric else None,
             registration_status=(
-                _named(MatterRegistrationStatus, raw[10]) if is_registration else None
+                MatterRegistrationStatus(raw[10]) if is_registration else None
             ),
         )
 
@@ -628,18 +624,18 @@ class LockOperationBlame(LogRecord):
     """A LockOperationBlame record (log_type 0x19 in August's numbering)."""
 
     time_stamp: int
-    op_type: LockOperationType | int
-    op_source: AugustLockOperationSource | int
+    op_type: LockOperationType
+    op_source: AugustLockOperationSource
     op_lock_cred_types: LockOperationCredType | None
     key_slot: int | None
     node_id: int | None
     user_slot: int | None
     fabric_index: int | None
-    op_status: LockOperationStatus | int
+    op_status: LockOperationStatus
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
-        op_source = _named(AugustLockOperationSource, raw[10])
+        op_source = AugustLockOperationSource(raw[10])
         key_slot: int | None = None
         node_id: int | None = None
         user_slot: int | None = None
@@ -655,7 +651,7 @@ class LockOperationBlame(LogRecord):
             raw,
             raw[4],
             time_stamp=_u32(raw, 5),
-            op_type=_named(LockOperationType, raw[9]),
+            op_type=LockOperationType(raw[9]),
             op_source=op_source,
             # Bit 0 of byte 11 names no credential type.
             op_lock_cred_types=LockOperationCredType(raw[11] & 0xFE) or None,
@@ -663,7 +659,7 @@ class LockOperationBlame(LogRecord):
             node_id=node_id,
             user_slot=user_slot,
             fabric_index=fabric_index,
-            op_status=_named(LockOperationStatus, raw[15]),
+            op_status=LockOperationStatus(raw[15]),
         )
 
 
@@ -672,9 +668,9 @@ class OutOfScheduleCredential(LogRecord):
     """An OutOfScheduleCredential record (log_type 0x1D in August's numbering)."""
 
     time_stamp: int
-    cred_type: CredType | int
+    cred_type: CredType
     battery_level: int
-    violation_type: OutOfScheduleType | int
+    violation_type: OutOfScheduleType
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
@@ -682,9 +678,9 @@ class OutOfScheduleCredential(LogRecord):
             raw,
             raw[4],
             time_stamp=_u32(raw, 5),
-            cred_type=_named(CredType, _u16(raw, 9)),
+            cred_type=CredType(_u16(raw, 9)),
             battery_level=_u16(raw, 11),
-            violation_type=_named(OutOfScheduleType, raw[13]),
+            violation_type=OutOfScheduleType(raw[13]),
         )
 
 
@@ -693,22 +689,22 @@ class BulkOperation(LogRecord):
     """A BulkOperation record (log_type 0x1E in August's numbering)."""
 
     time_stamp: int
-    bulk_op_type: BulkOperationType | int
+    bulk_op_type: BulkOperationType
     fabric_index: int | None
-    lock_cred_type: LockOperationCredType | int | None
+    lock_cred_type: LockOperationCredType | None
     number_of_removed_users: int | None
 
     @classmethod
     def decode(cls, raw: bytes) -> Self:
         bulk_op_type = raw[9]
         fabric_index: int | None = None
-        lock_cred_type: LockOperationCredType | int | None = None
+        lock_cred_type: LockOperationCredType | None = None
         number_of_removed_users: int | None = None
         if bulk_op_type == BulkOperationType.USERS_CLEAR:
             fabric_index = raw[10]
             number_of_removed_users = _u16(raw, 11)
         elif bulk_op_type == BulkOperationType.CREDS_CLEAR:
-            lock_cred_type = _LOCK_OPERATION_CRED_TYPES.get(raw[10], raw[10])
+            lock_cred_type = LockOperationCredType(raw[10])
             fabric_index = raw[11]
             number_of_removed_users = _u16(raw, 12)
         if fabric_index == _NO_FABRIC_INDEX:
@@ -717,7 +713,7 @@ class BulkOperation(LogRecord):
             raw,
             raw[4],
             time_stamp=_u32(raw, 5),
-            bulk_op_type=_named(BulkOperationType, bulk_op_type),
+            bulk_op_type=BulkOperationType(bulk_op_type),
             fabric_index=fabric_index,
             lock_cred_type=lock_cred_type,
             number_of_removed_users=number_of_removed_users,
