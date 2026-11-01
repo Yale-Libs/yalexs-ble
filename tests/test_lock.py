@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import yalexs_ble
 from yalexs_ble import util
 from yalexs_ble.const import (
+    DEVICE_NAME_CHARACTERISTIC,
     FIRMWARE_REVISION_CHARACTERISTIC,
     KEYPAD_MASTER_CODE_SLOT,
     MECHANICAL_OPERATION_ERRORS,
@@ -21,6 +22,7 @@ from yalexs_ble.const import (
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
     AutoLockState,
+    BatterySource,
     BatteryState,
     Commands,
     DoorActivity,
@@ -709,13 +711,15 @@ _CHAR_DATA: dict[str, bytes] = {
     MODEL_NUMBER_CHARACTERISTIC: b"ASL-03",
     SERIAL_NUMBER_CHARACTERISTIC: b"12345",
     FIRMWARE_REVISION_CHARACTERISTIC: b"2.0.0",
+    DEVICE_NAME_CHARACTERISTIC: b"",
 }
 
-# Model is read first, then serial, firmware.
+# Model is read first, then serial, firmware and device name.
 _CHAR_ORDER: tuple[str, ...] = (
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
     FIRMWARE_REVISION_CHARACTERISTIC,
+    DEVICE_NAME_CHARACTERISTIC,
 )
 
 
@@ -775,6 +779,75 @@ async def test_lock_info_success() -> None:
         serial="12345",
         firmware="2.0.0",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "expected", "activity_battery"),
+    [
+        (b"Yale Durus", "Yale Durus", True),
+        (b"Yale Durus\x00ignored", "Yale Durus", True),
+        (b"Yale Linus", "Yale Linus", False),
+        (b"", None, False),
+    ],
+)
+async def test_lock_info_device_name_preserves_module_model(
+    value: bytes, expected: str | None, activity_battery: bool
+) -> None:
+    lock, _ = _make_lock_with_mock_client(
+        data_overrides={
+            MODEL_NUMBER_CHARACTERISTIC: b"MD-04I",
+            DEVICE_NAME_CHARACTERISTIC: value,
+        }
+    )
+    info = await lock.lock_info()
+    assert info.device_name == expected
+    assert info.model == "MD-04I"
+    assert info.battery_from_activity is activity_battery
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        BleakError("Device name unreadable"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"),
+    ],
+)
+async def test_lock_info_unreadable_device_name_keeps_other_metadata(
+    error: Exception,
+) -> None:
+    lock, _ = _make_lock_with_mock_client(
+        side_effects={DEVICE_NAME_CHARACTERISTIC: error}
+    )
+    assert await lock.lock_info() == LockInfo("Yale/August", "ASL-03", "12345", "2.0.0")
+
+
+@pytest.mark.asyncio
+async def test_lock_info_missing_device_name() -> None:
+    lock, client = _make_lock_with_mock_client()
+    get_characteristic = client.services.get_characteristic
+    client.services.get_characteristic = lambda uuid: (
+        None if uuid == DEVICE_NAME_CHARACTERISTIC else get_characteristic(uuid)
+    )
+    assert await lock.lock_info() == LockInfo("Yale/August", "ASL-03", "12345", "2.0.0")
+
+
+@pytest.mark.asyncio
+async def test_lock_info_device_name_timeout_preserves_module_metadata() -> None:
+    lock, client = _make_lock_with_mock_client()
+    read_characteristic = client.read_gatt_char
+    mock_to_uuid = client._mock_to_uuid
+
+    async def read(char: MagicMock) -> bytes:
+        if mock_to_uuid[id(char)] == DEVICE_NAME_CHARACTERISTIC:
+            await asyncio.sleep(999)
+        return await read_characteristic(char)
+
+    client.read_gatt_char = read
+    with patch("yalexs_ble.lock.LOCK_INFO_TIMEOUT", 0.01):
+        info = await lock.lock_info()
+    assert info == LockInfo("Yale/August", "ASL-03", "12345", "2.0.0")
 
 
 @pytest.mark.asyncio
@@ -895,7 +968,7 @@ async def test_lock_info_model_read_error_is_retried() -> None:
     mock_client.read_gatt_char = fail_first_call
     info = await lock.lock_info()
     assert info.model == "ASL-03"
-    assert calls == 4
+    assert calls == 5
 
 
 @pytest.mark.asyncio
@@ -1518,6 +1591,69 @@ async def test_drain_lock_activity_requires_a_connection() -> None:
     lock = _make_lock()
     with pytest.raises(DisconnectedError):
         await _drain(lock)
+
+
+@pytest.mark.parametrize("millivolts", [4000, 5343, 6000, 8000])
+def test_durus_activity_battery_is_published_as_state(millivolts: int) -> None:
+    received: list[object] = []
+    lock = _make_lock(received.append)
+    lock._lock_info = LockInfo("Yale", "MD-04I", "x", "1.0", device_name="Yale Durus")
+    frame = bytearray(KEYPAD_LOCK_BUTTON)
+    frame[0x0C:0x0E] = millivolts.to_bytes(2, "little")
+
+    lock._internal_state_callback(bytes(frame))
+
+    assert received == [
+        [
+            BatteryState(
+                millivolts / 1000,
+                convert_voltage_to_percentage(millivolts / 4000),
+                BatterySource.LOG,
+            )
+        ]
+    ]
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        b"\xbb\x2d",
+        KEYPAD_LOCK_BUTTON[:13],
+        KEYPAD_LOCK_BUTTON + b"\x00",
+        END_OF_LOG,
+        UNKNOWN_ACTIVITY,
+        DOOR_ACTIVITY_FRAME,
+        KEYPAD_UNLOCK_SLOT_205,
+        _with_checksum("aa2d00000000000000000000df1400000200"),
+        _with_checksum("bb2d00000000000000000000000000000200"),
+        _with_checksum("bb2d000000000000000000009f0f00000200"),
+        _with_checksum("bb2d00000000000000000000411f00000200"),
+        _with_checksum("bb2d00000000000000000000ffff00000200"),
+    ],
+)
+def test_durus_activity_rejects_frames_without_battery(frame: bytes) -> None:
+    lock = _make_lock()
+    lock._lock_info = LockInfo("Yale", "MD-04I", "x", "1.0", device_name="Yale Durus")
+    assert lock._parse_state(frame) == ()
+
+
+@pytest.mark.parametrize(
+    "info",
+    [
+        None,
+        LockInfo("Yale", "MD-04I", "x", "1.0"),
+        LockInfo("Yale", "MD-04I", "x", "1.0", device_name="Yale Linus L2"),
+        LockInfo("Yale", "MD-04I", "x", "1.0", device_name="Yale Durus Plus"),
+        LockInfo("Yale", "SL-103", "x", "1.0"),
+        LockInfo("Yale", "CERES", "x", "1.0"),
+    ],
+)
+def test_activity_battery_requires_an_allowlisted_device_name(
+    info: LockInfo | None,
+) -> None:
+    lock = _make_lock()
+    lock._lock_info = info
+    assert lock._parse_state(KEYPAD_LOCK_BUTTON) == ()
 
 
 def test_ack_matcher_matches_only_the_written_operation() -> None:
