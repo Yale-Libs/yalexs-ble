@@ -122,6 +122,7 @@ class Session:
         name: str,
         lock: asyncio.Lock,
         disconnected_futures: set[asyncio.Future[None]],
+        failed_write_disconnects: set[asyncio.Task[None]],
         state_callback: Callable[[bytes], None] | None = None,
     ) -> None:
         """Init the session."""
@@ -151,6 +152,7 @@ class Session:
         self._result_callback: Callable[[bytes], None] | None = None
         self._state_callback = state_callback
         self._disconnected_futures = disconnected_futures
+        self._failed_write_disconnects = failed_write_disconnects
         self._first_request = True
         self._last_callback_time = -86400.0
         self._enable_cooldown = False
@@ -401,9 +403,9 @@ class Session:
             # The lock may not have received this frame, and on the plain session
             # the next frame would then decrypt at the lock to other bytes.
             if self.client.is_connected:
-                self._disconnect_task = self.loop.create_task(
-                    self._disconnect_after_failed_write()
-                )
+                task = self.loop.create_task(self._disconnect_after_failed_write())
+                self._disconnect_task = task
+                self._failed_write_disconnects.add(task)
             raise
 
     async def _disconnect_after_failed_write(self) -> None:

@@ -27,9 +27,12 @@ class SecureSession(Session):
         name: str,
         lock: asyncio.Lock,
         disconnected_futures: set[asyncio.Future[None]],
+        failed_write_disconnects: set[asyncio.Task[None]],
         key_index: int,
     ) -> None:
-        super().__init__(client, name, lock, disconnected_futures)
+        super().__init__(
+            client, name, lock, disconnected_futures, failed_write_disconnects
+        )
         self.key_index = key_index
         self.write_characteristic = client.services.get_characteristic(
             self._write_characteristic

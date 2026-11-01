@@ -1004,7 +1004,12 @@ def _connected_lock(
     lock = _make_lock(state_callback)
     client = MagicMock(is_connected=True, disconnect=AsyncMock())
     session = Session(
-        client, "mylock", asyncio.Lock(), set(), lock._internal_state_callback
+        client,
+        "mylock",
+        asyncio.Lock(),
+        set(),
+        lock._failed_write_disconnects,
+        lock._internal_state_callback,
     )
     session.decrypt = bytes  # type: ignore[method-assign, assignment]
     session.cipher_encrypt = MagicMock(update=bytes)
@@ -1566,7 +1571,12 @@ def _make_connected_lock_with_session(
     lock.client = client
     lock.secure_session = MagicMock()
     session = Session(
-        client, "mylock", asyncio.Lock(), set(), lock._internal_state_callback
+        client,
+        "mylock",
+        asyncio.Lock(),
+        set(),
+        lock._failed_write_disconnects,
+        lock._internal_state_callback,
     )
     session.cipher_encrypt = Cipher(
         algorithms.AES(bytes(16)),

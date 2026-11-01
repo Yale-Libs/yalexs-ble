@@ -277,6 +277,9 @@ class Lock:
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
+        # Both sessions add their failed-write disconnects to this set, so
+        # disconnect() still waits for one after the sessions are dropped.
+        self._failed_write_disconnects: set[asyncio.Task[None]] = set()
 
     def set_name(self, name: str) -> None:
         self.name = name
@@ -317,6 +320,7 @@ class Lock:
             self.name,
             self._lock,
             self._disconnected_futures,
+            self._failed_write_disconnects,
             self._internal_state_callback,
         )
         self.secure_session = SecureSession(
@@ -324,6 +328,7 @@ class Lock:
             self.name,
             self._lock,
             self._disconnected_futures,
+            self._failed_write_disconnects,
             self.key_index,
         )
         session = self.session
@@ -951,9 +956,16 @@ class Lock:
         )
 
     async def disconnect(self) -> None:
-        """Disconnect from the lock."""
+        """Disconnect from the lock; wait for any disconnect a failed write started."""
         _LOGGER.debug("%s: Disconnecting from the lock", self.name)
-        if not self.client or not self.client.is_connected:
+        # While a failed write's disconnect runs, the answer to a second request can
+        # end the next client's link to the address.
+        if (
+            not self.client
+            or not self.client.is_connected
+            or self._disconnects_after_failed_write()
+        ):
+            await self._wait_for_disconnect_after_failed_write()
             return
 
         try:
@@ -963,17 +975,34 @@ class Lock:
                 "%s: Failed to shutdown connection to lock", self.name, exc_info=True
             )
         finally:
-            try:
-                await self.client.disconnect()
-            except BleakError:
-                _LOGGER.debug(
-                    "%s: Failed to disconnect from lock", self.name, exc_info=True
-                )
+            # A write that fails with the link up during the shutdown starts a
+            # disconnect after the check above, and the wait below then sends a
+            # request only if that disconnect leaves the link up.
+            if not self._disconnects_after_failed_write():
+                await self._request_disconnect()
+        await self._wait_for_disconnect_after_failed_write()
+
+    async def _request_disconnect(self) -> None:
+        """Send a disconnect request, logging a BleakError it raises."""
+        assert self.client is not None  # nosec
+        try:
+            await self.client.disconnect()
+        except BleakError:
+            _LOGGER.debug(
+                "%s: Failed to disconnect from lock", self.name, exc_info=True
+            )
+
+    def _disconnects_after_failed_write(self) -> set[asyncio.Task[None]]:
+        """Return the failed-write disconnects of either session still running."""
+        return {task for task in self._failed_write_disconnects if not task.done()}
 
     async def _wait_for_disconnect_after_failed_write(self) -> None:
-        """Wait for the session's disconnect after a failed write, if one started."""
-        if self.session is not None and (task := self.session._disconnect_task):
-            await asyncio.wait((task,))
+        """Wait for running failed-write disconnects, then disconnect a link left up."""
+        if pending := self._disconnects_after_failed_write():
+            await asyncio.wait(pending)
+            # A disconnect that raised can leave the link up.
+            if self.client and self.client.is_connected:
+                await self._request_disconnect()
 
     async def _shutdown_connection(self) -> None:
         """Shutdown the connection."""

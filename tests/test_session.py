@@ -50,7 +50,7 @@ def _make_session(received: list[bytes], key: bytes | None = None) -> Session:
     Pass-through crypto by default; with ``key``, the real CBC contexts.
     """
     client = MagicMock(is_connected=True, disconnect=AsyncMock())
-    session = Session(client, "testlock", asyncio.Lock(), set(), received.append)
+    session = Session(client, "testlock", asyncio.Lock(), set(), set(), received.append)
     if key is None:
         session.decrypt = bytes  # type: ignore[method-assign, assignment]
         session.cipher_encrypt = MagicMock(update=bytes)
@@ -487,7 +487,7 @@ def _lock_decryptor(key: bytes, mode: modes.Mode) -> Callable[[bytes], bytes]:
 def _make_secure_session() -> SecureSession:
     """Create a SecureSession keyed with SESSION_KEY on a mock client."""
     session = SecureSession(
-        MagicMock(is_connected=True), "testlock", asyncio.Lock(), set(), 1
+        MagicMock(is_connected=True), "testlock", asyncio.Lock(), set(), set(), 1
     )
     session.set_key(SESSION_KEY)
     return session
@@ -659,7 +659,7 @@ def _make_operation_session(
     client.is_connected = True
     client.write_gatt_char = AsyncMock()
     client.disconnect = AsyncMock()
-    session = Session(client, "mylock", asyncio.Lock(), set(), state_callback)
+    session = Session(client, "mylock", asyncio.Lock(), set(), set(), state_callback)
     session.cipher_encrypt = Cipher(
         algorithms.AES(bytes(16)),
         modes.CBC(bytes(16)),

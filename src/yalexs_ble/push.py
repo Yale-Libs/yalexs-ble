@@ -2277,21 +2277,15 @@ class PushLock:
             # still ends its attempts; the stopped exit resets it instead.
             self._reset_jam_state()
         address = self.address.upper()
-        teardown = self.background_task(self._async_teardown(self._client))
+        teardown = self.background_task(self._async_teardown())
         _PENDING_TEARDOWNS[address] = teardown
         teardown.add_done_callback(functools.partial(_forget_teardown, address))
 
-    async def _async_teardown(self, client: Lock | None) -> None:
-        """Disconnect, then wait for the drain and the disconnect after a failed write.
-
-        client is the Lock in _client at the stop, because the forced disconnect
-        clears _client. The second wait covers only its plain session.
-        """
+    async def _async_teardown(self) -> None:
+        """Run the forced disconnect, then wait for the canceled drain task to end."""
         await self._execute_forced_disconnect("stopping")
         if (drain := self._activity_drain_task) is not None:
             await asyncio.wait((drain,))
-        if client is not None:
-            await client._wait_for_disconnect_after_failed_write()
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         """Run fut as a logged background task and return the task."""

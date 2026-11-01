@@ -22,6 +22,9 @@ import yalexs_ble
 from yalexs_ble.activity_log import LogRecord, parse_log_event_packet
 from yalexs_ble.const import (
     ASSA_ABLOY_MFR_ID,
+    READ_CHARACTERISTIC,
+    SECURE_WRITE_CHARACTERISTIC,
+    WRITE_CHARACTERISTIC,
     YALE_MFR_ID,
     AuthState,
     AutoLockMode,
@@ -4057,7 +4060,6 @@ def _mock_link(
     mock_lock.get_log = AsyncMock(side_effect=replies)
     mock_lock.unread_event_count = AsyncMock(return_value=count or 0)
     mock_lock.disconnect = AsyncMock()
-    mock_lock._wait_for_disconnect_after_failed_write = AsyncMock()
     if count is None:
         push_lock._backlog_remaining = 0
     push_lock._client = mock_lock
@@ -7576,7 +7578,12 @@ def _lock_on_a_real_session(push_lock: PushLock) -> tuple[Lock, Session, MagicMo
     lock = push_lock._get_lock_instance()
     client = MagicMock(is_connected=True, disconnect=AsyncMock())
     session = Session(
-        client, push_lock.name, asyncio.Lock(), set(), lock._internal_state_callback
+        client,
+        push_lock.name,
+        asyncio.Lock(),
+        set(),
+        lock._failed_write_disconnects,
+        lock._internal_state_callback,
     )
     session.cipher_encrypt = Cipher(
         algorithms.AES(bytes(16)),
@@ -10391,3 +10398,364 @@ async def test_validate_disconnects_its_client_before_it_returns(
     link.disconnect.assert_awaited_once()
     assert push_lock._disconnect_timer is None
     _AUTH_FAILURE_HISTORY.auth_success(address)
+
+
+class _EspProxy:
+    """A fake ESPHome Bluetooth proxy for one address."""
+
+    def __init__(self) -> None:
+        self.log: list[str] = []
+        self.clients: list[_EspClient] = []
+        self.next_secure_write_error: BleakError | None = None
+        self._waiting: list[asyncio.Future[None]] = []
+
+    async def establish(
+        self, _cls: Any, _device: Any, _name: str, disconnected: Any, **_: Any
+    ) -> "_EspClient":
+        """Return a new connected client, in place of establish_connection."""
+        self.log.append("connect")
+        client = _EspClient(self, disconnected)
+        if (error := self.next_secure_write_error) is not None:
+            self.next_secure_write_error = None
+            client.next_write_error[SECURE_WRITE_CHARACTERISTIC] = error
+        return client
+
+    def request_disconnect(self) -> asyncio.Future[None]:
+        self.log.append("disconnect request")
+        loop = asyncio.get_running_loop()
+        waiter = loop.create_future()
+        self._waiting.append(waiter)
+        loop.call_later(0.005, self.send_connected_false, "connected=False")
+        return waiter
+
+    def send_connected_false(self, entry: str) -> None:
+        self.log.append(entry)
+        for waiter in self._waiting:
+            if not waiter.done():
+                waiter.set_result(None)
+        self._waiting.clear()
+        for client in list(self.clients):
+            client.link_down()
+
+
+class _EspClient:
+    """A client of _EspProxy, whose is_connected turns False at the proxy's answer."""
+
+    def __init__(self, proxy: _EspProxy, disconnected: Any) -> None:
+        self.proxy = proxy
+        self.is_connected = True
+        self.down = asyncio.Event()
+        self.next_write_error: dict[str, BleakError] = {}
+        self.hold_after_answer: asyncio.Event | None = None
+        self._disconnected = disconnected
+        self._notify: dict[str, Callable[[int, bytearray], None]] = {}
+        self._writes: set[asyncio.Future[None]] = set()
+        self.services = MagicMock()
+        self.services.get_characteristic = lambda uuid: SimpleNamespace(uuid=uuid)
+        proxy.clients.append(self)
+
+    async def start_notify(self, char: Any, callback: Any) -> None:
+        self._notify[char.uuid] = callback
+
+    async def stop_notify(self, _char: Any) -> None:
+        return None
+
+    async def set_connection_params(self, *_: Any) -> None:
+        return None
+
+    async def clear_cache(self) -> bool:
+        return True
+
+    async def write_gatt_char(self, char: Any, data: bytes, _response: bool) -> None:
+        if not self.is_connected:
+            raise BleakError("not connected")
+        if (error := self.next_write_error.pop(char.uuid, None)) is not None:
+            await asyncio.sleep(0)
+            raise error
+        if char.uuid == SECURE_WRITE_CHARACTERISTIC:
+            # Every secure write is answered as the shutdown command is, by the
+            # lock ending the link.
+            asyncio.get_running_loop().call_soon(
+                self.proxy.send_connected_false, "the lock ends the link"
+            )
+            ended = asyncio.get_running_loop().create_future()
+            self._writes.add(ended)
+            await ended
+        reply = bytearray(data)
+        reply[0x00] = 0xBB
+        reply[0x03] = 0
+        reply[0x03] = _simple_checksum(reply)
+        asyncio.get_running_loop().call_soon(
+            self._notify[READ_CHARACTERISTIC], 0, reply
+        )
+
+    async def disconnect(self) -> None:
+        answered = self.proxy.request_disconnect()
+        try:
+            await answered
+        finally:
+            self.link_down()
+        if self.hold_after_answer is not None:
+            await self.hold_after_answer.wait()
+
+    def link_down(self) -> None:
+        if not self.is_connected:
+            return
+        self.is_connected = False
+        self.down.set()
+        self.proxy.clients.remove(self)
+        for ended in self._writes:
+            if not ended.done():
+                ended.set_exception(BleakError("changed connection status"))
+        self._disconnected(self)
+
+
+@contextmanager
+def _esp_backend(proxy: _EspProxy, *, handshake: bool = False) -> Iterator[None]:
+    """Connect every Lock through proxy, with identity ciphers unless handshake."""
+
+    async def setup_session(lock: Lock) -> None:
+        for session in (lock.session, lock.secure_session):
+            assert session is not None
+            session.cipher_encrypt = MagicMock(update=bytes)
+            session.cipher_decrypt = MagicMock(update=bytes)
+        lock.is_secure = True
+
+    with (
+        patch("yalexs_ble.lock.establish_connection", proxy.establish),
+        patch.object(Lock, "_setup_session", setup_session)
+        if not handshake
+        else nullcontext(),
+    ):
+        yield
+
+
+# The session raises the first as it is and, after its first request, the second
+# as DisconnectedError.
+_GATT_ERROR = BleakError("Bluetooth GATT Error handle=18 error=2 description=Error")
+_GATT_ERROR_133 = BleakError(
+    "Bluetooth GATT Error handle=18 error=133 description=Error"
+)
+
+
+async def _running_on_the_proxy(proxy: _EspProxy, address: str) -> PushLock:
+    """A running, always-connected lock whose first update connected through proxy."""
+    push_lock = _backoff_lock(address)
+    push_lock._lock_info = TEST_LOCK_INFO
+    push_lock.set_ble_device(BLEDevice(address, "Test Lock", None))
+    await push_lock._update()
+    return push_lock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error", [_GATT_ERROR, _GATT_ERROR_133], ids=["no-backoff", "backoff"]
+)
+async def test_a_failed_write_sends_one_disconnect_before_the_retry_connects(
+    error: BleakError,
+) -> None:
+    """A write that fails with the link up ends it with one disconnect request."""
+    proxy = _EspProxy()
+    with _esp_backend(proxy):
+        push_lock = await _running_on_the_proxy(proxy, "AA:BB:CC:DD:EE:E2")
+        proxy.clients[0].next_write_error[WRITE_CHARACTERISTIC] = error
+        await push_lock._update()
+
+    assert proxy.log == ["connect", "disconnect request", "connected=False", "connect"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_shutdown_write_sends_one_disconnect_before_the_next_start() -> (
+    None
+):
+    """A stop whose shutdown write fails with the link up sends one disconnect."""
+    address = "AA:BB:CC:DD:EE:E3"
+    proxy = _EspProxy()
+    with _esp_backend(proxy):
+        stopped = await _running_on_the_proxy(proxy, address)
+        proxy.clients[0].next_write_error[SECURE_WRITE_CHARACTERISTIC] = _GATT_ERROR_133
+        stopped._cancel()
+        await asyncio.wait_for(
+            _start(_named_push_lock(address, always_connected=False)), 1
+        )
+        proxy.log.append("started")
+
+    assert proxy.log == ["connect", "disconnect request", "connected=False", "started"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failed_write", "log"),
+    [
+        (
+            True,
+            [
+                "connect",
+                "disconnect request",
+                "connected=False",
+                "released",
+                "returned",
+            ],
+        ),
+        (False, ["connect", "the lock ends the link", "returned", "released"]),
+    ],
+    ids=["failed-write-disconnect", "no-failed-write-disconnect"],
+)
+async def test_disconnect_of_a_down_link_sends_no_request(
+    failed_write: bool, log: list[str]
+) -> None:
+    """Lock.disconnect() of a down link sends no request and waits for a running one."""
+    proxy = _EspProxy()
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E4", always_connected=False)
+    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
+    lock = push_lock._get_lock_instance()
+    with _esp_backend(proxy):
+        await lock.connect()
+    client = proxy.clients[0]
+    client.hold_after_answer = asyncio.Event()
+    if failed_write:
+        client.next_write_error[WRITE_CHARACTERISTIC] = _GATT_ERROR
+        with pytest.raises(BleakError):
+            await lock.lock_status()
+        # The session's disconnect has its answer and is held after it.
+        await asyncio.wait_for(client.down.wait(), 1)
+    else:
+        proxy.send_connected_false("the lock ends the link")
+
+    closing = asyncio.create_task(lock.disconnect())
+    closing.add_done_callback(lambda _: proxy.log.append("returned"))
+    # Time enough for disconnect() to return, were it not waiting.
+    await asyncio.wait({closing}, timeout=0.05)
+    proxy.log.append("released")
+    client.hold_after_answer.set()
+    await closing
+
+    assert proxy.log == log
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        _GATT_ERROR,
+        BleakError("Bluetooth GATT Error handle=18 error=1 description=Invalid handle"),
+    ],
+    ids=["gatt-error", "invalid-handle"],
+)
+async def test_a_failed_handshake_write_sends_one_disconnect(error: BleakError) -> None:
+    """A handshake write that fails with the link up ends it with one disconnect."""
+    proxy = _EspProxy()
+    proxy.next_secure_write_error = error
+    push_lock = PushLock(
+        address="AA:BB:CC:DD:EE:E5",
+        key="00" * 16,
+        key_index=1,
+        always_connected=False,
+    )
+    push_lock._name = "Test Lock"
+    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
+
+    with _esp_backend(proxy, handshake=True), pytest.raises(BleakError):
+        await push_lock._ensure_connected()
+
+    assert proxy.log == ["connect", "disconnect request", "connected=False"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("waited", "ends_link", "disconnect_calls", "log"),
+    [
+        (
+            False,
+            False,
+            2,
+            [
+                "connect",
+                "the lock ends the link",
+                "disconnect request",
+                "connected=False",
+            ],
+        ),
+        (True, False, 2, ["connect", "disconnect request", "connected=False"]),
+        (True, True, 1, ["connect"]),
+    ],
+    ids=["ended-link-up", "waited-link-up", "waited-link-down"],
+)
+async def test_disconnect_sends_a_request_when_a_raised_disconnect_left_the_link_up(
+    caplog: pytest.LogCaptureFixture,
+    waited: bool,
+    ends_link: bool,
+    disconnect_calls: int,
+    log: list[str],
+) -> None:
+    """Lock.disconnect() sends a request if a raised disconnect left the link up."""
+    proxy = _EspProxy()
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E6", always_connected=False)
+    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
+    lock = push_lock._get_lock_instance()
+    with _esp_backend(proxy):
+        await lock.connect()
+    client = proxy.clients[0]
+    real_disconnect = client.disconnect
+    released = asyncio.Event()
+    if not waited:
+        released.set()
+
+    async def disconnect() -> None:
+        if disconnect_mock.await_count > 1:
+            await real_disconnect()
+            return
+        # The first call is the failed write's disconnect, which the waited rows
+        # hold until Lock.disconnect() waits for it.
+        await released.wait()
+        if ends_link:
+            client.link_down()
+        raise BleakError("disconnect refused")
+
+    caplog.set_level(logging.DEBUG, logger="yalexs_ble.session")
+    client.next_write_error[WRITE_CHARACTERISTIC] = _GATT_ERROR
+    with patch.object(client, "disconnect", side_effect=disconnect) as disconnect_mock:
+        with pytest.raises(BleakError):
+            await lock.lock_status()
+        for _ in range(3):
+            await asyncio.sleep(0)  # This lets an unheld disconnect raise and end.
+        closing = asyncio.create_task(lock.disconnect())
+        await asyncio.sleep(0)  # Lock.disconnect() waits for a held disconnect.
+        released.set()
+        await asyncio.wait_for(closing, 1)
+
+    assert "Disconnect after a failed write raised" in caplog.text
+    assert disconnect_mock.await_count == disconnect_calls
+    assert not client.is_connected
+    assert proxy.log == log
+
+
+@pytest.mark.asyncio
+async def test_disconnect_logs_a_disconnect_request_that_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Lock.disconnect() logs a raised disconnect request at DEBUG and returns."""
+    proxy = _EspProxy()
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E7", always_connected=False)
+    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
+    lock = push_lock._get_lock_instance()
+    with _esp_backend(proxy):
+        await lock.connect()
+    client = proxy.clients[0]
+
+    with (
+        patch.object(
+            client, "disconnect", side_effect=BleakError("disconnect refused")
+        ) as disconnect_mock,
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.lock"),
+    ):
+        await asyncio.wait_for(lock.disconnect(), 1)
+
+    disconnect_mock.assert_awaited_once()
+    [record] = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "Test Lock: Failed to disconnect from lock"
+    ]
+    assert record.levelno == logging.DEBUG
+    assert isinstance(record.exc_info[1], BleakError)
