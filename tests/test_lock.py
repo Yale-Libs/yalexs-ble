@@ -1441,6 +1441,12 @@ def test_a_lock_record_keeps_an_op_code_with_no_name() -> None:
     assert activity.source not in list(OpCode)
 
 
+def test_op_code_refuses_a_value_that_is_not_an_int() -> None:
+    """Only an int becomes an UNKNOWN member; anything else is a ValueError."""
+    with pytest.raises(ValueError, match="not a valid OpCode"):
+        OpCode("0x0D")
+
+
 def test_op_code_holds_the_vendor_table() -> None:
     """OpCode holds the vendor's opCode table, with no member for 0x0D or 0x16."""
     assert {member.name: member.value for member in OpCode} == {
