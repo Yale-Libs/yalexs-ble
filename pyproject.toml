@@ -30,7 +30,7 @@ packages = [
 python = ">=3.11,<3.16"
 
 # Documentation Dependencies
-bleak = ">=3.0.2"
+bleak = ">=3.1.0"
 bleak-retry-connector = ">=4.7.1"
 async-timeout = {version = ">=3.0.0", python = "<3.11"}
 cryptography = ">=50.0.2"
