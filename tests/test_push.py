@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -3559,6 +3560,7 @@ def _keycode_push_lock() -> tuple[PushLock, MagicMock]:
     lock.get_keycode = AsyncMock(return_value="135790")
     lock.set_keycode = AsyncMock()
     lock.clear_keycode = AsyncMock()
+    lock.set_rtc = AsyncMock(return_value=1_791_439_200)
     return push_lock, lock
 
 
@@ -3930,6 +3932,78 @@ async def test_push_lock_keycode_failure_logs_one_warning_without_the_pin(
     assert len(warnings) == 1
     assert "get_keycode" in warnings[0].getMessage()
     assert "135790" not in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_push_lock_set_keycode_with_schedule() -> None:
+    push_lock, lock = _keycode_push_lock()
+    start = datetime(2026, 10, 8, 12, 0, 0, tzinfo=UTC)
+    end = datetime(2026, 10, 8, 18, 0, 0, tzinfo=UTC)
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        await push_lock.set_keycode(3, "135790", start_time=start, end_time=end)
+    lock.set_keycode.assert_awaited_once_with(3, "135790", start, end)
+
+
+@pytest.mark.asyncio
+async def test_push_lock_set_keycode_refuses_bad_schedule_without_connecting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    push_lock, lock = _keycode_push_lock()
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(
+            push_lock, "_ensure_connected", AsyncMock(return_value=lock)
+        ) as ensure_connected,
+        pytest.raises(ValueError, match="cannot be earlier"),
+    ):
+        await push_lock.set_keycode(1, "135790", start_time=200, end_time=100)
+    ensure_connected.assert_not_awaited()
+    lock.set_keycode.assert_not_awaited()
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+async def test_push_lock_set_rtc_round_trip() -> None:
+    push_lock, lock = _keycode_push_lock()
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        assert await push_lock.set_rtc(1_791_439_200) == 1_791_439_200
+        assert await push_lock.set_rtc() == 1_791_439_200
+    assert lock.set_rtc.await_count == 2
+    assert lock.set_rtc.await_args_list[0].args == (1_791_439_200,)
+    assert isinstance(lock.set_rtc.await_args_list[1].args[0], int)
+    assert push_lock._last_operation_complete_time != NEVER_TIME
+
+
+@pytest.mark.asyncio
+async def test_push_lock_set_rtc_refuses_bad_timestamp_without_connecting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    push_lock, lock = _keycode_push_lock()
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(
+            push_lock, "_ensure_connected", AsyncMock(return_value=lock)
+        ) as ensure_connected,
+        pytest.raises(ValueError, match="uint32 range"),
+    ):
+        await push_lock.set_rtc(-1)
+    ensure_connected.assert_not_awaited()
+    lock.set_rtc.assert_not_awaited()
+    assert not caplog.records
+
+
+@pytest.mark.asyncio
+async def test_push_lock_set_rtc_error_propagates_without_retry() -> None:
+    push_lock, lock = _keycode_push_lock()
+    lock.set_rtc.side_effect = OperationFailedError(
+        "set_rtc", OperationError.INVALID_OPERATION
+    )
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        pytest.raises(OperationFailedError),
+    ):
+        await push_lock.set_rtc(1_791_439_200)
+    lock.set_rtc.assert_awaited_once()
 
 
 def _log_record(log_type: int, index: int = 0) -> bytes:

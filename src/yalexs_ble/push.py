@@ -8,6 +8,7 @@ import struct
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import Any, TypeVar, cast
 
 from bleak.backends.scanner import AdvertisementData
@@ -42,7 +43,13 @@ from .const import (
     LockStateValue,
     LockStatus,
 )
-from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
+from .lock import (
+    ActivityLogOverrunError,
+    Lock,
+    validate_keycode_schedule,
+    validate_keycode_slot,
+    validate_rtc_timestamp,
+)
 from .session import (
     AuthError,
     BluetoothError,
@@ -1330,19 +1337,39 @@ class PushLock:
             "get_keycode", lambda lock: lock.get_keycode(slot)
         )
 
-    async def set_keycode(self, slot: int, pin: str) -> None:
-        """Program a PIN into a keypad slot.
+    async def set_keycode(
+        self,
+        slot: int,
+        pin: str,
+        start_time: datetime | int | None = None,
+        end_time: datetime | int | None = None,
+    ) -> None:
+        """Program a PIN into a keypad slot, always-valid unless a schedule is given.
 
         The slot is cleared first, so any failure after the Clear can leave it empty.
         """
         validate_keycode_slot(slot)
         encode_keycode_pin(pin)
-        await self._run_on_lock("set_keycode", lambda lock: lock.set_keycode(slot, pin))
+        validate_keycode_schedule(start_time, end_time)
+        if start_time is None and end_time is None:
+            await self._run_on_lock(
+                "set_keycode", lambda lock: lock.set_keycode(slot, pin)
+            )
+        else:
+            await self._run_on_lock(
+                "set_keycode",
+                lambda lock: lock.set_keycode(slot, pin, start_time, end_time),
+            )
 
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot."""
         validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
+
+    async def set_rtc(self, timestamp: datetime | int | None = None) -> int:
+        """Set the lock's hardware RTC clock; returns the programmed UTC epoch."""
+        ts = validate_rtc_timestamp(timestamp)
+        return await self._run_on_lock("set_rtc", lambda lock: lock.set_rtc(ts))
 
     @operation_lock
     async def _run_on_lock(

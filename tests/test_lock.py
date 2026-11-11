@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1346,6 +1348,113 @@ async def test_set_keycode_odd_length_pin_and_high_slot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_set_keycode_temporary_schedule_datetime() -> None:
+    lock, session = _keycode_lock([_result(op) for op in SET_KEYCODE_STEPS])
+    start = datetime(2026, 10, 8, 12, 0, 0, tzinfo=UTC)
+    end = datetime(2026, 10, 8, 18, 0, 0, tzinfo=UTC)
+    await lock.set_keycode(3, "123456", start_time=start, end_time=end)
+    access = session.sent[2]
+    assert access[0x01] == Commands.KEYCODE_ACCESS.value
+    assert int.from_bytes(access[0x04:0x08], "little") == int(start.timestamp())
+    assert int.from_bytes(access[0x08:0x0C], "little") == int(end.timestamp())
+    assert access[0x0C] == 0x81
+    assert access[0x0D] == 0x00
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_time", "end_time", "expected_start", "expected_end"),
+    [
+        (1_760_000_000, None, 1_760_000_000, 0),
+        (None, 1_760_003_600, 0, 1_760_003_600),
+        (0, 10, 0, 10),
+    ],
+)
+async def test_set_keycode_temporary_schedule_partial_and_int(
+    start_time: int | None,
+    end_time: int | None,
+    expected_start: int,
+    expected_end: int,
+) -> None:
+    lock, session = _keycode_lock([_result(op) for op in SET_KEYCODE_STEPS])
+    await lock.set_keycode(4, "654321", start_time=start_time, end_time=end_time)
+    access = session.sent[2]
+    assert int.from_bytes(access[0x04:0x08], "little") == expected_start
+    assert int.from_bytes(access[0x08:0x0C], "little") == expected_end
+    assert access[0x0C] == 0x81
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_time", "end_time", "exc_type", "match"),
+    [
+        (200, 100, ValueError, "cannot be earlier"),
+        (-1, None, ValueError, "uint32 range"),
+        (None, 0x1_0000_0000, ValueError, "uint32 range"),
+        (True, None, TypeError, "Invalid timestamp type"),
+        ("2026-10-08", None, TypeError, "Invalid timestamp type"),
+    ],
+)
+async def test_set_keycode_schedule_validation_errors(
+    start_time: Any,
+    end_time: Any,
+    exc_type: type[Exception],
+    match: str,
+) -> None:
+    lock, session = _keycode_lock([])
+    with pytest.raises(exc_type, match=match):
+        await lock.set_keycode(1, "1234", start_time=start_time, end_time=end_time)
+    assert session.sent == []
+
+
+@pytest.mark.asyncio
+async def test_set_rtc_success_and_defaults() -> None:
+    before = int(time.time())
+    lock, session = _keycode_lock([_result(Commands.SET_RTC.value)])
+    ts_default = await lock.set_rtc()
+    after = int(time.time())
+    assert before <= ts_default <= after
+    cmd_default = session.sent[0]
+    assert cmd_default[0x01] == Commands.SET_RTC.value
+    assert int.from_bytes(cmd_default[0x04:0x08], "little") == ts_default
+    assert cmd_default[0x10] == 0x02
+
+    dt = datetime(2026, 10, 9, 14, 30, 0, tzinfo=UTC)
+    lock2, session2 = _keycode_lock(
+        [_result(Commands.SET_RTC.value), _result(Commands.SET_RTC.value)]
+    )
+    assert await lock2.set_rtc(dt) == int(dt.timestamp())
+    assert await lock2.set_rtc(1_791_439_200) == 1_791_439_200
+    assert int.from_bytes(session2.sent[0][0x04:0x08], "little") == int(dt.timestamp())
+    assert int.from_bytes(session2.sent[1][0x04:0x08], "little") == 1_791_439_200
+
+
+@pytest.mark.asyncio
+async def test_set_rtc_failure_raises_operation_failed() -> None:
+    lock, _ = _keycode_lock(
+        [_result(Commands.SET_RTC.value, OperationError.INVALID_OPERATION.value)]
+    )
+    with pytest.raises(OperationFailedError) as exc_info:
+        await lock.set_rtc(1_791_439_200)
+    assert exc_info.value.command == "set_rtc"
+    assert exc_info.value.error == OperationError.INVALID_OPERATION
+
+
+@pytest.mark.asyncio
+async def test_set_rtc_validation_and_connection_errors() -> None:
+    lock, session = _keycode_lock([])
+    with pytest.raises(ValueError, match="uint32 range"):
+        await lock.set_rtc(-5)
+    with pytest.raises(TypeError, match="Invalid timestamp type"):
+        await lock.set_rtc(False)
+    assert session.sent == []
+
+    disconnected = _make_lock()
+    with pytest.raises(DisconnectedError):
+        await disconnected.set_rtc(1_791_439_200)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "failing_step"),
     [(0x06, 0x2C), (0x39, 0x2C), (0x07, 0x28)],
@@ -1425,7 +1534,7 @@ def test_keycode_get_matcher_requires_the_echoed_slot() -> None:
     assert not matches(bytes.fromhex("aa39004ec800000000000000000000000200"))
 
 
-@pytest.mark.parametrize("opcode", [0x27, 0x28, 0x2B, 0x2C, 0x39, 0x2D])
+@pytest.mark.parametrize("opcode", [0x10, 0x27, 0x28, 0x2B, 0x2C, 0x39, 0x2D])
 @pytest.mark.parametrize("flag", [0xBB, 0xAA])
 def test_keycode_frames_produce_no_state(opcode: int, flag: int) -> None:
     received: list[object] = []
