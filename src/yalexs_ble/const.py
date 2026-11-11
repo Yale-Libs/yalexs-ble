@@ -60,6 +60,7 @@ class Commands(IntEnum):
     READSETTING = 0x04
     UNLOCK = 0x0A
     LOCK = 0x0B
+    SET_RTC = 0x10
     KEYCODE_SET = 0x27
     KEYCODE_CLEAR = 0x28
     KEYCODE_ACCESS = 0x2B
