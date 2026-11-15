@@ -4,9 +4,7 @@ import asyncio
 import bisect
 import logging
 import os
-import time
 from collections.abc import AsyncGenerator, Callable, Iterable
-from datetime import datetime
 from typing import Any, TypeVar, cast
 
 from bleak import BleakError
@@ -188,7 +186,6 @@ def _poll_response_matcher(
 # Opcodes whose frames carry no lock state; their results go to the waiting command.
 NO_STATE_OPCODES = frozenset(
     {
-        Commands.SET_RTC.value,
         Commands.KEYCODE_SET.value,
         Commands.KEYCODE_CLEAR.value,
         Commands.KEYCODE_ACCESS.value,
@@ -198,9 +195,9 @@ NO_STATE_OPCODES = frozenset(
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
-KEYCODE_ACCESS_TEMPORARY = 0x81
 KEYCODE_CREDENTIAL_PIN = 0x00
 KEYCODE_MAX_SLOT = 0xFFFF
+UINT8_MAX = 0xFF
 UINT32_MAX = 0xFFFFFFFF
 # Result code of a 0xBB op-response or keycode result.
 RESULT_BYTE = 0x0F
@@ -226,40 +223,23 @@ def validate_keycode_slot(slot: int) -> None:
         raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
 
 
-def _to_uint32_epoch(value: datetime | int) -> int:
-    """Convert a datetime or Unix epoch int to a validated uint32 timestamp."""
-    if isinstance(value, datetime):
-        ts = int(value.timestamp())
-    elif isinstance(value, int) and not isinstance(value, bool):
-        ts = value
-    else:
-        raise TypeError(f"Invalid timestamp type: {type(value)}")
-    if not 0 <= ts <= UINT32_MAX:
-        raise ValueError(f"Timestamp out of uint32 range (0-{UINT32_MAX}): {ts}")
-    return ts
+def _validate_uint(value: int, max_value: int, name: str) -> None:
+    """Validate that value is a non-bool int within 0..max_value."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if not 0 <= value <= max_value:
+        raise ValueError(f"{name} out of range (0-{max_value}): {value}")
 
 
-def validate_keycode_schedule(
-    start_time: datetime | int | None = None,
-    end_time: datetime | int | None = None,
-) -> tuple[int, int, int]:
-    """Validate an optional schedule; returns (start_ts, end_ts, access_type)."""
-    if start_time is None and end_time is None:
-        return 0, 0, KEYCODE_ACCESS_ALWAYS
-    start_ts = _to_uint32_epoch(start_time) if start_time is not None else 0
-    end_ts = _to_uint32_epoch(end_time) if end_time is not None else 0
-    if start_time is not None and end_time is not None and end_ts < start_ts:
-        raise ValueError(
-            f"end_time ({end_ts}) cannot be earlier than start_time ({start_ts})"
-        )
-    return start_ts, end_ts, KEYCODE_ACCESS_TEMPORARY
-
-
-def validate_rtc_timestamp(timestamp: datetime | int | None = None) -> int:
-    """Return a uint32 UTC Unix epoch timestamp, defaulting to now."""
-    if timestamp is None:
-        return int(time.time())
-    return _to_uint32_epoch(timestamp)
+def validate_keycode_access(
+    access_type: int = KEYCODE_ACCESS_ALWAYS,
+    start_time: int = 0,
+    end_time: int = 0,
+) -> None:
+    """Validate KeyCode_Access schedule field bounds."""
+    _validate_uint(access_type, UINT8_MAX, "access_type")
+    _validate_uint(start_time, UINT32_MAX, "start_time")
+    _validate_uint(end_time, UINT32_MAX, "end_time")
 
 
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
@@ -804,17 +784,27 @@ class Lock:
         self,
         slot: int,
         pin: str,
-        start_time: datetime | int | None = None,
-        end_time: datetime | int | None = None,
+        *,
+        access_type: int = KEYCODE_ACCESS_ALWAYS,
+        start_time: int = 0,
+        end_time: int = 0,
     ) -> None:
-        """Program a PIN into a keypad slot, always-valid unless a schedule is given.
+        """Program a PIN into a keypad slot.
 
         The slot is cleared first, so a KeycodeError from a later step
         leaves the slot empty; the error names the step that failed.
+
+        Schedule fields (written to ``KEYCODE_ACCESS``):
+
+        | Schedule | ``access_type`` | ``start_time`` / ``end_time`` |
+        |---|---|---|
+        | Always | ``0x80`` | ``0`` / ``0`` |
+        | Temporary | ``0x81`` | UTC epoch seconds |
+        | Recurring | ``0x01``-``0x7F`` (Sun=0..Sat=6) | Seconds of day (0-86399) |
         """
         validate_keycode_slot(slot)
         encoded = util.encode_keycode_pin(pin)
-        start_ts, end_ts, access_type = validate_keycode_schedule(start_time, end_time)
+        validate_keycode_access(access_type, start_time, end_time)
         assert self.session is not None  # nosec
         await self.clear_keycode(slot)
 
@@ -824,30 +814,14 @@ class Lock:
         await self._send_keycode(cmd, "set_keycode")
 
         cmd = self.session.build_command(Commands.KEYCODE_ACCESS)
-        cmd[0x04:0x08] = util._int_to_bytes(start_ts, 4)
-        cmd[0x08:0x0C] = util._int_to_bytes(end_ts, 4)
+        cmd[0x04:0x08] = util._int_to_bytes(start_time, 4)
+        cmd[0x08:0x0C] = util._int_to_bytes(end_time, 4)
         cmd[0x0C] = access_type
         cmd[0x0D] = KEYCODE_CREDENTIAL_PIN
         await self._send_keycode(cmd, "set_keycode_access")
 
         cmd = self._keycode_slot_command(Commands.KEYCODE_COMMIT, encoded, slot)
         await self._send_keycode(cmd, "commit_keycode")
-
-    @raise_if_not_connected
-    async def set_rtc(self, timestamp: datetime | int | None = None) -> int:
-        """Set the lock's hardware RTC clock; returns the programmed UTC epoch."""
-        ts = validate_rtc_timestamp(timestamp)
-        assert self.session is not None  # nosec
-        cmd = self.session.build_command(Commands.SET_RTC)
-        cmd[0x04:0x08] = util._int_to_bytes(ts, 4)
-        response = await self.session.execute(
-            cmd, "set_rtc", _operation_response_matcher(Commands.SET_RTC.value)
-        )
-        if (result := response[RESULT_BYTE]) != OperationError.COMM_SUCCESS:
-            raise OperationFailedError(
-                "set_rtc", VALUE_TO_OPERATION_ERROR.get(result, result)
-            )
-        return ts
 
     async def securemode(self) -> None:
         """Set securemode unless already set; raises OperationFailedError on failure."""

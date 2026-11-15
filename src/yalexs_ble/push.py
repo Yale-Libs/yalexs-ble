@@ -8,7 +8,6 @@ import struct
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
 from typing import Any, TypeVar, cast
 
 from bleak.backends.scanner import AdvertisementData
@@ -44,11 +43,11 @@ from .const import (
     LockStatus,
 )
 from .lock import (
+    KEYCODE_ACCESS_ALWAYS,
     ActivityLogOverrunError,
     Lock,
-    validate_keycode_schedule,
+    validate_keycode_access,
     validate_keycode_slot,
-    validate_rtc_timestamp,
 )
 from .session import (
     AuthError,
@@ -1341,35 +1340,46 @@ class PushLock:
         self,
         slot: int,
         pin: str,
-        start_time: datetime | int | None = None,
-        end_time: datetime | int | None = None,
+        *,
+        access_type: int = KEYCODE_ACCESS_ALWAYS,
+        start_time: int = 0,
+        end_time: int = 0,
     ) -> None:
-        """Program a PIN into a keypad slot, always-valid unless a schedule is given.
+        """Program a PIN into a keypad slot.
 
         The slot is cleared first, so any failure after the Clear can leave it empty.
+
+        Schedule fields (written to ``KEYCODE_ACCESS``):
+
+        | Schedule | ``access_type`` | ``start_time`` / ``end_time`` |
+        |---|---|---|
+        | Always | ``0x80`` | ``0`` / ``0`` |
+        | Temporary | ``0x81`` | UTC epoch seconds |
+        | Recurring | ``0x01``-``0x7F`` (Sun=0..Sat=6) | Seconds of day (0-86399) |
         """
         validate_keycode_slot(slot)
         encode_keycode_pin(pin)
-        validate_keycode_schedule(start_time, end_time)
-        if start_time is None and end_time is None:
+        validate_keycode_access(access_type, start_time, end_time)
+        if access_type == KEYCODE_ACCESS_ALWAYS and start_time == 0 and end_time == 0:
             await self._run_on_lock(
                 "set_keycode", lambda lock: lock.set_keycode(slot, pin)
             )
         else:
             await self._run_on_lock(
                 "set_keycode",
-                lambda lock: lock.set_keycode(slot, pin, start_time, end_time),
+                lambda lock: lock.set_keycode(
+                    slot,
+                    pin,
+                    access_type=access_type,
+                    start_time=start_time,
+                    end_time=end_time,
+                ),
             )
 
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot."""
         validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
-
-    async def set_rtc(self, timestamp: datetime | int | None = None) -> int:
-        """Set the lock's hardware RTC clock; returns the programmed UTC epoch."""
-        ts = validate_rtc_timestamp(timestamp)
-        return await self._run_on_lock("set_rtc", lambda lock: lock.set_rtc(ts))
 
     @operation_lock
     async def _run_on_lock(
