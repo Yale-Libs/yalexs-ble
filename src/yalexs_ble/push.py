@@ -41,8 +41,14 @@ from .const import (
     LockState,
     LockStateValue,
     LockStatus,
+    StatusReply,
 )
-from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
+from .lock import (
+    ActivityLogOverrunError,
+    Lock,
+    validate_keycode_slot,
+    validate_status_type,
+)
 from .session import (
     AuthError,
     BluetoothError,
@@ -1343,6 +1349,18 @@ class PushLock:
         """Clear a keypad slot."""
         validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
+
+    async def get_status(self, status_type: int) -> StatusReply:
+        """Send a status poll for one status type and return the value with its times.
+
+        Raises ValueError before connecting, RuntimeError when not running, and
+        TimeoutError when the lock does not answer, with the connection kept.
+        """
+        validate_status_type(status_type)
+        return await self._run_on_lock(
+            f"get_status 0x{status_type:02X}",
+            lambda lock: lock.get_status(status_type),
+        )
 
     @operation_lock
     async def _run_on_lock(

@@ -35,6 +35,7 @@ from .const import (
     LockStatus,
     OperationError,
     SettingType,
+    StatusReply,
     StatusType,
 )
 from .secure_session import SecureSession
@@ -219,6 +220,14 @@ def validate_keycode_slot(slot: int) -> None:
     """Raise ValueError for a keypad slot outside the lock's range."""
     if not 1 <= slot <= KEYCODE_MAX_SLOT:
         raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
+
+
+def validate_status_type(status_type: int) -> None:
+    """Raise ValueError for a status type that does not fit one unsigned byte."""
+    if not 0 <= status_type <= 0xFF:
+        raise ValueError(
+            f"Status type is not an unsigned one-byte value (0 to 0xFF): {status_type}"
+        )
 
 
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
@@ -418,12 +427,14 @@ class Lock:
                 if state[4] == StatusType.LOCK_EVENTS_UNREAD.value:
                     # Answered through unread_event_count(); no state to publish.
                     return ()
-            elif (
+                # Any other status type holds no lock state, so the reply
+                # publishes nothing; a waiting get_status() returns its value.
+                return ()
+            if (
                 state[1] == Commands.WRITESETTING.value
                 or state[1] == Commands.READSETTING.value
-            ):
-                if state[4] == SettingType.AUTOLOCK.value:
-                    return [self._parse_auto_lock_state(state)]
+            ) and state[4] == SettingType.AUTOLOCK.value:
+                return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
             if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
                 return ()  # Operation ack; state arrives in the 0xBB op-response
@@ -935,6 +946,30 @@ class Lock:
     async def battery(self) -> BatteryState:
         response = await self._poll_status(StatusType.BATTERY, "battery")
         return self._parse_battery_state(response)
+
+    @raise_if_not_connected
+    async def get_status(self, status_type: int) -> StatusReply:
+        """Send a status poll and return its unsigned 32-bit value and its times.
+
+        Raises ValueError for a status type outside one byte, before any frame is
+        built, and TimeoutError when the lock does not answer within the session's wait.
+        """
+        validate_status_type(status_type)
+        _LOGGER.debug(
+            "%s: Sending a status poll for status type 0x%02X", self.name, status_type
+        )
+        assert self.session is not None  # nosec
+        command = self.session.build_operation_command(Commands.GETSTATUS, status_type)
+        response, times = await self.session.execute_timed(
+            command,
+            "get_status",
+            _poll_response_matcher(Commands.GETSTATUS.value, status_type),
+        )
+        value = util._bytes_to_int(response[0x08:0x0C])
+        _LOGGER.debug(
+            "%s: Status type 0x%02X has the value 0x%08X", self.name, status_type, value
+        )
+        return StatusReply(value, times)
 
     @raise_if_not_connected
     async def auto_lock_status(self) -> None:

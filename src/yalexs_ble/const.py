@@ -150,6 +150,14 @@ class StatusType(IntEnum):
     BATTERY = 0x0F
     # The activity log's unread count: records no client has read yet.
     LOCK_EVENTS_UNREAD = 0x09
+    # Aliases of LOCK_ONLY, DOOR_ONLY, DOOR_AND_LOCK, and BATTERY, based on the
+    # vendor's terms.
+    LOCK_STATE = 0x02
+    DOOR_STATE = 0x2E
+    DOOR_LOCK_STATE = 0x2F
+    BATTERY_VOLTAGE = 0x0F
+    # The lock's clock, in seconds since 1970 UTC.
+    RTC = 0x0A
 
 
 class SettingType(IntEnum):
@@ -216,6 +224,22 @@ class BatteryState:
 class AutoLockState:
     mode: AutoLockMode
     duration: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeTimes:
+    """When one exchange with the lock took place, in host seconds since 1970 UTC."""
+
+    request_written: float
+    reply_received: float
+
+
+@dataclass(frozen=True, slots=True)
+class StatusReply:
+    """The value of a status poll, with the times of the poll's exchange."""
+
+    value: int
+    times: ExchangeTimes
 
 
 @dataclass
