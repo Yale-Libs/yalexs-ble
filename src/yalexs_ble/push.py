@@ -49,6 +49,7 @@ from .lock import (
     Lock,
     validate_keycode_slot,
     validate_status_type,
+    validate_timezone_info,
 )
 from .session import (
     AuthError,
@@ -1373,6 +1374,18 @@ class PushLock:
         """
         return await self._run_on_lock(
             "sync_rtc", lambda lock: lock.sync_rtc(offset=offset)
+        )
+
+    async def set_timezone_info(self, payload: bytes) -> bytes:
+        """Send the lock's time zone and return the lock's reply.
+
+        payload is bytes 4 to 15 of the TimeZone_Info frame, passed through.
+        Raises ValueError before connecting, RuntimeError when not running, and
+        TimeoutError when the lock does not answer, with the connection kept.
+        """
+        validate_timezone_info(payload)
+        return await self._run_on_lock(
+            "set_timezone_info", lambda lock: lock.set_timezone_info(payload)
         )
 
     @operation_lock

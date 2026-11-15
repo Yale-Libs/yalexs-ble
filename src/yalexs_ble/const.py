@@ -66,6 +66,7 @@ class Commands(IntEnum):
     KEYCODE_ACCESS = 0x2B
     KEYCODE_COMMIT = 0x2C
     GETLOG = 0x2D
+    TIMEZONE_INFO = 0x30
     KEYCODE_GET = 0x39
 
 

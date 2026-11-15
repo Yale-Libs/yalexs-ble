@@ -201,6 +201,7 @@ NO_STATE_OPCODES = frozenset(
         Commands.KEYCODE_GET.value,
         Commands.GETLOG.value,
         Commands.SETRTC.value,
+        Commands.TIMEZONE_INFO.value,
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
@@ -245,6 +246,12 @@ def validate_rtc_time(seconds: int) -> None:
             "Clock time is not an unsigned four-byte value "
             f"(0 to 0xFFFFFFFF): {seconds}"
         )
+
+
+def validate_timezone_info(payload: bytes) -> None:
+    """Raise ValueError for a time zone payload that is not 12 bytes."""
+    if len(payload) != 12:
+        raise ValueError(f"Time zone payload is not 12 bytes: {len(payload)}")
 
 
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
@@ -1057,6 +1064,31 @@ class Lock:
         )
         assert written is not None  # nosec
         return RtcWrite(written, times)
+
+    @raise_if_not_connected
+    async def set_timezone_info(self, payload: bytes) -> bytes:
+        """Send the lock's time zone and return the lock's reply.
+
+        payload is bytes 4 to 15 of the TimeZone_Info frame, sent as given; the
+        return is bytes 4 to 15 of the lock's reply, unchanged. Raises ValueError
+        for a payload that is not 12 bytes, before any frame is built, and
+        TimeoutError when the lock does not answer within the session's wait.
+        """
+        validate_timezone_info(payload)
+        _LOGGER.debug("%s: Setting the time zone to %s", self.name, payload.hex())
+        assert self.session is not None  # nosec
+        command = self.session.build_command(Commands.TIMEZONE_INFO)
+        command[0x04:0x10] = payload
+        response = await self.session.execute(
+            command,
+            "set_timezone_info",
+            _operation_response_matcher(Commands.TIMEZONE_INFO.value),
+        )
+        reply = bytes(response[0x04:0x10])
+        _LOGGER.debug(
+            "%s: The lock answered the time zone write with %s", self.name, reply.hex()
+        )
+        return reply
 
     @raise_if_not_connected
     async def get_log(self) -> bytes:

@@ -8540,12 +8540,20 @@ _CLOCK_TIME_BYTE_4 = _CLOCK_TIME & 0xFF
 # A host time for _patched_host_clock to start at, from which a clock write at host
 # time writes _CLOCK_TIME.
 _HOST_TIME = _CLOCK_TIME - 0.5
+# Constructed TimeZone_Info frames. Byte 4 of a TimeZone_Info frame is the payload's
+# first byte, which is the key _record_and_answer answers the write by.
+_ZONE_PAYLOAD = bytes(range(0xF4, 0x100))
+_ZONE_ACK = bytes(_with_checksum(f"aa300000{_ZONE_PAYLOAD.hex()}0200"))
+_ZONE_REPLY = _answer_frame(Commands.TIMEZONE_INFO.value, _ZONE_PAYLOAD[0], b"\x01")
 
 
 def _record_and_answer(
     session: Session, client: MagicMock, answers: dict[tuple[int, int], bytes]
 ) -> list[bytes]:
-    """Record each command written to client and answer it by its bytes 1 and 4."""
+    """Record each command written to client and answer it by its bytes 1 and 4.
+
+    An answer of several frames is given as their concatenation.
+    """
     # Pass-through encryption, so write_gatt_char receives each command unencrypted
     # and can read its bytes 1 and 4.
     session.cipher_encrypt = MagicMock(update=bytes)
@@ -8553,8 +8561,9 @@ def _record_and_answer(
 
     async def write_gatt_char(_char: Any, command: bytearray, _response: bool) -> None:
         written.append(bytes(command))
-        if (answer := answers.get((command[0x01], command[0x04]))) is not None:
-            session._notify(0, bytearray(answer))
+        answer = answers.get((command[0x01], command[0x04]), b"")
+        for start in range(0, len(answer), RESPONSE_FRAME_LEN):
+            session._notify(0, bytearray(answer[start : start + RESPONSE_FRAME_LEN]))
 
     client.write_gatt_char = AsyncMock(side_effect=write_gatt_char)
     return written
@@ -8573,11 +8582,12 @@ def _call(target: object, method: str, args: tuple[Any, ...] | dict[str, Any]) -
     [
         ("get_status", (0x0A,), "get_status 0x0A"),
         ("sync_rtc", (), "sync_rtc"),
+        ("set_timezone_info", (_ZONE_PAYLOAD,), "set_timezone_info"),
     ],
 )
 async def test_push_commands_that_move_no_motor_warn_once_on_no_answer(
     method: str,
-    args: tuple[int, ...],
+    args: tuple[object, ...],
     name: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -8628,6 +8638,7 @@ async def test_push_answers_without_lock_state_publish_no_state(
                 (1793448000).to_bytes(4, "little"),
             ),
             (Commands.SETRTC.value, _CLOCK_TIME_BYTE_4): _CLOCK_WRITE_ACK,
+            (Commands.TIMEZONE_INFO.value, _ZONE_PAYLOAD[0]): _ZONE_ACK + _ZONE_REPLY,
         },
     )
 
@@ -8638,6 +8649,9 @@ async def test_push_answers_without_lock_state_publish_no_state(
     ):
         assert (await push_lock.get_status(StatusType.RTC)).value == 1793448000
         await push_lock.sync_rtc()
+        assert (
+            await push_lock.set_timezone_info(_ZONE_PAYLOAD) == _ZONE_REPLY[0x04:0x10]
+        )
 
     assert published == []
     assert push_lock.lock_state == before
@@ -8677,6 +8691,14 @@ async def test_push_answers_without_lock_state_publish_no_state(
                 _CLOCK_TIME, ExchangeTimes(_CLOCK_TIME - 0.25, _CLOCK_TIME - 0.25)
             ),
             id="clock-write-with-an-offset-during-a-cycle",
+        ),
+        pytest.param(
+            "set_timezone_info",
+            (_ZONE_PAYLOAD,),
+            (Commands.TIMEZONE_INFO, _ZONE_PAYLOAD[0]),
+            _ZONE_REPLY,
+            _ZONE_REPLY[0x04:0x10],
+            id="zone-write-during-a-cycle",
         ),
     ],
 )
@@ -8809,6 +8831,18 @@ async def test_a_clock_write_behind_a_get_log_chooses_its_second_once_it_runs(
             TypeError,
             None,
             id="a-timestamp-to-sync-rtc",
+        ),
+        (
+            "set_timezone_info",
+            (bytes(11),),
+            ValueError,
+            "Time zone payload is not 12 bytes: 11",
+        ),
+        (
+            "set_timezone_info",
+            (bytes(13),),
+            ValueError,
+            "Time zone payload is not 12 bytes: 13",
         ),
     ],
 )

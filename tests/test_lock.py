@@ -1488,10 +1488,11 @@ async def test_keycode_operations_require_a_connection() -> None:
     [
         ("get_status", (0x0A,)),
         ("sync_rtc", ()),
+        ("set_timezone_info", (bytes(12),)),
     ],
 )
 async def test_lock_commands_require_a_connection(
-    method: str, args: tuple[int, ...]
+    method: str, args: tuple[object, ...]
 ) -> None:
     lock = _make_lock()
     with pytest.raises(DisconnectedError):
@@ -2139,6 +2140,15 @@ CLOCK_WRITE_OFFSET = 1793750707 - HOST_START - 0.5
 CLOCK_WRITE = RtcWrite(1793750707, ExchangeTimes(HOST_START + 0.5, HOST_START + 0.5))
 # A constructed SetRTC 0xBB reply.
 CLOCK_WRITE_RESPONSE = _with_checksum("bb1000000000000000000000000000000000")
+# Constructed TimeZone_Info frames. Every payload byte is distinct, so a payload
+# written at the wrong offset fails, and the reply holds 0x01 at byte 7 where the
+# payload and the acknowledgment hold 0xF7, so a return taken from the acknowledgment
+# fails.
+ZONE_PAYLOAD = bytes(range(0xF4, 0x100))
+ZONE_ACK = _with_checksum(f"aa300000{ZONE_PAYLOAD.hex()}0200")
+ZONE_REPLY = _with_checksum(
+    f"bb300000{ZONE_PAYLOAD[:3].hex()}01{ZONE_PAYLOAD[4:].hex()}0000"
+)
 
 
 @pytest.mark.asyncio
@@ -2231,6 +2241,30 @@ CLOCK_WRITE_RESPONSE = _with_checksum("bb1000000000000000000000000000000000")
             CLOCK_WRITE,
             [[LockStatus.UNLOCKED]],
             id="clock-status-push-and-another-ack-first",
+        ),
+        pytest.param(
+            "set_timezone_info",
+            (ZONE_PAYLOAD,),
+            [ZONE_REPLY],
+            ZONE_REPLY[0x04:0x10],
+            [],
+            id="zone-bb-frame",
+        ),
+        pytest.param(
+            "set_timezone_info",
+            (ZONE_PAYLOAD,),
+            [ZONE_ACK, ZONE_REPLY],
+            ZONE_REPLY[0x04:0x10],
+            [],
+            id="zone-ack-first",
+        ),
+        pytest.param(
+            "set_timezone_info",
+            (ZONE_PAYLOAD,),
+            [CLOCK_WRITE_RESPONSE, ZONE_REPLY],
+            ZONE_REPLY[0x04:0x10],
+            [],
+            id="zone-clock-reply-first",
         ),
     ],
 )
@@ -2525,6 +2559,33 @@ async def test_sync_rtc_writes_the_second_at_the_host_time_less_the_offset(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(bytes(12), id="all-zero"),
+        pytest.param(ZONE_PAYLOAD, id="every-byte-distinct"),
+    ],
+)
+async def test_set_timezone_info_writes_the_payload_at_bytes_4_to_15(
+    payload: bytes,
+) -> None:
+    """The TimeZone_Info frame holds the payload at bytes 4 to 15 as given."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = _answered_by(session, ZONE_REPLY)
+
+    assert await lock.set_timezone_info(payload) == ZONE_REPLY[0x04:0x10]
+
+    (written,) = (
+        call.args[1] for call in session.client.write_gatt_char.await_args_list
+    )
+    assert written[0x00] == 0xEE
+    assert written[0x01] == Commands.TIMEZONE_INFO.value
+    assert written[0x04:0x10] == payload
+    assert written[0x10] == 0x02
+    assert len(written) == RESPONSE_FRAME_LEN
+
+
+@pytest.mark.asyncio
 @pytest.mark.usefixtures("host_clock")
 async def test_sync_rtc_is_not_answered_by_a_frame_of_another_opcode() -> None:
     """A status push or another command's acknowledgment does not answer SetRTC."""
@@ -2594,6 +2655,18 @@ async def test_sync_rtc_names_its_command_in_the_session_log(
             TypeError,
             None,
             id="a-timestamp-to-sync-rtc",
+        ),
+        (
+            "set_timezone_info",
+            (bytes(11),),
+            ValueError,
+            "Time zone payload is not 12 bytes: 11",
+        ),
+        (
+            "set_timezone_info",
+            (bytes(13),),
+            ValueError,
+            "Time zone payload is not 12 bytes: 13",
         ),
     ],
 )
