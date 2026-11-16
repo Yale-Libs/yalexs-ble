@@ -271,7 +271,12 @@ def validate_rtc_offset(offset: float) -> None:
 
 
 def validate_timezone_info(payload: bytes) -> None:
-    """Raise ValueError for a time zone payload that is not 12 bytes."""
+    """Raise TypeError or ValueError for a time zone payload that is not 12 bytes."""
+    if not isinstance(payload, bytes | bytearray):
+        raise TypeError(
+            f"Time zone payload has type {type(payload).__name__}, "
+            f"not bytes or bytearray: {payload!r}"
+        )
     if len(payload) != 12:
         raise ValueError(f"Time zone payload is not 12 bytes: {len(payload)}")
 
@@ -1123,9 +1128,10 @@ class Lock:
         """Send the lock's time zone and return the lock's reply.
 
         payload is bytes 4 to 15 of the TimeZone_Info frame, sent as given; the
-        return is bytes 4 to 15 of the lock's reply, unchanged. Raises ValueError
-        for a payload that is not 12 bytes, before any frame is built, and
-        TimeoutError when the lock does not answer within the session's wait.
+        return is bytes 4 to 15 of the lock's reply, unchanged. Raises TypeError for
+        a payload that is not bytes or a bytearray and ValueError for one that is
+        not 12 bytes, before any frame is built, and TimeoutError when the lock does
+        not answer within the session's wait.
         """
         validate_timezone_info(payload)
         _LOGGER.debug("%s: Setting the time zone to %s", self.name, payload.hex())

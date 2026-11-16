@@ -8959,6 +8959,13 @@ async def test_a_clock_write_behind_a_get_log_runs_once_the_cooldown_ends(
             ValueError,
             "Time zone payload is not 12 bytes: 13",
         ),
+        pytest.param(
+            "set_timezone_info",
+            ("abcdefghijkl",),
+            TypeError,
+            "Time zone payload has type str, not bytes or bytearray: 'abcdefghijkl'",
+            id="a-payload-that-is-a-str",
+        ),
     ],
 )
 async def test_push_commands_refuse_a_bad_argument(

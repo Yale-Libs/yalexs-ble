@@ -2637,6 +2637,7 @@ async def test_sync_rtc_writes_at_its_moment_and_set_rtc_at_once(
     [
         pytest.param(bytes(12), id="all-zero"),
         pytest.param(ZONE_PAYLOAD, id="every-byte-distinct"),
+        pytest.param(bytearray(ZONE_PAYLOAD), id="a-bytearray"),
     ],
 )
 async def test_set_timezone_info_writes_the_payload_at_bytes_4_to_15(
@@ -2833,6 +2834,13 @@ async def test_a_clock_write_names_its_call_in_the_session_log(
             (bytes(13),),
             ValueError,
             "Time zone payload is not 12 bytes: 13",
+        ),
+        pytest.param(
+            "set_timezone_info",
+            ("abcdefghijkl",),
+            TypeError,
+            "Time zone payload has type str, not bytes or bytearray: 'abcdefghijkl'",
+            id="a-payload-that-is-a-str",
         ),
     ],
 )

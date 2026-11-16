@@ -1396,8 +1396,10 @@ class PushLock:
         """Send the lock's time zone and return the lock's reply.
 
         payload is bytes 4 to 15 of the TimeZone_Info frame, passed through.
-        Raises ValueError before connecting, RuntimeError when not running, and
-        TimeoutError when the lock does not answer, with the connection kept.
+        Raises TypeError for a payload that is not bytes or a bytearray and
+        ValueError for one that is not 12 bytes, before connecting, RuntimeError
+        when not running, and TimeoutError when the lock does not answer, with the
+        connection kept.
         """
         validate_timezone_info(payload)
         return await self._run_on_lock(
