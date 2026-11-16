@@ -692,8 +692,10 @@ class Session:
         """Execute command as execute() does; also return the times of its exchange.
 
         prepare, when given, is awaited with the command after the cooldown and
-        before its checksum is written. For a command written more than once,
-        request_written is of the last write before the reply.
+        before its checksum is written. prepare runs before the session's write
+        lock is taken, so a command holding the write lock at that moment delays
+        the frame past the moment prepare chose. For a command written more than
+        once, request_written is of the last write before the reply.
         """
         try:
             async with self._command_scope(command, prepare=prepare):
