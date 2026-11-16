@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import bisect
 import logging
+import math
 import os
-from collections.abc import AsyncGenerator, Callable, Iterable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from time import time
 from typing import Any, TypeVar, cast
 
 from bleak import BleakError
@@ -30,11 +32,14 @@ from .const import (
     BatteryState,
     Commands,
     DoorStatus,
+    ExchangeTimes,
     LockInfo,
     LockStateValue,
     LockStatus,
     OperationError,
+    RtcWrite,
     SettingType,
+    StatusReply,
     StatusType,
 )
 from .secure_session import SecureSession
@@ -63,6 +68,10 @@ UNLATCH_OPERATION_BYTE = 0x0A
 
 # Operation byte (byte[4]) that makes a Lock command securemode.
 SECUREMODE_OPERATION_BYTE = 0x04
+
+# The least time sync_rtc leaves between choosing its second and that second's
+# moment; chosen, not measured.
+RTC_SEND_LEAD = 0.005
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -192,6 +201,8 @@ NO_STATE_OPCODES = frozenset(
         Commands.KEYCODE_COMMIT.value,
         Commands.KEYCODE_GET.value,
         Commands.GETLOG.value,
+        Commands.SETRTC.value,
+        Commands.TIMEZONE_INFO.value,
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
@@ -221,6 +232,55 @@ def validate_keycode_slot(slot: int) -> None:
         raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
 
 
+def validate_status_type(status_type: int) -> None:
+    """Raise ValueError for a status type that does not fit one unsigned byte."""
+    if not 0 <= status_type <= 0xFF:
+        raise ValueError(
+            f"Status type is not an unsigned one-byte value (0 to 0xFF): {status_type}"
+        )
+
+
+def validate_rtc_time(seconds: int) -> None:
+    """Raise ValueError for a clock time that does not fit four unsigned bytes."""
+    if not 0 <= seconds <= 0xFFFFFFFF:
+        raise ValueError(
+            "Clock time is not an unsigned four-byte value "
+            f"(0 to 0xFFFFFFFF): {seconds}"
+        )
+
+
+def validate_rtc_timestamp(timestamp: int) -> None:
+    """Raise TypeError or ValueError for a timestamp set_rtc does not accept."""
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+        raise TypeError(
+            f"Clock timestamp has type {type(timestamp).__name__}, not int: "
+            f"{timestamp!r}"
+        )
+    validate_rtc_time(timestamp)
+
+
+def validate_rtc_offset(offset: float) -> None:
+    """Raise TypeError or ValueError for an offset sync_rtc does not accept."""
+    if isinstance(offset, bool) or not isinstance(offset, int | float):
+        raise TypeError(
+            f"Clock offset has type {type(offset).__name__}, not int or float: "
+            f"{offset!r}"
+        )
+    if not math.isfinite(offset):
+        raise ValueError(f"Clock offset is not finite: {offset}")
+
+
+def validate_timezone_info(payload: bytes) -> None:
+    """Raise TypeError or ValueError for a time zone payload that is not 12 bytes."""
+    if not isinstance(payload, bytes | bytearray):
+        raise TypeError(
+            f"Time zone payload has type {type(payload).__name__}, "
+            f"not bytes or bytearray: {payload!r}"
+        )
+    if len(payload) != 12:
+        raise ValueError(f"Time zone payload is not 12 bytes: {len(payload)}")
+
+
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
     """Match the acknowledgment (0xAA + opcode + operation byte) of a command.
 
@@ -247,6 +307,15 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
 
     def _matches(data: bytes) -> bool:
         return len(data) > RESULT_BYTE and data[0x00] == 0xBB and data[0x01] == opcode
+
+    return _matches
+
+
+def _first_reply_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match an 0xAA or 0xBB frame whose byte 1 is opcode, whatever byte 4 holds."""
+
+    def _matches(data: bytes) -> bool:
+        return len(data) > 0x01 and data[0x00] in (0xAA, 0xBB) and data[0x01] == opcode
 
     return _matches
 
@@ -415,15 +484,14 @@ class Lock:
                     return self._parse_lock_and_door_state(state)
                 if state[4] == StatusType.BATTERY.value:
                     return [self._parse_battery_state(state)]
-                if state[4] == StatusType.LOCK_EVENTS_UNREAD.value:
-                    # Answered through unread_event_count(); no state to publish.
-                    return ()
-            elif (
+                # Any other status type holds no lock state, so the reply
+                # publishes nothing; the call waiting for it returns its value.
+                return ()
+            if (
                 state[1] == Commands.WRITESETTING.value
                 or state[1] == Commands.READSETTING.value
-            ):
-                if state[4] == SettingType.AUTOLOCK.value:
-                    return [self._parse_auto_lock_state(state)]
+            ) and state[4] == SettingType.AUTOLOCK.value:
+                return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
             if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
                 return ()  # Operation ack; state arrives in the 0xBB op-response
@@ -937,6 +1005,30 @@ class Lock:
         return self._parse_battery_state(response)
 
     @raise_if_not_connected
+    async def get_status(self, status_type: int) -> StatusReply:
+        """Send a status poll and return its unsigned 32-bit value and its times.
+
+        Raises ValueError for a status type outside one byte, before any frame is
+        built, and TimeoutError when the lock does not answer within the session's wait.
+        """
+        validate_status_type(status_type)
+        _LOGGER.debug(
+            "%s: Sending a status poll for status type 0x%02X", self.name, status_type
+        )
+        assert self.session is not None  # nosec
+        command = self.session.build_operation_command(Commands.GETSTATUS, status_type)
+        response, times = await self.session.execute_timed(
+            command,
+            "get_status",
+            _poll_response_matcher(Commands.GETSTATUS.value, status_type),
+        )
+        value = util._bytes_to_int(response[0x08:0x0C])
+        _LOGGER.debug(
+            "%s: Status type 0x%02X has the value 0x%08X", self.name, status_type, value
+        )
+        return StatusReply(value, times)
+
+    @raise_if_not_connected
     async def auto_lock_status(self) -> None:
         """Request the auto-lock setting.
 
@@ -954,6 +1046,108 @@ class Lock:
             "auto_lock_status",
         )
         _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
+
+    @raise_if_not_connected
+    async def sync_rtc(self, *, offset: float = 0.0) -> RtcWrite:
+        """Set the lock's clock to the host's time plus offset seconds.
+
+        The lock takes whole seconds, so the write is sent at the moment that gives
+        the fraction. Returns the second written and the times of the write; the
+        lock applied the write between request_written and reply_received. Raises
+        TypeError for an offset that is not an int or a float, and ValueError for
+        one that is not finite or gives a second that does not fit four unsigned
+        bytes, before any frame is written, and TimeoutError when the lock does not
+        answer within the session's wait.
+        """
+        validate_rtc_offset(offset)
+        assert self.session is not None  # nosec
+        session = self.session
+        written: int | None = None
+
+        async def fill_the_second_at_its_moment(command: bytearray) -> None:
+            nonlocal written
+            seconds = math.ceil(time() + offset + RTC_SEND_LEAD)
+            while True:
+                validate_rtc_time(seconds)
+                await asyncio.sleep(seconds - offset - time())
+                if not session.cooling_down():
+                    break
+                # A notification during the wait restarted the cooldown, so the
+                # write moves to the next second.
+                seconds += 1
+            command[0x04:0x08] = util._int_to_bytes(seconds, 4)
+            written = seconds
+            _LOGGER.debug("%s: Setting the clock to %d", self.name, seconds)
+
+        times = await self._write_rtc(
+            session.build_command(Commands.SETRTC),
+            "sync_rtc",
+            prepare=fill_the_second_at_its_moment,
+        )
+        assert written is not None  # nosec
+        return RtcWrite(written, times)
+
+    @raise_if_not_connected
+    async def set_rtc(self, timestamp: int) -> RtcWrite:
+        """Set the lock's clock to timestamp, in seconds since 1970 UTC, as given.
+
+        Returns the second written and the times of the write; the lock applied the
+        write between request_written and reply_received. Raises TypeError or
+        ValueError for a bad timestamp before any frame is written, and TimeoutError
+        when the lock does not answer within the session's wait.
+        """
+        validate_rtc_timestamp(timestamp)
+        assert self.session is not None  # nosec
+        command = self.session.build_command(Commands.SETRTC)
+        command[0x04:0x08] = util._int_to_bytes(timestamp, 4)
+        _LOGGER.debug("%s: Setting the clock to %d", self.name, timestamp)
+        return RtcWrite(timestamp, await self._write_rtc(command, "set_rtc"))
+
+    async def _write_rtc(
+        self,
+        command: bytearray,
+        command_name: str,
+        *,
+        prepare: Callable[[bytearray], Awaitable[None]] | None = None,
+    ) -> ExchangeTimes:
+        """Send a SetRTC command and return the times of its write."""
+        assert self.session is not None  # nosec
+        response, times = await self.session.execute_timed(
+            command,
+            command_name,
+            _first_reply_matcher(Commands.SETRTC.value),
+            prepare=prepare,
+        )
+        _LOGGER.debug(
+            "%s: The lock answered the clock write with %s", self.name, response.hex()
+        )
+        return times
+
+    @raise_if_not_connected
+    async def set_timezone_info(self, payload: bytes) -> bytes:
+        """Send the lock's time zone and return the lock's reply.
+
+        payload is bytes 4 to 15 of the TimeZone_Info frame, sent as given; the
+        return is bytes 4 to 15 of the lock's reply, unchanged. Raises TypeError for
+        a payload that is not bytes or a bytearray and ValueError for one that is
+        not 12 bytes, before any frame is built, and TimeoutError when the lock does
+        not answer within the session's wait.
+        """
+        validate_timezone_info(payload)
+        _LOGGER.debug("%s: Setting the time zone to %s", self.name, payload.hex())
+        assert self.session is not None  # nosec
+        command = self.session.build_command(Commands.TIMEZONE_INFO)
+        command[0x04:0x10] = payload
+        response = await self.session.execute(
+            command,
+            "set_timezone_info",
+            _operation_response_matcher(Commands.TIMEZONE_INFO.value),
+        )
+        reply = bytes(response[0x04:0x10])
+        _LOGGER.debug(
+            "%s: The lock answered the time zone write with %s", self.name, reply.hex()
+        )
+        return reply
 
     @raise_if_not_connected
     async def get_log(self) -> bytes:

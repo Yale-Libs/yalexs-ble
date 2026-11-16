@@ -41,8 +41,18 @@ from .const import (
     LockState,
     LockStateValue,
     LockStatus,
+    RtcWrite,
+    StatusReply,
 )
-from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
+from .lock import (
+    ActivityLogOverrunError,
+    Lock,
+    validate_keycode_slot,
+    validate_rtc_offset,
+    validate_rtc_timestamp,
+    validate_status_type,
+    validate_timezone_info,
+)
 from .session import (
     AuthError,
     BluetoothError,
@@ -1343,6 +1353,58 @@ class PushLock:
         """Clear a keypad slot."""
         validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
+
+    async def get_status(self, status_type: int) -> StatusReply:
+        """Send a status poll for one status type and return the value with its times.
+
+        Raises ValueError before connecting, RuntimeError when not running, and
+        TimeoutError when the lock does not answer, with the connection kept.
+        """
+        validate_status_type(status_type)
+        return await self._run_on_lock(
+            f"get_status 0x{status_type:02X}",
+            lambda lock: lock.get_status(status_type),
+        )
+
+    async def sync_rtc(self, *, offset: float = 0.0) -> RtcWrite:
+        """Set the lock's clock to the host's time plus offset seconds.
+
+        Returns the second written and the times of the write. Raises TypeError for
+        an offset that is not an int or a float and ValueError for one that is not
+        finite, before any connection, RuntimeError when not running, ValueError
+        when the second to write is outside four unsigned bytes, with no SetRTC
+        frame written, and TimeoutError when the lock does not answer, with the
+        connection kept.
+        """
+        validate_rtc_offset(offset)
+        return await self._run_on_lock(
+            "sync_rtc", lambda lock: lock.sync_rtc(offset=offset)
+        )
+
+    async def set_rtc(self, timestamp: int) -> RtcWrite:
+        """Set the lock's clock to timestamp, in seconds since 1970 UTC, as given.
+
+        Returns the second written and the times of the write. Raises TypeError for
+        a timestamp that is not an int and ValueError for one outside four unsigned
+        bytes, before any connection, RuntimeError when not running, and
+        TimeoutError when the lock does not answer, with the connection kept.
+        """
+        validate_rtc_timestamp(timestamp)
+        return await self._run_on_lock("set_rtc", lambda lock: lock.set_rtc(timestamp))
+
+    async def set_timezone_info(self, payload: bytes) -> bytes:
+        """Send the lock's time zone and return the lock's reply.
+
+        payload is bytes 4 to 15 of the TimeZone_Info frame, passed through.
+        Raises TypeError for a payload that is not bytes or a bytearray and
+        ValueError for one that is not 12 bytes, before connecting, RuntimeError
+        when not running, and TimeoutError when the lock does not answer, with the
+        connection kept.
+        """
+        validate_timezone_info(payload)
+        return await self._run_on_lock(
+            "set_timezone_info", lambda lock: lock.set_timezone_info(payload)
+        )
 
     @operation_lock
     async def _run_on_lock(
