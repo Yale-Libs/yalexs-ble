@@ -1,9 +1,8 @@
 import asyncio
 import logging
-import math
 import struct
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -20,12 +19,16 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
 from tests.helpers import (
+    CLOCK_OFFSET_BAD_ARGUMENTS,
     CLOCK_WRITE_ACK,
+    CLOCK_WRITE_TIME,
     ZONE_ACK,
     ZONE_PAYLOAD,
+    ZONE_PAYLOAD_BAD_ARGUMENTS,
     ZONE_REPLY,
     bb_frame,
     call_method,
+    with_checksum,
 )
 from yalexs_ble.activity_log import LogRecord
 from yalexs_ble.const import (
@@ -2882,7 +2885,7 @@ async def test_a_lock_state_outside_the_status_sets_shows_on_both_locks_and_is_p
     lock = _real_decoder(push_lock)
 
     with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
-        lock._internal_state_callback(bytes(_with_checksum(frame)))
+        lock._internal_state_callback(with_checksum(frame))
 
     assert (push_lock.lock_status, push_lock.secure_status) == (expected, expected)
     assert ("Unrecognized lock_status_str code" in caplog.text) is (
@@ -3808,7 +3811,7 @@ async def test_push_lock_keycode_late_answer_is_taken_by_the_next_clear() -> Non
     """Known limit: a Clear's answer is matched by opcode alone."""
     push_lock, lock, session, client = _keycode_real_session("aa:bb:cc:dd:ee:33")
     # A Clear result frame: slot 7 at the command's slot offset, KEYCODE_EXISTING_KEY.
-    late = _with_checksum("bb280000ffffffffffffff07000000060000")
+    late = with_checksum("bb280000ffffffffffffff07000000060000")
     writes = 0
 
     async def write_gatt_char(*_: object) -> None:
@@ -3840,7 +3843,7 @@ async def test_push_lock_keycode_checksum_failure_warning_omits_the_frame(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     push_lock, lock, session, client = _keycode_real_session("aa:bb:cc:dd:ee:35")
-    corrupt = _with_checksum("bb390000c800135790ffffffff0000000000")
+    corrupt = bytearray(with_checksum("bb390000c800135790ffffffff0000000000"))
     corrupt[-1] ^= 0x01
     client.write_gatt_char = AsyncMock(
         side_effect=_write_delivering(session, [corrupt])
@@ -3930,7 +3933,7 @@ async def test_push_lock_keycode_failure_logs_one_warning_without_the_pin(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     push_lock, lock, session, client = _keycode_real_session("aa:bb:cc:dd:ee:32")
-    malformed = _with_checksum("bb390000c800135790eeeeeeee0000000000")
+    malformed = with_checksum("bb390000c800135790eeeeeeee0000000000")
     client.write_gatt_char = AsyncMock(
         side_effect=_write_delivering(session, [malformed])
     )
@@ -3966,10 +3969,8 @@ _GET_LOG_ERROR = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
 
 def _count_reply(count: int) -> bytes:
     """A LOCK_EVENTS_UNREAD reply built to the captured layout, count at byte[8:12]."""
-    return bytes(
-        _with_checksum(
-            "bb02000009000000" + count.to_bytes(4, "little").hex() + "000000000200"
-        )
+    return with_checksum(
+        "bb02000009000000" + count.to_bytes(4, "little").hex() + "000000000200"
     )
 
 
@@ -4945,7 +4946,7 @@ async def test_a_cancelled_securemode_keeps_the_pair_and_polls_at_the_debounce()
     pairs: list[tuple[LockStatus, LockStatus]] = []
     push_lock.register_callback(lambda ls, li, ci: pairs.append((ls.lock, ls.secure)))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    ack = _with_checksum(_ACK_SECUREMODE)
+    ack = with_checksum(_ACK_SECUREMODE)
     client.write_gatt_char = AsyncMock(
         side_effect=_write_returning_first(session, [ack])
     )
@@ -6134,14 +6135,6 @@ _STATUS_PUSH_UNLOCKED = "bb0200000200000003000000000000000000"
 _STATUS_PUSH_LOCKED = "bb0200000200000005000000000000000000"
 
 
-def _with_checksum(hex_str: str) -> bytearray:
-    """Build an 18-byte frame with a valid simple checksum in byte[3]."""
-    frame = bytearray.fromhex(hex_str)
-    frame[0x03] = 0
-    frame[0x03] = _simple_checksum(frame)
-    return frame
-
-
 @contextmanager
 def _patched_clock() -> Iterator[list[float]]:
     """Patch push.py's clock and return the cell that holds it.
@@ -6194,7 +6187,9 @@ def _lock_on_a_real_session(push_lock: PushLock) -> tuple[Lock, Session, MagicMo
 
 
 def _write_delivering(
-    session: Session, frames: list[bytearray], error: BaseException | None = None
+    session: Session,
+    frames: Sequence[bytes | bytearray],
+    error: BaseException | None = None,
 ) -> Callable[..., None]:
     """Build a write that delivers frames and then returns or fails."""
 
@@ -6208,7 +6203,7 @@ def _write_delivering(
 
 
 def _write_returning_first(
-    session: Session, frames: list[bytearray]
+    session: Session, frames: Sequence[bytes | bytearray]
 ) -> Callable[..., None]:
     """Build a write whose frames are handled on the loop turn after it returns."""
 
@@ -6238,7 +6233,7 @@ async def test_a_jam_reported_before_the_write_returns_never_leaves_the_display(
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, *report)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, *report)]
     client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
 
     with (
@@ -6270,7 +6265,7 @@ async def test_a_jam_reported_before_the_write_returns_ends_the_attempts(
     client.write_gatt_char = AsyncMock(
         side_effect=_write_delivering(
             session,
-            [_with_checksum(_STATUS_PUSH_JAMMED)],
+            [with_checksum(_STATUS_PUSH_JAMMED)],
             write_error,
         )
     )
@@ -6294,7 +6289,7 @@ async def test_a_command_issued_within_the_precedence_time_keeps_the_jam_on_disp
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
     client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
 
     with (
@@ -6319,7 +6314,7 @@ async def test_a_command_issued_after_the_precedence_time_shows_its_result():
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
     client.write_gatt_char = AsyncMock(
         side_effect=_write_returning_first(session, frames)
     )
@@ -6346,11 +6341,11 @@ async def test_a_jam_pushed_during_the_connect_keeps_the_display() -> None:
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
     client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
 
     def connect_with_a_jam_pushed() -> Lock:
-        session._notify(0, bytearray(_with_checksum(_STATUS_PUSH_JAMMED)))
+        session._notify(0, bytearray(with_checksum(_STATUS_PUSH_JAMMED)))
         return lock
 
     with patch.object(
@@ -6376,7 +6371,7 @@ async def test_a_jam_pushed_during_the_connect_keeps_the_display() -> None:
     ids=["handled-after-the-write-returned", "handled-before-the-write-returned"],
 )
 async def test_a_re_jam_after_the_precedence_time_shows_the_attempt(
-    write: Callable[[Session, list[bytearray]], Callable[..., None]],
+    write: Callable[[Session, Sequence[bytes | bytearray]], Callable[..., None]],
     emitted: list[LockStatus],
 ) -> None:
     """A re-jam against a command past the precedence time leaves JAMMED on display."""
@@ -6385,7 +6380,7 @@ async def test_a_re_jam_after_the_precedence_time_shows_the_attempt(
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_JAMMED)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_JAMMED)]
     client.write_gatt_char = AsyncMock(side_effect=write(session, frames))
 
     with (
@@ -6411,7 +6406,7 @@ async def test_an_op_response_before_write_success_shows_no_transitional() -> No
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
     client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
     write_success = push_lock._operation_write_success
     window_after_write_success: list[bool] = []
@@ -6441,7 +6436,7 @@ async def test_a_jam_reported_after_the_op_response_follows_the_end_state() -> N
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
     frames = [
-        _with_checksum(frame)
+        with_checksum(frame)
         for frame in (_ACK_LOCK, _OP_RESPONSE_OK, _STATUS_PUSH_JAMMED)
     ]
     client.write_gatt_char = AsyncMock(
@@ -6469,8 +6464,8 @@ async def test_the_push_after_the_op_response_is_admitted_before_or_after_the_ex
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    push = _with_checksum(_STATUS_PUSH_UNLOCKED)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    push = with_checksum(_STATUS_PUSH_UNLOCKED)
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
     if before_the_exit:
         frames.append(push)
     client.write_gatt_char = AsyncMock(
@@ -6543,9 +6538,10 @@ async def test_a_status_handled_before_write_success_is_refused() -> None:
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    inside = _write_delivering(session, [_with_checksum(_STATUS_PUSH_LOCKED)])
+    inside = _write_delivering(session, [with_checksum(_STATUS_PUSH_LOCKED)])
     after = _write_returning_first(
-        session, [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+        session,
+        [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)],
     )
 
     def write(*args: object) -> None:
@@ -6568,7 +6564,7 @@ async def test_precedence_is_read_from_the_issue_time_not_the_stamp() -> None:
     emissions: list[LockStatus] = []
     push_lock.register_callback(lambda ls, li, ci: emissions.append(ls.lock))
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
     deliver = _write_delivering(session, frames)
 
     def write_returning_late(*args: object) -> None:
@@ -6890,7 +6886,7 @@ async def test_the_locks_answer_releases_the_hold_when_the_write_then_fails(
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:75")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, *report)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, *report)]
     client.write_gatt_char = AsyncMock(
         side_effect=_write_delivering(session, frames, BleakError("write failed"))
     )
@@ -6921,11 +6917,11 @@ async def test_a_jam_reported_during_a_command_under_a_hold_does_not_flap() -> N
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:90")
     push_lock._lock_state = _known_state(LockStatus.LOCKED)
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
     client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
 
     def connect_with_a_jam_pushed() -> Lock:
-        session._notify(0, bytearray(_with_checksum(_STATUS_PUSH_JAMMED)))
+        session._notify(0, bytearray(with_checksum(_STATUS_PUSH_JAMMED)))
         return lock
 
     with (
@@ -6956,7 +6952,7 @@ async def test_settled_push_after_a_command_under_precedence_is_refused_by_the_h
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:92")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_OK)]
     client.write_gatt_char = AsyncMock(side_effect=_write_delivering(session, frames))
 
     with (
@@ -6995,14 +6991,14 @@ async def test_settled_push_after_a_command_under_precedence_is_refused_by_the_h
     ],
 )
 async def test_a_reported_failure_re_arms_the_hold_at_its_op_response(
-    write: Callable[[Session, list[bytearray]], Callable[..., None]],
+    write: Callable[[Session, Sequence[bytes | bytearray]], Callable[..., None]],
     issued_after: float,
 ) -> None:
     """A reported failure arms the hold from the frame carrying its op-response."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:93")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     lock, session, client = _lock_on_a_real_session(push_lock)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_JAMMED)]
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_JAMMED)]
     client.write_gatt_char = AsyncMock(side_effect=write(session, frames))
 
     with (
@@ -7033,8 +7029,8 @@ async def test_a_push_after_a_failed_command_meets_the_hold_wherever_the_exit_fa
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:c0")
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     lock, session, client = _lock_on_a_real_session(push_lock)
-    push = _with_checksum(_STATUS_PUSH_UNLOCKED)
-    frames = [_with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_JAMMED)]
+    push = with_checksum(_STATUS_PUSH_UNLOCKED)
+    frames = [with_checksum(frame) for frame in (_ACK_LOCK, _OP_RESPONSE_JAMMED)]
     if before_the_exit:
         frames.append(push)
     client.write_gatt_char = AsyncMock(
@@ -8505,7 +8501,7 @@ async def test_an_op_response_the_lock_parses_holds_the_next_read_off():
     assert push_lock._earliest_update_time == NEVER_TIME
     before = time.monotonic()
 
-    lock._parse_state(bytes(_with_checksum(_OP_RESPONSE_OK)))
+    lock._parse_state(with_checksum(_OP_RESPONSE_OK))
 
     assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
 
@@ -8530,12 +8526,11 @@ _STATUS_ANSWERS = {
 }
 
 
-# The time CLOCK_WRITE_ACK holds, and byte 4 of the SetRTC frame that writes it.
-_CLOCK_TIME = 1793750707
-_CLOCK_TIME_BYTE_4 = _CLOCK_TIME & 0xFF
+# Byte 4 of the SetRTC frame that writes CLOCK_WRITE_TIME.
+_CLOCK_TIME_BYTE_4 = CLOCK_WRITE_TIME & 0xFF
 # A host time for _patched_host_clock to start at, from which a clock write at host
-# time writes _CLOCK_TIME.
-_HOST_TIME = _CLOCK_TIME - 0.5
+# time writes CLOCK_WRITE_TIME.
+_HOST_TIME = CLOCK_WRITE_TIME - 0.5
 
 
 def _record_and_answer(
@@ -8566,7 +8561,7 @@ def _record_and_answer(
     [
         ("get_status", (0x0A,), "get_status 0x0A"),
         ("sync_rtc", (), "sync_rtc"),
-        ("set_rtc", (_CLOCK_TIME,), "set_rtc"),
+        ("set_rtc", (CLOCK_WRITE_TIME,), "set_rtc"),
         ("set_timezone_info", (ZONE_PAYLOAD,), "set_timezone_info"),
     ],
 )
@@ -8632,7 +8627,7 @@ async def test_push_answers_without_lock_state_publish_no_state(
     ):
         assert (await push_lock.get_status(StatusType.RTC)).value == 1793448000
         await push_lock.sync_rtc()
-        await push_lock.set_rtc(_CLOCK_TIME)
+        await push_lock.set_rtc(CLOCK_WRITE_TIME)
         assert await push_lock.set_timezone_info(ZONE_PAYLOAD) == ZONE_REPLY[0x04:0x10]
 
     assert published == []
@@ -8657,7 +8652,9 @@ async def test_push_answers_without_lock_state_publish_no_state(
             (),
             (Commands.SETRTC, _CLOCK_TIME_BYTE_4),
             CLOCK_WRITE_ACK,
-            RtcWrite(_CLOCK_TIME, ExchangeTimes(_CLOCK_TIME, _CLOCK_TIME)),
+            RtcWrite(
+                CLOCK_WRITE_TIME, ExchangeTimes(CLOCK_WRITE_TIME, CLOCK_WRITE_TIME)
+            ),
             id="clock-write-during-a-cycle",
         ),
         pytest.param(
@@ -8666,16 +8663,17 @@ async def test_push_answers_without_lock_state_publish_no_state(
             (Commands.SETRTC, _CLOCK_TIME_BYTE_4),
             CLOCK_WRITE_ACK,
             RtcWrite(
-                _CLOCK_TIME, ExchangeTimes(_CLOCK_TIME - 0.25, _CLOCK_TIME - 0.25)
+                CLOCK_WRITE_TIME,
+                ExchangeTimes(CLOCK_WRITE_TIME - 0.25, CLOCK_WRITE_TIME - 0.25),
             ),
             id="clock-write-with-an-offset-during-a-cycle",
         ),
         pytest.param(
             "set_rtc",
-            (_CLOCK_TIME,),
+            (CLOCK_WRITE_TIME,),
             (Commands.SETRTC, _CLOCK_TIME_BYTE_4),
             CLOCK_WRITE_ACK,
-            RtcWrite(_CLOCK_TIME, ExchangeTimes(_HOST_TIME, _HOST_TIME)),
+            RtcWrite(CLOCK_WRITE_TIME, ExchangeTimes(_HOST_TIME, _HOST_TIME)),
             id="clock-write-of-a-timestamp-during-a-cycle",
         ),
         pytest.param(
@@ -8831,71 +8829,30 @@ async def test_a_clock_write_behind_a_get_log_runs_once_the_cooldown_ends(
         pytest.param("sync_rtc", (0.5,), TypeError, None, id="an-offset-by-position"),
         pytest.param(
             "sync_rtc",
-            {"timestamp": _CLOCK_TIME},
+            {"timestamp": CLOCK_WRITE_TIME},
             TypeError,
             None,
             id="a-timestamp-to-sync-rtc",
         ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": "0.5"},
-            TypeError,
-            "Clock offset has type str, not int or float: '0.5'",
-            id="an-offset-that-is-a-str",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": None},
-            TypeError,
-            "Clock offset has type NoneType, not int or float: None",
-            id="an-offset-that-is-none",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": True},
-            TypeError,
-            "Clock offset has type bool, not int or float: True",
-            id="an-offset-that-is-a-bool",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": math.inf},
-            ValueError,
-            "Clock offset is not finite: inf",
-            id="an-infinite-offset",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": -math.inf},
-            ValueError,
-            "Clock offset is not finite: -inf",
-            id="a-negative-infinite-offset",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": math.nan},
-            ValueError,
-            "Clock offset is not finite: nan",
-            id="a-nan-offset",
-        ),
+        *CLOCK_OFFSET_BAD_ARGUMENTS,
         pytest.param("set_rtc", (), TypeError, None, id="no-timestamp"),
         pytest.param(
             "set_rtc",
-            {"timestamp": _CLOCK_TIME, "offset": 0.5},
+            {"timestamp": CLOCK_WRITE_TIME, "offset": 0.5},
             TypeError,
             None,
             id="an-offset-to-set-rtc",
         ),
         pytest.param(
             "set_rtc",
-            (float(_CLOCK_TIME),),
+            (float(CLOCK_WRITE_TIME),),
             TypeError,
             "Clock timestamp has type float, not int",
             id="a-float",
         ),
         pytest.param(
             "set_rtc",
-            (datetime.fromtimestamp(_CLOCK_TIME, UTC),),
+            (datetime.fromtimestamp(CLOCK_WRITE_TIME, UTC),),
             TypeError,
             "Clock timestamp has type datetime, not int",
             id="a-datetime",
@@ -8933,13 +8890,7 @@ async def test_a_clock_write_behind_a_get_log_runs_once_the_cooldown_ends(
             ValueError,
             "Time zone payload is not 12 bytes: 13",
         ),
-        pytest.param(
-            "set_timezone_info",
-            ("abcdefghijkl",),
-            TypeError,
-            "Time zone payload has type str, not bytes or bytearray: 'abcdefghijkl'",
-            id="a-payload-that-is-a-str",
-        ),
+        *ZONE_PAYLOAD_BAD_ARGUMENTS,
     ],
 )
 async def test_push_commands_refuse_a_bad_argument(

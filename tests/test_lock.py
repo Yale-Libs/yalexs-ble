@@ -1,7 +1,6 @@
 import asyncio
 import contextlib
 import logging
-import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -15,12 +14,16 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
 from tests.helpers import (
+    CLOCK_OFFSET_BAD_ARGUMENTS,
     CLOCK_WRITE_ACK,
+    CLOCK_WRITE_TIME,
     ZONE_ACK,
     ZONE_PAYLOAD,
+    ZONE_PAYLOAD_BAD_ARGUMENTS,
     ZONE_REPLY,
     bb_frame,
     call_method,
+    with_checksum,
 )
 from yalexs_ble import util
 from yalexs_ble.const import (
@@ -1003,22 +1006,10 @@ UNLOCK_ACK = bytes.fromhex("aa0a004a0000000000000000000000000200")
 SECUREMODE_ACK = bytes.fromhex("aa0b00450400000000000000000000000200")
 
 
-def _with_checksum(hex_str: str) -> bytes:
-    """Build an 18-byte frame with a valid simple checksum in byte[3].
-
-    byte[3] is the checksum field and ``_validate_response`` requires the
-    frame to sum to zero.
-    """
-    frame = bytearray.fromhex(hex_str)
-    frame[0x03] = 0
-    frame[0x03] = _simple_checksum(frame)
-    return bytes(frame)
-
-
 # A LOCK_EVENTS_UNREAD reply captured on 2026-07-26 from a Yale lock: 242 records.
 DEPTH_FRAME = bytes.fromhex("bb02004609000000f2000000000000000200")
 # Built to the same layout with 0xDEADBEEF in the count at byte[8:12].
-NEGATIVE_DEPTH_FRAME = _with_checksum("bb02000009000000efbeadde000000000200")
+NEGATIVE_DEPTH_FRAME = with_checksum("bb02000009000000efbeadde000000000200")
 # The answer to status type 0x08, captured on 2026-07-26 from a Yale lock: the
 # filler 0xDEADBEEF at byte[8:12].
 LOCK_EVENTS_FRAME = bytes.fromhex("bb02000108000000efbeadde000000000200")
@@ -1029,8 +1020,8 @@ RTC_FRAME = bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 1793448000)
 # Built GETLOG replies, each holding one activity record: byte[2] is the
 # record index and byte[4] the record type. 0x80 ends the log; 0x20 is a door
 # state change.
-ACTIVITY_FRAME = _with_checksum("bb2d00008000000000000000000000000000")
-DOOR_ACTIVITY_FRAME = _with_checksum("bb2d00002000000000010000000000000000")
+ACTIVITY_FRAME = with_checksum("bb2d00008000000000000000000000000000")
+DOOR_ACTIVITY_FRAME = with_checksum("bb2d00002000000000010000000000000000")
 
 
 # The host clock reads HOST_START at the start of a test on host_clock, and the
@@ -1109,7 +1100,7 @@ def test_poll_response_matcher_takes_only_the_requested_subtype() -> None:
     assert not matches(DOOR_FRAME)
     assert not matches(LOCK_FRAME)
     # Right opcode and subtype, but an acknowledgment rather than a response.
-    assert not matches(_with_checksum("aa02000f0f00000000000000000000000000"))
+    assert not matches(with_checksum("aa02000f0f00000000000000000000000000"))
     # Wrong opcode.
     assert not matches(ACTIVITY_FRAME)
 
@@ -1121,13 +1112,13 @@ def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
     """
     matches = _poll_response_matcher(Commands.GETLOG.value)
     assert matches(ACTIVITY_FRAME)
-    assert matches(_with_checksum("bb2d00002000000000000000000000000000"))
+    assert matches(with_checksum("bb2d00002000000000000000000000000000"))
     # Still opcode-gated.
     assert not matches(BATTERY_FRAME)
     # An acknowledgment carries the request's own byte[4], which is zero for
     # this command and so reads as a lock operation record. Only the 0xBB check
     # keeps it from being returned as a record.
-    assert not matches(_with_checksum("aa2d00000000000000000000000000000000"))
+    assert not matches(with_checksum("aa2d00000000000000000000000000000000"))
 
 
 @pytest.mark.asyncio
@@ -1255,7 +1246,7 @@ def test_a_settings_response_of_another_setting_is_still_unknown(
     """A settings response for a setting the library does not decode stays unknown."""
     lock = _make_lock()
     # Built: a READSETTING response with setting 0xB2 at byte[4].
-    frame = _with_checksum("bb040000b20000001e000000000000000000")
+    frame = with_checksum("bb040000b20000001e000000000000000000")
 
     with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
         assert lock._parse_state(frame) is None
@@ -1298,7 +1289,7 @@ async def test_the_auto_lock_read_completes_on_its_acknowledgment() -> None:
     would wait for a 0xBB such a lock never sends.
     """
     lock, session = _connected_lock()
-    ack = _with_checksum("aa0400002800000000000000000000000000")
+    ack = with_checksum("aa0400002800000000000000000000000000")
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
         # The read arms no matcher, which is the exemption itself.
@@ -1568,7 +1559,7 @@ KEYPAD_UNLOCK_SLOT_205 = bytes.fromhex("bb2d0072079aa176a333004bea14cd000200")
 KEYPAD_UNLOCK_SLOT_200 = bytes.fromhex("bb2d00a4077a9e76a333004cdf14c8000200")
 KEYPAD_LOCK_BUTTON = bytes.fromhex("bb2d0056000b0500a0a176a3df14194a0200")
 END_OF_LOG = bytes.fromhex("bb2d00de800200009aa176a3a8a176a30200")
-UNKNOWN_ACTIVITY = _with_checksum("bb2d00005500000000000000000000000000")
+UNKNOWN_ACTIVITY = with_checksum("bb2d00005500000000000000000000000000")
 
 
 def test_op_code_refuses_a_value_that_is_not_an_int() -> None:
@@ -1789,7 +1780,7 @@ def _ack_frame(opcode: int, operation_byte: int) -> bytes:
     frame[0x01] = opcode
     frame[0x04] = operation_byte
     frame[0x10] = 0x02
-    return _with_checksum(frame.hex())
+    return with_checksum(frame.hex())
 
 
 UNLATCH_ACK = _ack_frame(Commands.UNLOCK, UNLATCH_OPERATION_BYTE)
@@ -1801,7 +1792,7 @@ def _op_response_frame(opcode: int, result: int = OperationError.COMM_SUCCESS) -
     frame[0x00] = 0xBB
     frame[0x01] = opcode
     frame[0x0F] = result
-    return _with_checksum(frame.hex())
+    return with_checksum(frame.hex())
 
 
 async def _drive_operation(
@@ -2125,12 +2116,14 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
     return AsyncMock(side_effect=deliver)
 
 
-# The offset that makes sync_rtc write 1793750707 half a second after HOST_START,
+# The offset that makes sync_rtc write CLOCK_WRITE_TIME half a second after HOST_START,
 # and what sync_rtc returns for that write when the lock answers at once.
-CLOCK_WRITE_OFFSET = 1793750707 - HOST_START - 0.5
-CLOCK_WRITE = RtcWrite(1793750707, ExchangeTimes(HOST_START + 0.5, HOST_START + 0.5))
+CLOCK_WRITE_OFFSET = CLOCK_WRITE_TIME - HOST_START - 0.5
+CLOCK_WRITE = RtcWrite(
+    CLOCK_WRITE_TIME, ExchangeTimes(HOST_START + 0.5, HOST_START + 0.5)
+)
 # A constructed SetRTC 0xBB reply.
-CLOCK_WRITE_RESPONSE = _with_checksum("bb1000000000000000000000000000000000")
+CLOCK_WRITE_RESPONSE = with_checksum("bb1000000000000000000000000000000000")
 
 
 @pytest.mark.asyncio
@@ -2172,7 +2165,7 @@ CLOCK_WRITE_RESPONSE = _with_checksum("bb1000000000000000000000000000000000")
             (StatusType.RTC,),
             [
                 # Constructed status push reporting UNLOCKED.
-                _with_checksum("bb0200000200000003000000000000000000"),
+                with_checksum("bb0200000200000003000000000000000000"),
                 RTC_FRAME,
             ],
             StatusReply(1793448000, AT_HOST_START),
@@ -2224,7 +2217,7 @@ CLOCK_WRITE_RESPONSE = _with_checksum("bb1000000000000000000000000000000000")
             {"offset": CLOCK_WRITE_OFFSET},
             [
                 # Constructed status push reporting UNLOCKED.
-                _with_checksum("bb0200000200000003000000000000000000"),
+                with_checksum("bb0200000200000003000000000000000000"),
                 LOCK_ACK,
                 CLOCK_WRITE_ACK,
             ],
@@ -2367,7 +2360,7 @@ async def test_a_status_poll_returns_the_host_times_of_its_answered_write(
         host_clock.now -= frame_before
         # Constructed status push reporting UNLOCKED.
         session._notify(
-            0, bytearray(_with_checksum("bb0200000200000003000000000000000000"))
+            0, bytearray(with_checksum("bb0200000200000003000000000000000000"))
         )
         host_clock.now += frame_before
     written_at: list[float] = []
@@ -2585,7 +2578,7 @@ async def test_sync_rtc_writes_at_its_moment_and_set_rtc_at_once(
                 at,
                 # Constructed status push reporting UNLOCKED.
                 lambda: session._notify(
-                    0, bytearray(_with_checksum("bb0200000200000003000000000000000000"))
+                    0, bytearray(with_checksum("bb0200000200000003000000000000000000"))
                 ),
             )
         )
@@ -2646,7 +2639,7 @@ async def test_sync_rtc_is_not_answered_by_a_frame_of_another_opcode() -> None:
     session.client.write_gatt_char = _answered_by(
         session,
         # Constructed status push reporting UNLOCKED.
-        _with_checksum("bb0200000200000003000000000000000000"),
+        with_checksum("bb0200000200000003000000000000000000"),
         LOCK_ACK,
     )
 
@@ -2662,7 +2655,7 @@ async def test_sync_rtc_is_not_answered_by_a_frame_of_another_opcode() -> None:
     ("method", "args"),
     [
         ("sync_rtc", {"offset": CLOCK_WRITE_OFFSET}),
-        ("set_rtc", (1793750707,)),
+        ("set_rtc", (CLOCK_WRITE_TIME,)),
     ],
 )
 @pytest.mark.usefixtures("host_clock")
@@ -2718,48 +2711,7 @@ async def test_a_clock_write_names_its_call_in_the_session_log(
             None,
             id="a-timestamp-to-sync-rtc",
         ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": "0.5"},
-            TypeError,
-            "Clock offset has type str, not int or float: '0.5'",
-            id="an-offset-that-is-a-str",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": None},
-            TypeError,
-            "Clock offset has type NoneType, not int or float: None",
-            id="an-offset-that-is-none",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": True},
-            TypeError,
-            "Clock offset has type bool, not int or float: True",
-            id="an-offset-that-is-a-bool",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": math.inf},
-            ValueError,
-            "Clock offset is not finite: inf",
-            id="an-infinite-offset",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": -math.inf},
-            ValueError,
-            "Clock offset is not finite: -inf",
-            id="a-negative-infinite-offset",
-        ),
-        pytest.param(
-            "sync_rtc",
-            {"offset": math.nan},
-            ValueError,
-            "Clock offset is not finite: nan",
-            id="a-nan-offset",
-        ),
+        *CLOCK_OFFSET_BAD_ARGUMENTS,
         pytest.param("set_rtc", (), TypeError, None, id="no-timestamp"),
         pytest.param(
             "set_rtc",
@@ -2814,13 +2766,7 @@ async def test_a_clock_write_names_its_call_in_the_session_log(
             ValueError,
             "Time zone payload is not 12 bytes: 13",
         ),
-        pytest.param(
-            "set_timezone_info",
-            ("abcdefghijkl",),
-            TypeError,
-            "Time zone payload has type str, not bytes or bytearray: 'abcdefghijkl'",
-            id="a-payload-that-is-a-str",
-        ),
+        *ZONE_PAYLOAD_BAD_ARGUMENTS,
     ],
 )
 @pytest.mark.usefixtures("host_clock")
