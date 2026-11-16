@@ -733,18 +733,18 @@ dev = ["argcomplete", "asynctest ; python_version < \"3.11\"", "attrs (>=23.1)",
 
 [[package]]
 name = "pytest-asyncio"
-version = "1.4.1"
+version = "1.5.0"
 description = "Pytest support for asyncio"
 optional = false
 python-versions = ">=3.10"
 groups = ["dev"]
 files = [
-    {file = "pytest_asyncio-1.4.1-py3-none-any.whl", hash = "sha256:507afa78ec77c6661164ef1a2368bc7820383fd1a14b2a7f813de8b5a92949cc"},
-    {file = "pytest_asyncio-1.4.1.tar.gz", hash = "sha256:e8266eb094e5ee9ffdb2068c9836f33e209ea77a970eb846933d416b5602669b"},
+    {file = "pytest_asyncio-1.5.0-py3-none-any.whl", hash = "sha256:557f255ee03cc84f84a8d5f438bc9c6e0f714bf86970ae743c7ecb5a38d7e07d"},
+    {file = "pytest_asyncio-1.5.0.tar.gz", hash = "sha256:92c8fa83ca419fd0d4bd6a34df6520dae435841d3733c319343249492adf37f7"},
 ]
 
 [package.dependencies]
-pytest = ">=8.4,<10"
+pytest = ">=8.4"
 typing-extensions = {version = ">=4.12", markers = "python_version < \"3.13\""}
 
 [package.extras]
@@ -1134,4 +1134,4 @@ all = ["winrt-Windows.Foundation.Collections[all] (>=3.2.1.0,<3.2.2.0)", "winrt-
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.16"
-content-hash = "e3b452557de037692b3a0482dc45006c498f96fe9e79893df3405ef37487ba05"
+content-hash = "4d5e417e28662700fe54d3f6fac69fbd2292165355022c6e33e9d8816d0835a0"
