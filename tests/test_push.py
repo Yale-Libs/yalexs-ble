@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -8582,6 +8583,7 @@ def _call(target: object, method: str, args: tuple[Any, ...] | dict[str, Any]) -
     [
         ("get_status", (0x0A,), "get_status 0x0A"),
         ("sync_rtc", (), "sync_rtc"),
+        ("set_rtc", (_CLOCK_TIME,), "set_rtc"),
         ("set_timezone_info", (_ZONE_PAYLOAD,), "set_timezone_info"),
     ],
 )
@@ -8649,6 +8651,7 @@ async def test_push_answers_without_lock_state_publish_no_state(
     ):
         assert (await push_lock.get_status(StatusType.RTC)).value == 1793448000
         await push_lock.sync_rtc()
+        await push_lock.set_rtc(_CLOCK_TIME)
         assert (
             await push_lock.set_timezone_info(_ZONE_PAYLOAD) == _ZONE_REPLY[0x04:0x10]
         )
@@ -8691,6 +8694,14 @@ async def test_push_answers_without_lock_state_publish_no_state(
                 _CLOCK_TIME, ExchangeTimes(_CLOCK_TIME - 0.25, _CLOCK_TIME - 0.25)
             ),
             id="clock-write-with-an-offset-during-a-cycle",
+        ),
+        pytest.param(
+            "set_rtc",
+            (_CLOCK_TIME,),
+            (Commands.SETRTC, _CLOCK_TIME_BYTE_4),
+            _CLOCK_WRITE_ACK,
+            RtcWrite(_CLOCK_TIME, ExchangeTimes(_HOST_TIME, _HOST_TIME)),
+            id="clock-write-of-a-timestamp-during-a-cycle",
         ),
         pytest.param(
             "set_timezone_info",
@@ -8757,19 +8768,39 @@ async def test_the_cycle_after_a_command_that_moves_no_motor_writes_no_command(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "reply_at",
+    ("method", "args", "reply_at", "second", "written_at"),
     [
-        pytest.param(1000.8, id="cooldown-past-the-second"),
+        # The cooldown ends past 1001, so the second is 1002.
         pytest.param(
+            "sync_rtc", {}, 1000.8, 1002, 1002.0, id="cooldown-past-the-second"
+        ),
+        # The cooldown ends less than RTC_SEND_LEAD before 1001.
+        pytest.param(
+            "sync_rtc",
+            {},
             1001.0 - RTC_SEND_LEAD / 2 - COOLDOWN_TIME,
+            1002,
+            1002.0,
             id="cooldown-within-the-lead-of-the-second",
+        ),
+        pytest.param(
+            "set_rtc",
+            {"timestamp": 1000},
+            1000.8,
+            1000,
+            1000.8 + COOLDOWN_TIME,
+            id="a-timestamp-when-the-cooldown-ends",
         ),
     ],
 )
-async def test_a_clock_write_behind_a_get_log_chooses_its_second_once_it_runs(
+async def test_a_clock_write_behind_a_get_log_runs_once_the_cooldown_ends(
+    method: str,
+    args: tuple[int, ...] | dict[str, int],
     reply_at: float,
+    second: int,
+    written_at: float,
 ) -> None:
-    """The second is chosen after the operation lock is free and the cooldown over."""
+    """sync_rtc chooses its second, and set_rtc writes, when the cooldown ends."""
     push_lock, lock, session, client = _keycode_real_session("aa:bb:cc:dd:ee:4c")
     session.enable_cooldown()
     session.cipher_encrypt = MagicMock(update=bytes)
@@ -8788,7 +8819,7 @@ async def test_a_clock_write_behind_a_get_log_chooses_its_second_once_it_runs(
         # An update cycle holds the operation lock through its drain, which ends on
         # the GetLogError reply.
         async with push_lock._operation_lock:
-            clock_write = asyncio.create_task(push_lock.sync_rtc())
+            clock_write = asyncio.create_task(_call(push_lock, method, args))
             await asyncio.sleep(0)
             clock[0] = reply_at
             session._notify(0, bytearray(_GET_LOG_ERROR))
@@ -8796,16 +8827,14 @@ async def test_a_clock_write_behind_a_get_log_chooses_its_second_once_it_runs(
 
     push_lock._running = False
 
-    # The cooldown ends past 1001, or less than RTC_SEND_LEAD before it, so the
-    # second is 1002.
-    ((written_at, frame),) = writes
-    assert written_at == pytest.approx(1002.0)
-    assert frame[0x04:0x08] == (1002).to_bytes(4, "little")
-    assert rtc_write.second == 1002
+    ((at, frame),) = writes
+    assert at == pytest.approx(written_at)
+    assert frame[0x04:0x08] == second.to_bytes(4, "little")
+    assert rtc_write.second == second
     assert (
         rtc_write.times.request_written,
         rtc_write.times.reply_received,
-    ) == pytest.approx((1002.0, 1002.0))
+    ) == pytest.approx((written_at, written_at))
 
 
 @pytest.mark.asyncio
@@ -8831,6 +8860,49 @@ async def test_a_clock_write_behind_a_get_log_chooses_its_second_once_it_runs(
             TypeError,
             None,
             id="a-timestamp-to-sync-rtc",
+        ),
+        pytest.param("set_rtc", (), TypeError, None, id="no-timestamp"),
+        pytest.param(
+            "set_rtc",
+            {"timestamp": _CLOCK_TIME, "offset": 0.5},
+            TypeError,
+            None,
+            id="an-offset-to-set-rtc",
+        ),
+        pytest.param(
+            "set_rtc",
+            (float(_CLOCK_TIME),),
+            TypeError,
+            "Clock timestamp has type float, not int",
+            id="a-float",
+        ),
+        pytest.param(
+            "set_rtc",
+            (datetime.fromtimestamp(_CLOCK_TIME, UTC),),
+            TypeError,
+            "Clock timestamp has type datetime, not int",
+            id="a-datetime",
+        ),
+        pytest.param(
+            "set_rtc",
+            {"timestamp": True},
+            TypeError,
+            "Clock timestamp has type bool, not int: True",
+            id="a-bool",
+        ),
+        pytest.param(
+            "set_rtc",
+            {"timestamp": -1},
+            ValueError,
+            "Clock time is not an unsigned four-byte value",
+            id="a-timestamp-below-zero",
+        ),
+        pytest.param(
+            "set_rtc",
+            (0x100000000,),
+            ValueError,
+            "Clock time is not an unsigned four-byte value",
+            id="a-timestamp-past-four-bytes",
         ),
         (
             "set_timezone_info",

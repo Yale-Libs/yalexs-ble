@@ -5,7 +5,7 @@ import bisect
 import logging
 import math
 import os
-from collections.abc import AsyncGenerator, Callable, Iterable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from time import time
 from typing import Any, TypeVar, cast
 
@@ -32,6 +32,7 @@ from .const import (
     BatteryState,
     Commands,
     DoorStatus,
+    ExchangeTimes,
     LockInfo,
     LockStateValue,
     LockStatus,
@@ -246,6 +247,16 @@ def validate_rtc_time(seconds: int) -> None:
             "Clock time is not an unsigned four-byte value "
             f"(0 to 0xFFFFFFFF): {seconds}"
         )
+
+
+def validate_rtc_timestamp(timestamp: int) -> None:
+    """Raise TypeError or ValueError for a timestamp set_rtc does not accept."""
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+        raise TypeError(
+            f"Clock timestamp has type {type(timestamp).__name__}, not int: "
+            f"{timestamp!r}"
+        )
+    validate_rtc_time(timestamp)
 
 
 def validate_timezone_info(payload: bytes) -> None:
@@ -1053,17 +1064,49 @@ class Lock:
             written = seconds
             _LOGGER.debug("%s: Setting the clock to %d", self.name, seconds)
 
-        response, times = await session.execute_timed(
+        times = await self._write_rtc(
             session.build_command(Commands.SETRTC),
             "sync_rtc",
-            _first_reply_matcher(Commands.SETRTC.value),
             prepare=fill_the_second_at_its_moment,
+        )
+        assert written is not None  # nosec
+        return RtcWrite(written, times)
+
+    @raise_if_not_connected
+    async def set_rtc(self, timestamp: int) -> RtcWrite:
+        """Set the lock's clock to timestamp, in seconds since 1970 UTC, as given.
+
+        Returns the second written and the times of the write; the lock applied the
+        write between request_written and reply_received. Raises TypeError or
+        ValueError for a bad timestamp before any frame is written, and TimeoutError
+        when the lock does not answer within the session's wait.
+        """
+        validate_rtc_timestamp(timestamp)
+        assert self.session is not None  # nosec
+        command = self.session.build_command(Commands.SETRTC)
+        command[0x04:0x08] = util._int_to_bytes(timestamp, 4)
+        _LOGGER.debug("%s: Setting the clock to %d", self.name, timestamp)
+        return RtcWrite(timestamp, await self._write_rtc(command, "set_rtc"))
+
+    async def _write_rtc(
+        self,
+        command: bytearray,
+        command_name: str,
+        *,
+        prepare: Callable[[bytearray], Awaitable[None]] | None = None,
+    ) -> ExchangeTimes:
+        """Send a SetRTC command and return the times of its write."""
+        assert self.session is not None  # nosec
+        response, times = await self.session.execute_timed(
+            command,
+            command_name,
+            _first_reply_matcher(Commands.SETRTC.value),
+            prepare=prepare,
         )
         _LOGGER.debug(
             "%s: The lock answered the clock write with %s", self.name, response.hex()
         )
-        assert written is not None  # nosec
-        return RtcWrite(written, times)
+        return times
 
     @raise_if_not_connected
     async def set_timezone_info(self, payload: bytes) -> bytes:

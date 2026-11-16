@@ -3,6 +3,7 @@ import contextlib
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1488,6 +1489,7 @@ async def test_keycode_operations_require_a_connection() -> None:
     [
         ("get_status", (0x0A,)),
         ("sync_rtc", ()),
+        ("set_rtc", (1003,)),
         ("set_timezone_info", (bytes(12),)),
     ],
 )
@@ -2499,26 +2501,67 @@ async def test_sync_rtc_writes_the_time_little_endian_at_bytes_4_to_7(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("start", "offset", "frames_at", "seconds", "written_at"),
+    ("start", "method", "args", "frames_at", "seconds", "written_at"),
     [
-        pytest.param(1000.3, 0.0, [], 1001, 1001.0, id="host-time"),
-        pytest.param(1000.3, -0.4, [], 1000, 1000.4, id="behind-the-host"),
-        pytest.param(1000.3, 2.5, [], 1003, 1000.5, id="ahead-of-the-host"),
+        pytest.param(1000.3, "sync_rtc", {}, [], 1001, 1001.0, id="host-time"),
         pytest.param(
-            1001.0 - RTC_SEND_LEAD / 2, 0.0, [], 1002, 1002.0, id="within-the-lead"
+            1000.3,
+            "sync_rtc",
+            {"offset": -0.4},
+            [],
+            1000,
+            1000.4,
+            id="behind-the-host",
         ),
         pytest.param(
-            1000.3, 0.0, [1000.5], 1001, 1001.0, id="a-frame-0.5-s-before-the-moment"
+            1000.3,
+            "sync_rtc",
+            {"offset": 2.5},
+            [],
+            1003,
+            1000.5,
+            id="ahead-of-the-host",
         ),
         pytest.param(
-            1000.3, 0.0, [1000.9], 1002, 1002.0, id="a-frame-0.1-s-before-the-moment"
+            1001.0 - RTC_SEND_LEAD / 2,
+            "sync_rtc",
+            {},
+            [],
+            1002,
+            1002.0,
+            id="within-the-lead",
+        ),
+        pytest.param(
+            1000.3,
+            "sync_rtc",
+            {},
+            [1000.5],
+            1001,
+            1001.0,
+            id="a-frame-0.5-s-before-the-moment",
+        ),
+        pytest.param(
+            1000.3,
+            "sync_rtc",
+            {},
+            [1000.9],
+            1002,
+            1002.0,
+            id="a-frame-0.1-s-before-the-moment",
+        ),
+        pytest.param(
+            1000.3, "set_rtc", {"timestamp": 0}, [], 0, 1000.3, id="a-timestamp-of-zero"
+        ),
+        pytest.param(
+            1000.3, "set_rtc", (1003,), [], 1003, 1000.3, id="a-timestamp-ahead"
         ),
     ],
 )
-async def test_sync_rtc_writes_the_second_at_the_host_time_less_the_offset(
+async def test_sync_rtc_writes_at_its_moment_and_set_rtc_at_once(
     host_clock: HostClock,
     start: float,
-    offset: float,
+    method: str,
+    args: tuple[int, ...] | dict[str, float],
     frames_at: list[float],
     seconds: int,
     written_at: float,
@@ -2546,7 +2589,7 @@ async def test_sync_rtc_writes_the_second_at_the_host_time_less_the_offset(
 
     session.client.write_gatt_char = write_gatt_char
 
-    rtc_write = await lock.sync_rtc(offset=offset)
+    rtc_write = await _call(lock, method, args)
 
     ((at, frame),) = writes
     assert at == pytest.approx(written_at)
@@ -2605,18 +2648,27 @@ async def test_sync_rtc_is_not_answered_by_a_frame_of_another_opcode() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("sync_rtc", {"offset": CLOCK_WRITE_OFFSET}),
+        ("set_rtc", (1793750707,)),
+    ],
+)
 @pytest.mark.usefixtures("host_clock")
-async def test_sync_rtc_names_its_command_in_the_session_log(
+async def test_a_clock_write_names_its_call_in_the_session_log(
+    method: str,
+    args: tuple[int, ...] | dict[str, float],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The session's debug line for the SetRTC write names sync_rtc."""
+    """The session's debug line for the SetRTC write names the call."""
     lock, session = _connected_lock()
     session.client.write_gatt_char = _answered_by(session, CLOCK_WRITE_ACK)
 
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
-        await lock.sync_rtc(offset=CLOCK_WRITE_OFFSET)
+        await _call(lock, method, args)
 
-    assert "Encrypted command sync_rtc: " in caplog.text
+    assert f"Encrypted command {method}: " in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2655,6 +2707,48 @@ async def test_sync_rtc_names_its_command_in_the_session_log(
             TypeError,
             None,
             id="a-timestamp-to-sync-rtc",
+        ),
+        pytest.param("set_rtc", (), TypeError, None, id="no-timestamp"),
+        pytest.param(
+            "set_rtc",
+            {"timestamp": 1793750707, "offset": 0.5},
+            TypeError,
+            None,
+            id="an-offset-to-set-rtc",
+        ),
+        pytest.param(
+            "set_rtc",
+            (1793750707.0,),
+            TypeError,
+            "Clock timestamp has type float, not int: 1793750707.0",
+            id="a-float",
+        ),
+        pytest.param(
+            "set_rtc",
+            (datetime.fromtimestamp(1793750707, UTC),),
+            TypeError,
+            "Clock timestamp has type datetime, not int",
+            id="a-datetime",
+        ),
+        pytest.param(
+            "set_rtc",
+            {"timestamp": True},
+            TypeError,
+            "Clock timestamp has type bool, not int: True",
+            id="a-bool",
+        ),
+        # A timestamp just outside four unsigned bytes.
+        (
+            "set_rtc",
+            {"timestamp": -1},
+            ValueError,
+            r"four-byte value \(0 to 0xFFFFFFFF\): -1$",
+        ),
+        (
+            "set_rtc",
+            (0x100000000,),
+            ValueError,
+            r"four-byte value \(0 to 0xFFFFFFFF\): 4294967296$",
         ),
         (
             "set_timezone_info",

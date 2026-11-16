@@ -48,6 +48,7 @@ from .lock import (
     ActivityLogOverrunError,
     Lock,
     validate_keycode_slot,
+    validate_rtc_timestamp,
     validate_status_type,
     validate_timezone_info,
 )
@@ -1375,6 +1376,17 @@ class PushLock:
         return await self._run_on_lock(
             "sync_rtc", lambda lock: lock.sync_rtc(offset=offset)
         )
+
+    async def set_rtc(self, timestamp: int) -> RtcWrite:
+        """Set the lock's clock to timestamp, in seconds since 1970 UTC, as given.
+
+        Returns the second written and the times of the write. Raises TypeError for
+        a timestamp that is not an int and ValueError for one outside four unsigned
+        bytes, before any connection, RuntimeError when not running, and
+        TimeoutError when the lock does not answer, with the connection kept.
+        """
+        validate_rtc_timestamp(timestamp)
+        return await self._run_on_lock("set_rtc", lambda lock: lock.set_rtc(timestamp))
 
     async def set_timezone_info(self, payload: bytes) -> bytes:
         """Send the lock's time zone and return the lock's reply.
