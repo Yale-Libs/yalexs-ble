@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import struct
 import time
 from collections.abc import Callable, Iterator
@@ -8860,6 +8861,48 @@ async def test_a_clock_write_behind_a_get_log_runs_once_the_cooldown_ends(
             TypeError,
             None,
             id="a-timestamp-to-sync-rtc",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": "0.5"},
+            TypeError,
+            "Clock offset has type str, not int or float: '0.5'",
+            id="an-offset-that-is-a-str",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": None},
+            TypeError,
+            "Clock offset has type NoneType, not int or float: None",
+            id="an-offset-that-is-none",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": True},
+            TypeError,
+            "Clock offset has type bool, not int or float: True",
+            id="an-offset-that-is-a-bool",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": math.inf},
+            ValueError,
+            "Clock offset is not finite: inf",
+            id="an-infinite-offset",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": -math.inf},
+            ValueError,
+            "Clock offset is not finite: -inf",
+            id="a-negative-infinite-offset",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": math.nan},
+            ValueError,
+            "Clock offset is not finite: nan",
+            id="a-nan-offset",
         ),
         pytest.param("set_rtc", (), TypeError, None, id="no-timestamp"),
         pytest.param(

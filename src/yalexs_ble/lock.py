@@ -259,6 +259,17 @@ def validate_rtc_timestamp(timestamp: int) -> None:
     validate_rtc_time(timestamp)
 
 
+def validate_rtc_offset(offset: float) -> None:
+    """Raise TypeError or ValueError for an offset sync_rtc does not accept."""
+    if isinstance(offset, bool) or not isinstance(offset, int | float):
+        raise TypeError(
+            f"Clock offset has type {type(offset).__name__}, not int or float: "
+            f"{offset!r}"
+        )
+    if not math.isfinite(offset):
+        raise ValueError(f"Clock offset is not finite: {offset}")
+
+
 def validate_timezone_info(payload: bytes) -> None:
     """Raise ValueError for a time zone payload that is not 12 bytes."""
     if len(payload) != 12:
@@ -1038,10 +1049,12 @@ class Lock:
         The lock takes whole seconds, so the write is sent at the moment that gives
         the fraction. Returns the second written and the times of the write; the
         lock applied the write between request_written and reply_received. Raises
-        ValueError for a second that does not fit four unsigned bytes, before any
-        frame is written, and TimeoutError when the lock does not answer within the
-        session's wait.
+        TypeError for an offset that is not an int or a float, and ValueError for
+        one that is not finite or gives a second that does not fit four unsigned
+        bytes, before any frame is written, and TimeoutError when the lock does not
+        answer within the session's wait.
         """
+        validate_rtc_offset(offset)
         assert self.session is not None  # nosec
         session = self.session
         written: int | None = None

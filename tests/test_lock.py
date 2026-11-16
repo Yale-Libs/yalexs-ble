@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -2543,6 +2544,15 @@ async def test_sync_rtc_writes_the_time_little_endian_at_bytes_4_to_7(
             id="ahead-of-the-host",
         ),
         pytest.param(
+            1000.3,
+            "sync_rtc",
+            {"offset": 2},
+            [],
+            1003,
+            1001.0,
+            id="an-int-offset",
+        ),
+        pytest.param(
             1001.0 - RTC_SEND_LEAD / 2,
             "sync_rtc",
             {},
@@ -2727,6 +2737,48 @@ async def test_a_clock_write_names_its_call_in_the_session_log(
             TypeError,
             None,
             id="a-timestamp-to-sync-rtc",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": "0.5"},
+            TypeError,
+            "Clock offset has type str, not int or float: '0.5'",
+            id="an-offset-that-is-a-str",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": None},
+            TypeError,
+            "Clock offset has type NoneType, not int or float: None",
+            id="an-offset-that-is-none",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": True},
+            TypeError,
+            "Clock offset has type bool, not int or float: True",
+            id="an-offset-that-is-a-bool",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": math.inf},
+            ValueError,
+            "Clock offset is not finite: inf",
+            id="an-infinite-offset",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": -math.inf},
+            ValueError,
+            "Clock offset is not finite: -inf",
+            id="a-negative-infinite-offset",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": math.nan},
+            ValueError,
+            "Clock offset is not finite: nan",
+            id="a-nan-offset",
         ),
         pytest.param("set_rtc", (), TypeError, None, id="no-timestamp"),
         pytest.param(
