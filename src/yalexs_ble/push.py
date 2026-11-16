@@ -41,6 +41,7 @@ from .const import (
     LockState,
     LockStateValue,
     LockStatus,
+    RtcWrite,
     StatusReply,
 )
 from .lock import (
@@ -1360,6 +1361,18 @@ class PushLock:
         return await self._run_on_lock(
             f"get_status 0x{status_type:02X}",
             lambda lock: lock.get_status(status_type),
+        )
+
+    async def sync_rtc(self, *, offset: float = 0.0) -> RtcWrite:
+        """Set the lock's clock to the host's time plus offset seconds.
+
+        Returns the second written and the times of the write. Raises RuntimeError
+        when not running, ValueError when the second to write is outside four
+        unsigned bytes, with no SetRTC frame written, and TimeoutError when the lock
+        does not answer, with the connection kept.
+        """
+        return await self._run_on_lock(
+            "sync_rtc", lambda lock: lock.sync_rtc(offset=offset)
         )
 
     @operation_lock

@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,6 +31,7 @@ from yalexs_ble.const import (
     LockStatus,
     OpCode,
     OperationError,
+    RtcWrite,
     SettingType,
     StatusReply,
     StatusType,
@@ -38,9 +39,11 @@ from yalexs_ble.const import (
 from yalexs_ble.lock import (
     AA_BATTERY_VOLTAGE_TO_PERCENTAGE,
     MAX_ACTIVITY_RECORDS,
+    RTC_SEND_LEAD,
     UNLATCH_OPERATION_BYTE,
     Lock,
     _ack_matcher,
+    _first_reply_matcher,
     _keycode_response_matcher,
     _operation_response_matcher,
     _poll_response_matcher,
@@ -660,6 +663,21 @@ def test_settings_response_matcher_takes_value_frame_not_ack() -> None:
     assert not write_matcher(write_response[:4])  # truncated below the setting id
 
 
+def test_first_reply_matcher_takes_the_aa_or_bb_frame_of_its_opcode() -> None:
+    """The matcher takes an 0xAA or 0xBB frame with its opcode and no other."""
+    matches = _first_reply_matcher(Commands.SETRTC.value)
+    # Constructed frames; the matcher reads bytes 0 and 1 only.
+    status_push = bytes.fromhex("bb0200000200000003000000000000000000")
+    command = bytes.fromhex("ee1000000000000000000000000000000200")
+
+    assert matches(bytes.fromhex("aa1000000000000000000000000000000200"))
+    assert matches(bytes.fromhex("bb1000000000000000000000000000000000"))
+    assert not matches(LOCK_ACK)
+    assert not matches(status_push)
+    assert not matches(command)
+    assert not matches(bytes.fromhex("aa"))  # truncated below byte 1
+
+
 _CHAR_DATA: dict[str, bytes] = {
     MODEL_NUMBER_CHARACTERISTIC: b"ASL-03",
     SERIAL_NUMBER_CHARACTERISTIC: b"12345",
@@ -1029,19 +1047,26 @@ class HostClock:
     """The host clock of a test on host_clock."""
 
     now: float = HOST_START
+    # Calls a wait makes at their host time, in time order.
+    due: list[tuple[float, Callable[[], None]]] = field(default_factory=list)
 
     def advance(self, delay: float) -> None:
         """Move the clock on by delay seconds, none for a delay below zero."""
-        self.now += max(delay, 0.0)
+        end = self.now + max(delay, 0.0)
+        while self.due and self.due[0][0] <= end:
+            self.now, call = self.due.pop(0)
+            call()
+        self.now = end
 
 
 @pytest.fixture
 def host_clock(monkeypatch: pytest.MonkeyPatch) -> HostClock:
-    """Run the session's host and monotonic clocks from one HostClock.
+    """Run the clocks that lock.py and session.py read from one HostClock.
 
     asyncio.sleep advances the clock by its delay without waiting.
     """
     clock = HostClock()
+    monkeypatch.setattr("yalexs_ble.lock.time", lambda: clock.now)
     monkeypatch.setattr("yalexs_ble.session.time", lambda: clock.now)
     monkeypatch.setattr(
         "yalexs_ble.session.monotonic", lambda: clock.now - MONOTONIC_BEHIND
@@ -1462,9 +1487,10 @@ async def test_keycode_operations_require_a_connection() -> None:
     ("method", "args"),
     [
         ("get_status", (0x0A,)),
+        ("sync_rtc", ()),
     ],
 )
-async def test_status_poll_requires_a_connection(
+async def test_lock_commands_require_a_connection(
     method: str, args: tuple[int, ...]
 ) -> None:
     lock = _make_lock()
@@ -1974,6 +2000,7 @@ async def test_force_unlatch_does_not_retry_a_raising_write() -> None:
     [
         ("ExchangeTimes", ExchangeTimes),
         ("OperationFailedError", OperationFailedError),
+        ("RtcWrite", RtcWrite),
         ("StatusReply", StatusReply),
         ("StatusType", StatusType),
     ],
@@ -2097,6 +2124,23 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
     return AsyncMock(side_effect=deliver)
 
 
+def _call(target: object, method: str, args: tuple[Any, ...] | dict[str, Any]) -> Any:
+    """Call a method with a tuple as positional or a dict as keyword arguments."""
+    if isinstance(args, dict):
+        return getattr(target, method)(**args)
+    return getattr(target, method)(*args)
+
+
+# A SetRTC acknowledgment captured on 2026-11-04 from a Yale lock, answering 1793750707.
+CLOCK_WRITE_ACK = bytes.fromhex("aa1000c7b376ea6a00000000000000000200")
+# The offset that makes sync_rtc write 1793750707 half a second after HOST_START,
+# and what sync_rtc returns for that write when the lock answers at once.
+CLOCK_WRITE_OFFSET = 1793750707 - HOST_START - 0.5
+CLOCK_WRITE = RtcWrite(1793750707, ExchangeTimes(HOST_START + 0.5, HOST_START + 0.5))
+# A constructed SetRTC 0xBB reply.
+CLOCK_WRITE_RESPONSE = _with_checksum("bb1000000000000000000000000000000000")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "args", "frames", "value", "states"),
@@ -2159,22 +2203,51 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
             [],
             id="status-highest-value",
         ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": CLOCK_WRITE_OFFSET},
+            [CLOCK_WRITE_ACK],
+            CLOCK_WRITE,
+            [],
+            id="clock-aa-frame",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": CLOCK_WRITE_OFFSET},
+            [CLOCK_WRITE_RESPONSE],
+            CLOCK_WRITE,
+            [],
+            id="clock-bb-frame",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": CLOCK_WRITE_OFFSET},
+            [
+                # Constructed status push reporting UNLOCKED.
+                _with_checksum("bb0200000200000003000000000000000000"),
+                LOCK_ACK,
+                CLOCK_WRITE_ACK,
+            ],
+            CLOCK_WRITE,
+            [[LockStatus.UNLOCKED]],
+            id="clock-status-push-and-another-ack-first",
+        ),
     ],
 )
 @pytest.mark.usefixtures("host_clock")
-async def test_a_status_poll_completes_on_its_own_bb_frame(
+async def test_a_command_that_moves_no_motor_completes_on_its_own_reply(
     method: str,
-    args: tuple[int, ...],
+    args: tuple[object, ...] | dict[str, float],
     frames: list[bytes],
     value: object,
     states: list[list[LockStateValue]],
 ) -> None:
-    """The poll returns the value of the 0xBB frame with its opcode and status type."""
+    """The command completes on its own reply and not on a frame of another command."""
     received: list[list[LockStateValue]] = []
     lock, session = _connected_lock(lambda s: received.append(list(s)))
     session.client.write_gatt_char = _answered_by(session, *frames)
 
-    assert await getattr(lock, method)(*args) == value
+    assert await _call(lock, method, args) == value
     assert received == states
 
 
@@ -2360,20 +2433,182 @@ async def test_a_late_status_answer_completes_the_next_status_poll_of_its_type(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("method", "args", "match"),
+    ("seconds", "time_bytes"),
     [
-        ("get_status", (-1,), "Status type is not an unsigned one-byte value"),
-        ("get_status", (0x100,), "Status type is not an unsigned one-byte value"),
+        pytest.param(0, "00000000", id="lowest"),
+        pytest.param(1, "01000000", id="one"),
+        pytest.param(1791043200, "8026c16a", id="little-endian"),
+        pytest.param(0xFFFFFFFF, "ffffffff", id="highest"),
     ],
 )
-async def test_status_poll_rejects_a_status_type_the_frame_cannot_hold(
-    method: str, args: tuple[int, ...], match: str
+@pytest.mark.usefixtures("host_clock")
+async def test_sync_rtc_writes_the_time_little_endian_at_bytes_4_to_7(
+    seconds: int, time_bytes: str
 ) -> None:
-    """An argument outside its field raises ValueError and nothing is written."""
+    """The SetRTC frame holds the time at bytes 4 to 7 and zero from byte 8 to 15."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = _answered_by(session, CLOCK_WRITE_ACK)
+
+    await lock.sync_rtc(offset=seconds - HOST_START - 0.5)
+
+    (written,) = (
+        call.args[1] for call in session.client.write_gatt_char.await_args_list
+    )
+    assert written[0x00] == 0xEE
+    assert written[0x01] == Commands.SETRTC.value
+    assert written[0x04:0x08] == bytes.fromhex(time_bytes)
+    assert written[0x08:0x10] == bytes(8)
+    assert written[0x10] == 0x02
+    assert len(written) == RESPONSE_FRAME_LEN
+    assert _simple_checksum(written) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "offset", "frames_at", "seconds", "written_at"),
+    [
+        pytest.param(1000.3, 0.0, [], 1001, 1001.0, id="host-time"),
+        pytest.param(1000.3, -0.4, [], 1000, 1000.4, id="behind-the-host"),
+        pytest.param(1000.3, 2.5, [], 1003, 1000.5, id="ahead-of-the-host"),
+        pytest.param(
+            1001.0 - RTC_SEND_LEAD / 2, 0.0, [], 1002, 1002.0, id="within-the-lead"
+        ),
+        pytest.param(
+            1000.3, 0.0, [1000.5], 1001, 1001.0, id="a-frame-0.5-s-before-the-moment"
+        ),
+        pytest.param(
+            1000.3, 0.0, [1000.9], 1002, 1002.0, id="a-frame-0.1-s-before-the-moment"
+        ),
+    ],
+)
+async def test_sync_rtc_writes_the_second_at_the_host_time_less_the_offset(
+    host_clock: HostClock,
+    start: float,
+    offset: float,
+    frames_at: list[float],
+    seconds: int,
+    written_at: float,
+) -> None:
+    """A frame that leaves the cooldown running at the moment moves it a second."""
+    lock, session = _connected_lock()
+    session.enable_cooldown()
+    host_clock.now = start
+    for at in frames_at:
+        host_clock.due.append(
+            (
+                at,
+                # Constructed status push reporting UNLOCKED.
+                lambda: session._notify(
+                    0, bytearray(_with_checksum("bb0200000200000003000000000000000000"))
+                ),
+            )
+        )
+    writes: list[tuple[float, bytes]] = []
+
+    async def write_gatt_char(_char: object, frame: bytes, _response: bool) -> None:
+        writes.append((host_clock.now, bytes(frame)))
+        host_clock.advance(0.35)
+        session._notify(0, bytearray(CLOCK_WRITE_ACK))
+
+    session.client.write_gatt_char = write_gatt_char
+
+    rtc_write = await lock.sync_rtc(offset=offset)
+
+    ((at, frame),) = writes
+    assert at == pytest.approx(written_at)
+    assert frame[0x04:0x08] == seconds.to_bytes(4, "little")
+    assert rtc_write.second == seconds
+    assert (
+        rtc_write.times.request_written,
+        rtc_write.times.reply_received,
+    ) == pytest.approx((written_at, written_at + 0.35))
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("host_clock")
+async def test_sync_rtc_is_not_answered_by_a_frame_of_another_opcode() -> None:
+    """A status push or another command's acknowledgment does not answer SetRTC."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = _answered_by(
+        session,
+        # Constructed status push reporting UNLOCKED.
+        _with_checksum("bb0200000200000003000000000000000000"),
+        LOCK_ACK,
+    )
+
+    with (
+        patch("yalexs_ble.util.asyncio_timeout", lambda _: asyncio.timeout(0.01)),
+        pytest.raises(TimeoutError),
+    ):
+        await lock.sync_rtc()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("host_clock")
+async def test_sync_rtc_names_its_command_in_the_session_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The session's debug line for the SetRTC write names sync_rtc."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = _answered_by(session, CLOCK_WRITE_ACK)
+
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
+        await lock.sync_rtc(offset=CLOCK_WRITE_OFFSET)
+
+    assert "Encrypted command sync_rtc: " in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args", "error", "match"),
+    [
+        (
+            "get_status",
+            (-1,),
+            ValueError,
+            "Status type is not an unsigned one-byte value",
+        ),
+        (
+            "get_status",
+            (0x100,),
+            ValueError,
+            "Status type is not an unsigned one-byte value",
+        ),
+        # An offset that puts the second to write just outside four unsigned bytes.
+        (
+            "sync_rtc",
+            {"offset": -HOST_START - 1.5},
+            ValueError,
+            r"four-byte value \(0 to 0xFFFFFFFF\): -1$",
+        ),
+        (
+            "sync_rtc",
+            {"offset": 0x100000000 - HOST_START - 0.5},
+            ValueError,
+            r"four-byte value \(0 to 0xFFFFFFFF\): 4294967296$",
+        ),
+        pytest.param("sync_rtc", (0.5,), TypeError, None, id="an-offset-by-position"),
+        pytest.param(
+            "sync_rtc",
+            {"timestamp": 1793750707},
+            TypeError,
+            None,
+            id="a-timestamp-to-sync-rtc",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("host_clock")
+async def test_commands_refuse_a_bad_argument_and_write_nothing(
+    method: str,
+    args: tuple[object, ...] | dict[str, object],
+    error: type[Exception],
+    match: str | None,
+) -> None:
+    """A bad argument raises and nothing is written."""
     lock, session = _connected_lock()
     session.client.write_gatt_char = AsyncMock()
 
-    with pytest.raises(ValueError, match=match):
-        await getattr(lock, method)(*args)
+    with pytest.raises(error, match=match):
+        await _call(lock, method, args)
 
     session.client.write_gatt_char.assert_not_awaited()

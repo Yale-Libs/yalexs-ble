@@ -34,11 +34,12 @@ from yalexs_ble.const import (
     LockState,
     LockStatus,
     OperationError,
+    RtcWrite,
     SettingType,
     StatusReply,
     StatusType,
 )
-from yalexs_ble.lock import ActivityLogOverrunError, Lock
+from yalexs_ble.lock import RTC_SEND_LEAD, ActivityLogOverrunError, Lock
 from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
     _LOCK_OPERATION,
@@ -75,6 +76,7 @@ from yalexs_ble.push import (
     retry_bluetooth_connection_error,
 )
 from yalexs_ble.session import (
+    COOLDOWN_TIME,
     AuthError,
     DisconnectedError,
     KeycodeError,
@@ -6142,10 +6144,22 @@ def _patched_clock() -> Iterator[list[float]]:
 
 
 @contextmanager
-def _patched_host_time(now: float) -> Iterator[None]:
-    """Hold the host clock the session reads at now."""
-    with patch("yalexs_ble.session.time", lambda: now):
-        yield
+def _patched_host_clock(start: float) -> Iterator[list[float]]:
+    """Patch the lock's and session's clocks to one cell, which a wait moves on."""
+    clock = [start]
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay: float) -> None:
+        clock[0] += max(delay, 0.0)
+        await real_sleep(0)
+
+    with (
+        patch("yalexs_ble.lock.time", lambda: clock[0]),
+        patch("yalexs_ble.session.time", lambda: clock[0]),
+        patch("yalexs_ble.session.monotonic", lambda: clock[0]),
+        patch("yalexs_ble.session.asyncio.sleep", sleep),
+    ):
+        yield clock
 
 
 def _lock_on_a_real_session(push_lock: PushLock) -> tuple[Lock, Session, MagicMock]:
@@ -8517,8 +8531,15 @@ _STATUS_ANSWERS = {
 }
 
 
-# The host time _patched_host_time holds for the commands below.
-_HOST_TIME = 1793750706.5
+# A SetRTC acknowledgment captured on 2026-11-04 from a Yale lock, answering
+# _CLOCK_TIME.
+_CLOCK_WRITE_ACK = bytes.fromhex("aa1000c7b376ea6a00000000000000000200")
+# The time _CLOCK_WRITE_ACK holds, and byte 4 of the SetRTC frame that writes it.
+_CLOCK_TIME = 1793750707
+_CLOCK_TIME_BYTE_4 = _CLOCK_TIME & 0xFF
+# A host time for _patched_host_clock to start at, from which a clock write at host
+# time writes _CLOCK_TIME.
+_HOST_TIME = _CLOCK_TIME - 0.5
 
 
 def _record_and_answer(
@@ -8539,20 +8560,28 @@ def _record_and_answer(
     return written
 
 
+def _call(target: object, method: str, args: tuple[Any, ...] | dict[str, Any]) -> Any:
+    """Call a method with a tuple as positional or a dict as keyword arguments."""
+    if isinstance(args, dict):
+        return getattr(target, method)(**args)
+    return getattr(target, method)(*args)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "args", "name"),
     [
         ("get_status", (0x0A,), "get_status 0x0A"),
+        ("sync_rtc", (), "sync_rtc"),
     ],
 )
-async def test_push_status_poll_warns_once_on_no_answer(
+async def test_push_commands_that_move_no_motor_warn_once_on_no_answer(
     method: str,
     args: tuple[int, ...],
     name: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """One warning names the command and status type and says it was not answered."""
+    """One warning names the command and says it was not answered."""
     push_lock, lock, _session, client = _keycode_real_session("aa:bb:cc:dd:ee:37")
     client.write_gatt_char = AsyncMock()
 
@@ -8560,6 +8589,7 @@ async def test_push_status_poll_warns_once_on_no_answer(
         caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
         patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.01)),
+        _patched_host_clock(_HOST_TIME),
         pytest.raises(TimeoutError) as raised,
     ):
         await getattr(push_lock, method)(*args)
@@ -8571,10 +8601,10 @@ async def test_push_status_poll_warns_once_on_no_answer(
 
 
 @pytest.mark.asyncio
-async def test_push_undecoded_status_answers_publish_no_state(
+async def test_push_answers_without_lock_state_publish_no_state(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An undecoded status answer publishes nothing and keeps lock_state."""
+    """An answer without a lock state publishes nothing and keeps lock_state."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
     lock, session, client = _lock_on_a_real_session(push_lock)
     before = LockState(
@@ -8597,14 +8627,17 @@ async def test_push_undecoded_status_answers_publish_no_state(
                 StatusType.RTC.value,
                 (1793448000).to_bytes(4, "little"),
             ),
+            (Commands.SETRTC.value, _CLOCK_TIME_BYTE_4): _CLOCK_WRITE_ACK,
         },
     )
 
     with (
         caplog.at_level(logging.INFO, logger="yalexs_ble.lock"),
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        _patched_host_clock(_HOST_TIME),
     ):
         assert (await push_lock.get_status(StatusType.RTC)).value == 1793448000
+        await push_lock.sync_rtc()
 
     assert published == []
     assert push_lock.lock_state == before
@@ -8613,32 +8646,52 @@ async def test_push_undecoded_status_answers_publish_no_state(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("method", "args", "opcode", "answer", "returned"),
+    ("method", "args", "sent", "answer", "returned"),
     [
         pytest.param(
             "get_status",
             (StatusType.RTC.value,),
-            Commands.GETSTATUS,
-            1793448000,
+            (Commands.GETSTATUS, StatusType.RTC.value),
+            _answer_frame(
+                Commands.GETSTATUS.value,
+                StatusType.RTC.value,
+                (1793448000).to_bytes(4, "little"),
+            ),
             StatusReply(1793448000, ExchangeTimes(_HOST_TIME, _HOST_TIME)),
             id="status-poll-during-a-cycle",
         ),
+        pytest.param(
+            "sync_rtc",
+            (),
+            (Commands.SETRTC, _CLOCK_TIME_BYTE_4),
+            _CLOCK_WRITE_ACK,
+            RtcWrite(_CLOCK_TIME, ExchangeTimes(_CLOCK_TIME, _CLOCK_TIME)),
+            id="clock-write-during-a-cycle",
+        ),
+        pytest.param(
+            "sync_rtc",
+            {"offset": 0.25},
+            (Commands.SETRTC, _CLOCK_TIME_BYTE_4),
+            _CLOCK_WRITE_ACK,
+            RtcWrite(
+                _CLOCK_TIME, ExchangeTimes(_CLOCK_TIME - 0.25, _CLOCK_TIME - 0.25)
+            ),
+            id="clock-write-with-an-offset-during-a-cycle",
+        ),
     ],
 )
-async def test_the_cycle_after_a_status_poll_writes_no_command(
+async def test_the_cycle_after_a_command_that_moves_no_motor_writes_no_command(
     method: str,
-    args: tuple[int, ...],
-    opcode: Commands,
-    answer: int,
+    args: tuple[object, ...] | dict[str, object],
+    sent: tuple[Commands, int],
+    answer: bytes,
     returned: object,
 ) -> None:
-    """The update cycle that follows a get_status writes no command."""
+    """The update cycle that follows a command that moves no motor writes no command."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3f")
     lock, session, client = _lock_on_a_real_session(push_lock)
     answers = dict(_STATUS_ANSWERS)
-    answers[(opcode.value, args[0])] = _answer_frame(
-        opcode.value, args[0], answer.to_bytes(4, "little")
-    )
+    answers[(sent[0].value, sent[1])] = answer
     written = _record_and_answer(session, client, answers)
     published: list[LockState] = []
     cycle_connecting = asyncio.Event()
@@ -8652,14 +8705,14 @@ async def test_the_cycle_after_a_status_poll_writes_no_command(
     with (
         patch.object(push_lock, "_ensure_connected", ensure_connected),
         patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.05)),
-        _patched_host_time(_HOST_TIME),
+        _patched_host_clock(_HOST_TIME),
     ):
         # The first cycle polls the lock status, so the cycle under test has a reading.
         cycle = asyncio.create_task(push_lock._update())
         await cycle_connecting.wait()
         # The command queues on the operation lock the first cycle holds, so a flag
         # set before the command would be cleared by that cycle's poll.
-        command = asyncio.create_task(getattr(push_lock, method)(*args))
+        command = asyncio.create_task(_call(push_lock, method, args))
         await asyncio.sleep(0)
         cycle_released.set()
         await cycle
@@ -8674,31 +8727,103 @@ async def test_the_cycle_after_a_status_poll_writes_no_command(
         (Commands.GETSTATUS, StatusType.DOOR_ONLY.value),
         (Commands.READSETTING, SettingType.AUTOLOCK.value),
         (Commands.GETSTATUS, StatusType.LOCK_ONLY.value),
-        (opcode, args[0]),
+        sent,
     ]
-    # The cycle under test publishes its state on completion.
+    # The cycle under test publishes its state on completion, in every row.
     assert [state.lock for state in published] == [LockStatus.LOCKED]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("name", "args", "match"),
+    "reply_at",
     [
-        ("get_status", (0x100,), "Status type is not an unsigned one-byte value"),
-        ("get_status", (-1,), "Status type is not an unsigned one-byte value"),
+        pytest.param(1000.8, id="cooldown-past-the-second"),
+        pytest.param(
+            1001.0 - RTC_SEND_LEAD / 2 - COOLDOWN_TIME,
+            id="cooldown-within-the-lead-of-the-second",
+        ),
     ],
 )
-async def test_push_status_poll_refuses_a_bad_argument(
-    name: str,
-    args: tuple[int, ...],
-    match: str,
+async def test_a_clock_write_behind_a_get_log_chooses_its_second_once_it_runs(
+    reply_at: float,
 ) -> None:
-    """A bad argument raises ValueError without taking the operation lock."""
+    """The second is chosen after the operation lock is free and the cooldown over."""
+    push_lock, lock, session, client = _keycode_real_session("aa:bb:cc:dd:ee:4c")
+    session.enable_cooldown()
+    session.cipher_encrypt = MagicMock(update=bytes)
+    writes: list[tuple[float, bytes]] = []
+
+    with (
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        _patched_host_clock(1000.3) as clock,
+    ):
+
+        async def write_gatt_char(_char: Any, frame: bytes, _response: bool) -> None:
+            writes.append((clock[0], bytes(frame)))
+            session._notify(0, bytearray(_CLOCK_WRITE_ACK))
+
+        client.write_gatt_char = write_gatt_char
+        # An update cycle holds the operation lock through its drain, which ends on
+        # the GetLogError reply.
+        async with push_lock._operation_lock:
+            clock_write = asyncio.create_task(push_lock.sync_rtc())
+            await asyncio.sleep(0)
+            clock[0] = reply_at
+            session._notify(0, bytearray(_GET_LOG_ERROR))
+        rtc_write = await clock_write
+
+    push_lock._running = False
+
+    # The cooldown ends past 1001, or less than RTC_SEND_LEAD before it, so the
+    # second is 1002.
+    ((written_at, frame),) = writes
+    assert written_at == pytest.approx(1002.0)
+    assert frame[0x04:0x08] == (1002).to_bytes(4, "little")
+    assert rtc_write.second == 1002
+    assert (
+        rtc_write.times.request_written,
+        rtc_write.times.reply_received,
+    ) == pytest.approx((1002.0, 1002.0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "args", "error", "match"),
+    [
+        (
+            "get_status",
+            (0x100,),
+            ValueError,
+            "Status type is not an unsigned one-byte value",
+        ),
+        (
+            "get_status",
+            (-1,),
+            ValueError,
+            "Status type is not an unsigned one-byte value",
+        ),
+        pytest.param("sync_rtc", (0.5,), TypeError, None, id="an-offset-by-position"),
+        pytest.param(
+            "sync_rtc",
+            {"timestamp": _CLOCK_TIME},
+            TypeError,
+            None,
+            id="a-timestamp-to-sync-rtc",
+        ),
+    ],
+)
+async def test_push_commands_refuse_a_bad_argument(
+    name: str,
+    args: tuple[object, ...] | dict[str, object],
+    error: type[Exception],
+    match: str | None,
+) -> None:
+    """A bad argument raises without taking the operation lock."""
     push_lock, _lock, _session, _client = _keycode_real_session("aa:bb:cc:dd:ee:42")
 
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(error, match=match):
         # Held, so a command that took the operation lock would time out here.
         async with push_lock._operation_lock, asyncio.timeout(1):
-            await getattr(push_lock, name)(*args)
+            await _call(push_lock, name, args)
 
     push_lock._running = False

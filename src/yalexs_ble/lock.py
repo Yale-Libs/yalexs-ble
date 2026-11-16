@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import bisect
 import logging
+import math
 import os
 from collections.abc import AsyncGenerator, Callable, Iterable
+from time import time
 from typing import Any, TypeVar, cast
 
 from bleak import BleakError
@@ -34,6 +36,7 @@ from .const import (
     LockStateValue,
     LockStatus,
     OperationError,
+    RtcWrite,
     SettingType,
     StatusReply,
     StatusType,
@@ -64,6 +67,10 @@ UNLATCH_OPERATION_BYTE = 0x0A
 
 # Operation byte (byte[4]) that makes a Lock command securemode.
 SECUREMODE_OPERATION_BYTE = 0x04
+
+# The least time sync_rtc leaves between choosing its second and that second's
+# moment; chosen, not measured.
+RTC_SEND_LEAD = 0.005
 
 AA_BATTERY_VOLTAGE_TO_PERCENTAGE = (
     (1.55, 100),
@@ -193,6 +200,7 @@ NO_STATE_OPCODES = frozenset(
         Commands.KEYCODE_COMMIT.value,
         Commands.KEYCODE_GET.value,
         Commands.GETLOG.value,
+        Commands.SETRTC.value,
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
@@ -230,6 +238,15 @@ def validate_status_type(status_type: int) -> None:
         )
 
 
+def validate_rtc_time(seconds: int) -> None:
+    """Raise ValueError for a clock time that does not fit four unsigned bytes."""
+    if not 0 <= seconds <= 0xFFFFFFFF:
+        raise ValueError(
+            "Clock time is not an unsigned four-byte value "
+            f"(0 to 0xFFFFFFFF): {seconds}"
+        )
+
+
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
     """Match the acknowledgment (0xAA + opcode + operation byte) of a command.
 
@@ -256,6 +273,15 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
 
     def _matches(data: bytes) -> bool:
         return len(data) > RESULT_BYTE and data[0x00] == 0xBB and data[0x01] == opcode
+
+    return _matches
+
+
+def _first_reply_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match an 0xAA or 0xBB frame whose byte 1 is opcode, whatever byte 4 holds."""
+
+    def _matches(data: bytes) -> bool:
+        return len(data) > 0x01 and data[0x00] in (0xAA, 0xBB) and data[0x01] == opcode
 
     return _matches
 
@@ -989,6 +1015,48 @@ class Lock:
             "auto_lock_status",
         )
         _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
+
+    @raise_if_not_connected
+    async def sync_rtc(self, *, offset: float = 0.0) -> RtcWrite:
+        """Set the lock's clock to the host's time plus offset seconds.
+
+        The lock takes whole seconds, so the write is sent at the moment that gives
+        the fraction. Returns the second written and the times of the write; the
+        lock applied the write between request_written and reply_received. Raises
+        ValueError for a second that does not fit four unsigned bytes, before any
+        frame is written, and TimeoutError when the lock does not answer within the
+        session's wait.
+        """
+        assert self.session is not None  # nosec
+        session = self.session
+        written: int | None = None
+
+        async def fill_the_second_at_its_moment(command: bytearray) -> None:
+            nonlocal written
+            seconds = math.ceil(time() + offset + RTC_SEND_LEAD)
+            while True:
+                validate_rtc_time(seconds)
+                await asyncio.sleep(seconds - offset - time())
+                if not session.cooling_down():
+                    break
+                # A notification during the wait restarted the cooldown, so the
+                # write moves to the next second.
+                seconds += 1
+            command[0x04:0x08] = util._int_to_bytes(seconds, 4)
+            written = seconds
+            _LOGGER.debug("%s: Setting the clock to %d", self.name, seconds)
+
+        response, times = await session.execute_timed(
+            session.build_command(Commands.SETRTC),
+            "sync_rtc",
+            _first_reply_matcher(Commands.SETRTC.value),
+            prepare=fill_the_second_at_its_moment,
+        )
+        _LOGGER.debug(
+            "%s: The lock answered the clock write with %s", self.name, response.hex()
+        )
+        assert written is not None  # nosec
+        return RtcWrite(written, times)
 
     @raise_if_not_connected
     async def get_log(self) -> bytes:

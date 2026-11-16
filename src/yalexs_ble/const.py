@@ -60,6 +60,7 @@ class Commands(IntEnum):
     READSETTING = 0x04
     UNLOCK = 0x0A
     LOCK = 0x0B
+    SETRTC = 0x10
     KEYCODE_SET = 0x27
     KEYCODE_CLEAR = 0x28
     KEYCODE_ACCESS = 0x2B
@@ -239,6 +240,14 @@ class StatusReply:
     """The value of a status poll, with the times of the poll's exchange."""
 
     value: int
+    times: ExchangeTimes
+
+
+@dataclass(frozen=True, slots=True)
+class RtcWrite:
+    """The second written to the lock's clock, with the times of the write."""
+
+    second: int
     times: ExchangeTimes
 
 
