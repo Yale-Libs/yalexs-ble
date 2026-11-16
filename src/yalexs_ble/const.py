@@ -152,12 +152,6 @@ class StatusType(IntEnum):
     BATTERY = 0x0F
     # The activity log's unread count: records no client has read yet.
     LOCK_EVENTS_UNREAD = 0x09
-    # Aliases of LOCK_ONLY, DOOR_ONLY, DOOR_AND_LOCK, and BATTERY, based on the
-    # vendor's terms.
-    LOCK_STATE = 0x02
-    DOOR_STATE = 0x2E
-    DOOR_LOCK_STATE = 0x2F
-    BATTERY_VOLTAGE = 0x0F
     # The lock's clock, in seconds since 1970 UTC.
     RTC = 0x0A
 

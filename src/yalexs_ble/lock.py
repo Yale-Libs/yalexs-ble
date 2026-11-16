@@ -468,11 +468,8 @@ class Lock:
                     return self._parse_lock_and_door_state(state)
                 if state[4] == StatusType.BATTERY.value:
                     return [self._parse_battery_state(state)]
-                if state[4] == StatusType.LOCK_EVENTS_UNREAD.value:
-                    # Answered through unread_event_count(); no state to publish.
-                    return ()
                 # Any other status type holds no lock state, so the reply
-                # publishes nothing; a waiting get_status() returns its value.
+                # publishes nothing; the call waiting for it returns its value.
                 return ()
             if (
                 state[1] == Commands.WRITESETTING.value
