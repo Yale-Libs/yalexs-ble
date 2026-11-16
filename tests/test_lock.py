@@ -2111,17 +2111,25 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
         ),
         pytest.param(
             "get_status",
-            (StatusType.LOCK_STATE,),
+            (StatusType.LOCK_ONLY,),
             [
                 _bb_frame(
                     Commands.GETSTATUS.value,
-                    StatusType.LOCK_STATE.value,
+                    StatusType.LOCK_ONLY.value,
                     value=LockStatus.LOCKED.value,
                 )
             ],
             StatusReply(LockStatus.LOCKED.value, AT_HOST_START),
             [[LockStatus.LOCKED]],
-            id="status-lock-state-answer",
+            id="status-lock-only-answer",
+        ),
+        pytest.param(
+            "unread_event_count",
+            (),
+            [DEPTH_FRAME],
+            242,
+            [],
+            id="unread-event-count-answer",
         ),
         pytest.param(
             "get_status",
@@ -2182,12 +2190,12 @@ async def test_a_status_poll_completes_on_its_own_bb_frame(
 @pytest.mark.parametrize(
     ("status_type", "byte_4"),
     [
-        pytest.param(StatusType.LOCK_STATE, 0x02, id="LOCK_STATE"),
+        pytest.param(StatusType.LOCK_ONLY, 0x02, id="LOCK_ONLY"),
         pytest.param(StatusType.LOCK_EVENTS_UNREAD, 0x09, id="LOCK_EVENTS_UNREAD"),
         pytest.param(StatusType.RTC, 0x0A, id="RTC"),
-        pytest.param(StatusType.BATTERY_VOLTAGE, 0x0F, id="BATTERY_VOLTAGE"),
-        pytest.param(StatusType.DOOR_STATE, 0x2E, id="DOOR_STATE"),
-        pytest.param(StatusType.DOOR_LOCK_STATE, 0x2F, id="DOOR_LOCK_STATE"),
+        pytest.param(StatusType.BATTERY, 0x0F, id="BATTERY"),
+        pytest.param(StatusType.DOOR_ONLY, 0x2E, id="DOOR_ONLY"),
+        pytest.param(StatusType.DOOR_AND_LOCK, 0x2F, id="DOOR_AND_LOCK"),
         pytest.param(0x00, 0x00, id="lowest-id"),
         pytest.param(0xFF, 0xFF, id="highest-id"),
     ],
@@ -2207,6 +2215,18 @@ async def test_get_status_sends_the_type_in_byte_4(
         call.args[1] for call in session.client.write_gatt_char.await_args_list
     )
     assert (written[0x01], written[0x04]) == (Commands.GETSTATUS.value, byte_4)
+
+
+def test_status_type_has_one_name_per_status_type() -> None:
+    """StatusType has these six members and no alias."""
+    assert {name: member.value for name, member in StatusType.__members__.items()} == {
+        "LOCK_ONLY": 0x02,
+        "DOOR_ONLY": 0x2E,
+        "DOOR_AND_LOCK": 0x2F,
+        "BATTERY": 0x0F,
+        "LOCK_EVENTS_UNREAD": 0x09,
+        "RTC": 0x0A,
+    }
 
 
 # RTC_FRAME with its checksum broken, so the session refuses it and writes again.
@@ -2301,12 +2321,12 @@ async def test_a_status_poll_returns_the_host_times_of_its_answered_write(
         ),
         pytest.param(
             ("door_status", ()),
-            ("get_status", (StatusType.DOOR_STATE,)),
+            ("get_status", (StatusType.DOOR_ONLY,)),
             [
                 DOOR_FRAME,
                 _bb_frame(
                     Commands.GETSTATUS.value,
-                    StatusType.DOOR_STATE.value,
+                    StatusType.DOOR_ONLY.value,
                     DoorStatus.OPENED.value,
                 ),
             ],
@@ -2314,13 +2334,13 @@ async def test_a_status_poll_returns_the_host_times_of_its_answered_write(
             id="door-status-then-get-status",
         ),
         pytest.param(
-            ("get_status", (StatusType.DOOR_STATE,)),
+            ("get_status", (StatusType.DOOR_ONLY,)),
             ("door_status", ()),
             [
                 DOOR_FRAME,
                 _bb_frame(
                     Commands.GETSTATUS.value,
-                    StatusType.DOOR_STATE.value,
+                    StatusType.DOOR_ONLY.value,
                     DoorStatus.OPENED.value,
                 ),
             ],
