@@ -14,6 +14,14 @@ from bleak_retry_connector import BLEDevice
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
+from tests.helpers import (
+    CLOCK_WRITE_ACK,
+    ZONE_ACK,
+    ZONE_PAYLOAD,
+    ZONE_REPLY,
+    bb_frame,
+    call_method,
+)
 from yalexs_ble import util
 from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
@@ -1007,17 +1015,6 @@ def _with_checksum(hex_str: str) -> bytes:
     return bytes(frame)
 
 
-def _bb_frame(opcode: int, byte_4: int, value: int) -> bytes:
-    """Build a 0xBB frame with the opcode, byte 4, and the value at bytes 8 to 11."""
-    frame = bytearray(RESPONSE_FRAME_LEN)
-    frame[0x00] = 0xBB
-    frame[0x01] = opcode
-    frame[0x04] = byte_4
-    frame[0x08:0x0C] = value.to_bytes(4, "little")
-    frame[0x03] = _simple_checksum(frame)
-    return bytes(frame)
-
-
 # A LOCK_EVENTS_UNREAD reply captured on 2026-07-26 from a Yale lock: 242 records.
 DEPTH_FRAME = bytes.fromhex("bb02004609000000f2000000000000000200")
 # Built to the same layout with 0xDEADBEEF in the count at byte[8:12].
@@ -1026,7 +1023,7 @@ NEGATIVE_DEPTH_FRAME = _with_checksum("bb02000009000000efbeadde000000000200")
 # filler 0xDEADBEEF at byte[8:12].
 LOCK_EVENTS_FRAME = bytes.fromhex("bb02000108000000efbeadde000000000200")
 # Built: an RTC answer holding 2026-10-31 12:00 UTC, 1793448000 s, at byte[8:12].
-RTC_FRAME = _bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 1793448000)
+RTC_FRAME = bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 1793448000)
 
 
 # Built GETLOG replies, each holding one activity record: byte[2] is the
@@ -2128,30 +2125,12 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
     return AsyncMock(side_effect=deliver)
 
 
-def _call(target: object, method: str, args: tuple[Any, ...] | dict[str, Any]) -> Any:
-    """Call a method with a tuple as positional or a dict as keyword arguments."""
-    if isinstance(args, dict):
-        return getattr(target, method)(**args)
-    return getattr(target, method)(*args)
-
-
-# A SetRTC acknowledgment captured on 2026-11-04 from a Yale lock, answering 1793750707.
-CLOCK_WRITE_ACK = bytes.fromhex("aa1000c7b376ea6a00000000000000000200")
 # The offset that makes sync_rtc write 1793750707 half a second after HOST_START,
 # and what sync_rtc returns for that write when the lock answers at once.
 CLOCK_WRITE_OFFSET = 1793750707 - HOST_START - 0.5
 CLOCK_WRITE = RtcWrite(1793750707, ExchangeTimes(HOST_START + 0.5, HOST_START + 0.5))
 # A constructed SetRTC 0xBB reply.
 CLOCK_WRITE_RESPONSE = _with_checksum("bb1000000000000000000000000000000000")
-# Constructed TimeZone_Info frames. Every payload byte is distinct, so a payload
-# written at the wrong offset fails, and the reply holds 0x01 at byte 7 where the
-# payload and the acknowledgment hold 0xF7, so a return taken from the acknowledgment
-# fails.
-ZONE_PAYLOAD = bytes(range(0xF4, 0x100))
-ZONE_ACK = _with_checksum(f"aa300000{ZONE_PAYLOAD.hex()}0200")
-ZONE_REPLY = _with_checksum(
-    f"bb300000{ZONE_PAYLOAD[:3].hex()}01{ZONE_PAYLOAD[4:].hex()}0000"
-)
 
 
 @pytest.mark.asyncio
@@ -2170,7 +2149,7 @@ ZONE_REPLY = _with_checksum(
             "get_status",
             (StatusType.LOCK_ONLY,),
             [
-                _bb_frame(
+                bb_frame(
                     Commands.GETSTATUS.value,
                     StatusType.LOCK_ONLY.value,
                     value=LockStatus.LOCKED.value,
@@ -2211,7 +2190,7 @@ ZONE_REPLY = _with_checksum(
         pytest.param(
             "get_status",
             (StatusType.RTC,),
-            [_bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 0x00000000)],
+            [bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 0x00000000)],
             StatusReply(0, AT_HOST_START),
             [],
             id="status-lowest-value",
@@ -2219,7 +2198,7 @@ ZONE_REPLY = _with_checksum(
         pytest.param(
             "get_status",
             (StatusType.RTC,),
-            [_bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 0xFFFFFFFF)],
+            [bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 0xFFFFFFFF)],
             StatusReply(4294967295, AT_HOST_START),
             [],
             id="status-highest-value",
@@ -2292,7 +2271,7 @@ async def test_a_command_that_moves_no_motor_completes_on_its_own_reply(
     lock, session = _connected_lock(lambda s: received.append(list(s)))
     session.client.write_gatt_char = _answered_by(session, *frames)
 
-    assert await _call(lock, method, args) == value
+    assert await call_method(lock, method, args) == value
     assert received == states
 
 
@@ -2316,7 +2295,7 @@ async def test_get_status_sends_the_type_in_byte_4(
     """The GetStatus frame holds the status type at byte 4."""
     lock, session = _connected_lock()
     session.client.write_gatt_char = _answered_by(
-        session, _bb_frame(Commands.GETSTATUS.value, status_type, value=0)
+        session, bb_frame(Commands.GETSTATUS.value, status_type, value=0)
     )
 
     assert (await lock.get_status(status_type)).value == 0
@@ -2424,7 +2403,7 @@ async def test_a_status_poll_returns_the_host_times_of_its_answered_write(
             ("get_status", (StatusType.RTC,)),
             [
                 RTC_FRAME,
-                _bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 1793448060),
+                bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 1793448060),
             ],
             StatusReply(1793448000, AT_HOST_START),
             id="get-status-then-get-status",
@@ -2434,7 +2413,7 @@ async def test_a_status_poll_returns_the_host_times_of_its_answered_write(
             ("get_status", (StatusType.DOOR_ONLY,)),
             [
                 DOOR_FRAME,
-                _bb_frame(
+                bb_frame(
                     Commands.GETSTATUS.value,
                     StatusType.DOOR_ONLY.value,
                     DoorStatus.OPENED.value,
@@ -2448,7 +2427,7 @@ async def test_a_status_poll_returns_the_host_times_of_its_answered_write(
             ("door_status", ()),
             [
                 DOOR_FRAME,
-                _bb_frame(
+                bb_frame(
                     Commands.GETSTATUS.value,
                     StatusType.DOOR_ONLY.value,
                     DoorStatus.OPENED.value,
@@ -2619,7 +2598,7 @@ async def test_sync_rtc_writes_at_its_moment_and_set_rtc_at_once(
 
     session.client.write_gatt_char = write_gatt_char
 
-    rtc_write = await _call(lock, method, args)
+    rtc_write = await call_method(lock, method, args)
 
     ((at, frame),) = writes
     assert at == pytest.approx(written_at)
@@ -2697,7 +2676,7 @@ async def test_a_clock_write_names_its_call_in_the_session_log(
     session.client.write_gatt_char = _answered_by(session, CLOCK_WRITE_ACK)
 
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
-        await _call(lock, method, args)
+        await call_method(lock, method, args)
 
     assert f"Encrypted command {method}: " in caplog.text
 
@@ -2856,6 +2835,6 @@ async def test_commands_refuse_a_bad_argument_and_write_nothing(
     session.client.write_gatt_char = AsyncMock()
 
     with pytest.raises(error, match=match):
-        await _call(lock, method, args)
+        await call_method(lock, method, args)
 
     session.client.write_gatt_char.assert_not_awaited()

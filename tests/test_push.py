@@ -19,6 +19,14 @@ from bleak_retry_connector import BleakNotFoundError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
+from tests.helpers import (
+    CLOCK_WRITE_ACK,
+    ZONE_ACK,
+    ZONE_PAYLOAD,
+    ZONE_REPLY,
+    bb_frame,
+    call_method,
+)
 from yalexs_ble.activity_log import LogRecord
 from yalexs_ble.const import (
     ASSA_ABLOY_MFR_ID,
@@ -8502,51 +8510,32 @@ async def test_an_op_response_the_lock_parses_holds_the_next_read_off():
     assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
 
 
-def _answer_frame(opcode: int, byte_4: int, payload: bytes) -> bytes:
-    """Build a 0xBB frame with the opcode, byte 4, and the payload from byte 8."""
-    frame = bytearray(RESPONSE_FRAME_LEN)
-    frame[0x00] = 0xBB
-    frame[0x01] = opcode
-    frame[0x04] = byte_4
-    frame[0x08 : 0x08 + len(payload)] = payload
-    frame[0x03] = _simple_checksum(frame)
-    return bytes(frame)
-
-
 # The answers a cycle's status polls and auto-lock setting read take, keyed by the
 # opcode and byte 4 of each; the battery answer clears the 3.0 V floor in
 # _update_any_state, and the setting answer keeps the next cycle from reading again.
 _STATUS_ANSWERS = {
     **{
-        (Commands.GETSTATUS.value, subtype.value): _answer_frame(
-            Commands.GETSTATUS.value, subtype.value, payload
+        (Commands.GETSTATUS.value, subtype.value): bb_frame(
+            Commands.GETSTATUS.value, subtype.value, value
         )
-        for subtype, payload in (
-            (StatusType.BATTERY, bytes.fromhex("7914")),
-            (StatusType.DOOR_ONLY, bytes([DoorStatus.CLOSED.value])),
-            (StatusType.LOCK_ONLY, bytes([LockStatus.LOCKED.value])),
+        for subtype, value in (
+            (StatusType.BATTERY, 0x1479),
+            (StatusType.DOOR_ONLY, DoorStatus.CLOSED.value),
+            (StatusType.LOCK_ONLY, LockStatus.LOCKED.value),
         )
     },
-    (Commands.READSETTING.value, SettingType.AUTOLOCK.value): _answer_frame(
-        Commands.READSETTING.value, SettingType.AUTOLOCK.value, bytes(4)
+    (Commands.READSETTING.value, SettingType.AUTOLOCK.value): bb_frame(
+        Commands.READSETTING.value, SettingType.AUTOLOCK.value, 0
     ),
 }
 
 
-# A SetRTC acknowledgment captured on 2026-11-04 from a Yale lock, answering
-# _CLOCK_TIME.
-_CLOCK_WRITE_ACK = bytes.fromhex("aa1000c7b376ea6a00000000000000000200")
-# The time _CLOCK_WRITE_ACK holds, and byte 4 of the SetRTC frame that writes it.
+# The time CLOCK_WRITE_ACK holds, and byte 4 of the SetRTC frame that writes it.
 _CLOCK_TIME = 1793750707
 _CLOCK_TIME_BYTE_4 = _CLOCK_TIME & 0xFF
 # A host time for _patched_host_clock to start at, from which a clock write at host
 # time writes _CLOCK_TIME.
 _HOST_TIME = _CLOCK_TIME - 0.5
-# Constructed TimeZone_Info frames. Byte 4 of a TimeZone_Info frame is the payload's
-# first byte, which is the key _record_and_answer answers the write by.
-_ZONE_PAYLOAD = bytes(range(0xF4, 0x100))
-_ZONE_ACK = bytes(_with_checksum(f"aa300000{_ZONE_PAYLOAD.hex()}0200"))
-_ZONE_REPLY = _answer_frame(Commands.TIMEZONE_INFO.value, _ZONE_PAYLOAD[0], b"\x01")
 
 
 def _record_and_answer(
@@ -8571,13 +8560,6 @@ def _record_and_answer(
     return written
 
 
-def _call(target: object, method: str, args: tuple[Any, ...] | dict[str, Any]) -> Any:
-    """Call a method with a tuple as positional or a dict as keyword arguments."""
-    if isinstance(args, dict):
-        return getattr(target, method)(**args)
-    return getattr(target, method)(*args)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "args", "name"),
@@ -8585,7 +8567,7 @@ def _call(target: object, method: str, args: tuple[Any, ...] | dict[str, Any]) -
         ("get_status", (0x0A,), "get_status 0x0A"),
         ("sync_rtc", (), "sync_rtc"),
         ("set_rtc", (_CLOCK_TIME,), "set_rtc"),
-        ("set_timezone_info", (_ZONE_PAYLOAD,), "set_timezone_info"),
+        ("set_timezone_info", (ZONE_PAYLOAD,), "set_timezone_info"),
     ],
 )
 async def test_push_commands_that_move_no_motor_warn_once_on_no_answer(
@@ -8635,13 +8617,11 @@ async def test_push_answers_without_lock_state_publish_no_state(
         session,
         client,
         {
-            (Commands.GETSTATUS.value, StatusType.RTC.value): _answer_frame(
-                Commands.GETSTATUS.value,
-                StatusType.RTC.value,
-                (1793448000).to_bytes(4, "little"),
+            (Commands.GETSTATUS.value, StatusType.RTC.value): bb_frame(
+                Commands.GETSTATUS.value, StatusType.RTC.value, 1793448000
             ),
-            (Commands.SETRTC.value, _CLOCK_TIME_BYTE_4): _CLOCK_WRITE_ACK,
-            (Commands.TIMEZONE_INFO.value, _ZONE_PAYLOAD[0]): _ZONE_ACK + _ZONE_REPLY,
+            (Commands.SETRTC.value, _CLOCK_TIME_BYTE_4): CLOCK_WRITE_ACK,
+            (Commands.TIMEZONE_INFO.value, ZONE_PAYLOAD[0]): ZONE_ACK + ZONE_REPLY,
         },
     )
 
@@ -8653,9 +8633,7 @@ async def test_push_answers_without_lock_state_publish_no_state(
         assert (await push_lock.get_status(StatusType.RTC)).value == 1793448000
         await push_lock.sync_rtc()
         await push_lock.set_rtc(_CLOCK_TIME)
-        assert (
-            await push_lock.set_timezone_info(_ZONE_PAYLOAD) == _ZONE_REPLY[0x04:0x10]
-        )
+        assert await push_lock.set_timezone_info(ZONE_PAYLOAD) == ZONE_REPLY[0x04:0x10]
 
     assert published == []
     assert push_lock.lock_state == before
@@ -8670,11 +8648,7 @@ async def test_push_answers_without_lock_state_publish_no_state(
             "get_status",
             (StatusType.RTC.value,),
             (Commands.GETSTATUS, StatusType.RTC.value),
-            _answer_frame(
-                Commands.GETSTATUS.value,
-                StatusType.RTC.value,
-                (1793448000).to_bytes(4, "little"),
-            ),
+            bb_frame(Commands.GETSTATUS.value, StatusType.RTC.value, 1793448000),
             StatusReply(1793448000, ExchangeTimes(_HOST_TIME, _HOST_TIME)),
             id="status-poll-during-a-cycle",
         ),
@@ -8682,7 +8656,7 @@ async def test_push_answers_without_lock_state_publish_no_state(
             "sync_rtc",
             (),
             (Commands.SETRTC, _CLOCK_TIME_BYTE_4),
-            _CLOCK_WRITE_ACK,
+            CLOCK_WRITE_ACK,
             RtcWrite(_CLOCK_TIME, ExchangeTimes(_CLOCK_TIME, _CLOCK_TIME)),
             id="clock-write-during-a-cycle",
         ),
@@ -8690,7 +8664,7 @@ async def test_push_answers_without_lock_state_publish_no_state(
             "sync_rtc",
             {"offset": 0.25},
             (Commands.SETRTC, _CLOCK_TIME_BYTE_4),
-            _CLOCK_WRITE_ACK,
+            CLOCK_WRITE_ACK,
             RtcWrite(
                 _CLOCK_TIME, ExchangeTimes(_CLOCK_TIME - 0.25, _CLOCK_TIME - 0.25)
             ),
@@ -8700,16 +8674,16 @@ async def test_push_answers_without_lock_state_publish_no_state(
             "set_rtc",
             (_CLOCK_TIME,),
             (Commands.SETRTC, _CLOCK_TIME_BYTE_4),
-            _CLOCK_WRITE_ACK,
+            CLOCK_WRITE_ACK,
             RtcWrite(_CLOCK_TIME, ExchangeTimes(_HOST_TIME, _HOST_TIME)),
             id="clock-write-of-a-timestamp-during-a-cycle",
         ),
         pytest.param(
             "set_timezone_info",
-            (_ZONE_PAYLOAD,),
-            (Commands.TIMEZONE_INFO, _ZONE_PAYLOAD[0]),
-            _ZONE_REPLY,
-            _ZONE_REPLY[0x04:0x10],
+            (ZONE_PAYLOAD,),
+            (Commands.TIMEZONE_INFO, ZONE_PAYLOAD[0]),
+            ZONE_REPLY,
+            ZONE_REPLY[0x04:0x10],
             id="zone-write-during-a-cycle",
         ),
     ],
@@ -8746,7 +8720,7 @@ async def test_the_cycle_after_a_command_that_moves_no_motor_writes_no_command(
         await cycle_connecting.wait()
         # The command queues on the operation lock the first cycle holds, so a flag
         # set before the command would be cleared by that cycle's poll.
-        command = asyncio.create_task(_call(push_lock, method, args))
+        command = asyncio.create_task(call_method(push_lock, method, args))
         await asyncio.sleep(0)
         cycle_released.set()
         await cycle
@@ -8814,13 +8788,13 @@ async def test_a_clock_write_behind_a_get_log_runs_once_the_cooldown_ends(
 
         async def write_gatt_char(_char: Any, frame: bytes, _response: bool) -> None:
             writes.append((clock[0], bytes(frame)))
-            session._notify(0, bytearray(_CLOCK_WRITE_ACK))
+            session._notify(0, bytearray(CLOCK_WRITE_ACK))
 
         client.write_gatt_char = write_gatt_char
         # An update cycle holds the operation lock through its drain, which ends on
         # the GetLogError reply.
         async with push_lock._operation_lock:
-            clock_write = asyncio.create_task(_call(push_lock, method, args))
+            clock_write = asyncio.create_task(call_method(push_lock, method, args))
             await asyncio.sleep(0)
             clock[0] = reply_at
             session._notify(0, bytearray(_GET_LOG_ERROR))
@@ -8980,6 +8954,6 @@ async def test_push_commands_refuse_a_bad_argument(
     with pytest.raises(error, match=match):
         # Held, so a command that took the operation lock would time out here.
         async with push_lock._operation_lock, asyncio.timeout(1):
-            await _call(push_lock, name, args)
+            await call_method(push_lock, name, args)
 
     push_lock._running = False
