@@ -34,7 +34,7 @@ from yalexs_ble.const import (
     OperationError,
     StatusType,
 )
-from yalexs_ble.lock import ActivityLogOverrunError, Lock
+from yalexs_ble.lock import KEYCODE_ACCESS_ALWAYS, ActivityLogOverrunError, Lock
 from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
     _LOCK_OPERATION,
@@ -3570,7 +3570,13 @@ async def test_push_lock_keycode_round_trip() -> None:
         await push_lock.set_keycode(200, "135790")
         await push_lock.clear_keycode(200)
     lock.get_keycode.assert_awaited_once_with(200)
-    lock.set_keycode.assert_awaited_once_with(200, "135790")
+    lock.set_keycode.assert_awaited_once_with(
+        200,
+        "135790",
+        access_type=KEYCODE_ACCESS_ALWAYS,
+        start_time=0,
+        end_time=0,
+    )
     lock.clear_keycode.assert_awaited_once_with(200)
     assert push_lock._last_operation_complete_time != NEVER_TIME
 

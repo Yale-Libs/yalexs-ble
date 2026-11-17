@@ -236,7 +236,10 @@ def validate_keycode_access(
     start_time: int = 0,
     end_time: int = 0,
 ) -> None:
-    """Validate KeyCode_Access schedule field bounds."""
+    """Check only that each value fits its field.
+
+    What a value means is between the consumer and its lock.
+    """
     _validate_uint(access_type, UINT8_MAX, "access_type")
     _validate_uint(start_time, UINT32_MAX, "start_time")
     _validate_uint(end_time, UINT32_MAX, "end_time")

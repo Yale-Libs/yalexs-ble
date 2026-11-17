@@ -1360,21 +1360,16 @@ class PushLock:
         validate_keycode_slot(slot)
         encode_keycode_pin(pin)
         validate_keycode_access(access_type, start_time, end_time)
-        if access_type == KEYCODE_ACCESS_ALWAYS and start_time == 0 and end_time == 0:
-            await self._run_on_lock(
-                "set_keycode", lambda lock: lock.set_keycode(slot, pin)
-            )
-        else:
-            await self._run_on_lock(
-                "set_keycode",
-                lambda lock: lock.set_keycode(
-                    slot,
-                    pin,
-                    access_type=access_type,
-                    start_time=start_time,
-                    end_time=end_time,
-                ),
-            )
+        await self._run_on_lock(
+            "set_keycode",
+            lambda lock: lock.set_keycode(
+                slot,
+                pin,
+                access_type=access_type,
+                start_time=start_time,
+                end_time=end_time,
+            ),
+        )
 
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot."""
