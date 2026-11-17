@@ -7606,93 +7606,50 @@ async def test_push_parameter_commands_publish_no_state() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("method", "args", "opcode", "answer", "during_cycle", "cycle_polls"),
+    ("method", "args", "opcode", "answer"),
     [
         pytest.param(
-            "set_parameter",
-            (0xB2, 30),
-            Commands.WRITESETTING,
-            30,
-            True,
-            [(Commands.GETSTATUS, StatusType.LOCK_ONLY.value)],
-            id="answered-write",
+            "set_parameter", (0xB2, 30), Commands.WRITESETTING, 30, id="answered-write"
         ),
         pytest.param(
             "set_parameter",
             (0xB2, 30),
             Commands.WRITESETTING,
             None,
-            True,
-            [(Commands.GETSTATUS, StatusType.LOCK_ONLY.value)],
             id="unanswered-write",
         ),
         pytest.param(
-            "get_parameter",
-            (0xB2,),
-            Commands.READSETTING,
-            30,
-            True,
-            [],
-            id="read-during-a-cycle",
-        ),
-        pytest.param(
-            "get_parameter",
-            (0xB2,),
-            Commands.READSETTING,
-            30,
-            False,
-            [],
-            id="read-after-a-cycle",
+            "get_parameter", (0xB2,), Commands.READSETTING, 30, id="answered-read"
         ),
     ],
 )
-async def test_only_a_parameter_write_makes_the_next_cycle_poll_the_lock_status(
+async def test_a_parameter_command_does_not_make_the_next_cycle_poll_the_lock_status(
     method: str,
     args: tuple[int, ...],
     opcode: Commands,
     answer: int | None,
-    during_cycle: bool,
-    cycle_polls: list[tuple[Commands, int]],
 ) -> None:
-    """A write, not a read, makes the next update cycle poll the lock status."""
+    """A parameter read or write adds no lock status poll to the next update cycle."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3f")
     lock, session, client = _lock_on_a_real_session(push_lock)
+    # The link is up, so the cycle under test runs on the first cycle's connection.
+    push_lock._client = lock
     answers = dict(_STATUS_ANSWERS)
     if answer is not None:
         answers[(opcode.value, 0xB2)] = _parameter_answer(opcode.value, 0xB2, answer)
     written = _record_and_answer(session, client, answers)
     published: list[LockState] = []
-    cycle_connecting = asyncio.Event()
-    cycle_released = asyncio.Event()
 
-    async def ensure_connected() -> Lock:
-        cycle_connecting.set()
-        await cycle_released.wait()
-        return lock
-
-    with (
-        patch.object(push_lock, "_ensure_connected", ensure_connected),
-        patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.05)),
-    ):
+    with patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.01)):
         # The first cycle polls the lock status, so the cycle under test has a reading.
-        cycle = asyncio.create_task(push_lock._update())
-        await cycle_connecting.wait()
-        if not during_cycle:
-            cycle_released.set()
-            await cycle
-        # During the first cycle the command queues on the operation lock that cycle
-        # holds, so a flag set before the command would be cleared by that cycle's poll.
-        command = asyncio.create_task(getattr(push_lock, method)(*args))
-        await asyncio.sleep(0)
-        cycle_released.set()
-        await cycle
+        await push_lock._update()
         push_lock.register_callback(lambda state, info, conn: published.append(state))
         with (
             nullcontext()
             if answer is not None
             else pytest.raises(TimeoutError, match="did not answer")
         ):
-            assert await command == answer
+            assert await getattr(push_lock, method)(*args) == answer
         await push_lock._update()
 
     push_lock._running = False
@@ -7702,9 +7659,57 @@ async def test_only_a_parameter_write_makes_the_next_cycle_poll_the_lock_status(
         (Commands.GETSTATUS, StatusType.DOOR_ONLY.value),
         (Commands.GETSTATUS, StatusType.LOCK_ONLY.value),
         (opcode, 0xB2),
-        *cycle_polls,
     ]
     # The cycle under test publishes its state on completion, in every row.
+    assert [state.lock for state in published] == [LockStatus.LOCKED]
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_after_an_answered_write_polls_the_lock_status() -> None:
+    """An answered write reschedules the keep-alive; its cycle polls the lock status."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:2f", always_connected=True)
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    push_lock._client = lock
+    client.set_connection_params = AsyncMock()
+    answers = dict(_STATUS_ANSWERS)
+    answers[(Commands.WRITESETTING.value, 0xB2)] = _parameter_answer(
+        Commands.WRITESETTING.value, 0xB2, 30
+    )
+    written = _record_and_answer(session, client, answers)
+    published: list[LockState] = []
+
+    # The first cycle polls the lock status, so the keep-alive's cycle has a reading.
+    await push_lock._update()
+    first_cycle = len(written)
+    after_the_first_cycle = push_lock._keep_alive_timer
+    push_lock.register_callback(lambda state, info, conn: published.append(state))
+    assert await push_lock.set_parameter(0xB2, 30) == 30
+
+    keep_alive = push_lock._keep_alive_timer
+    assert keep_alive is not None
+    assert keep_alive is not after_the_first_cycle
+    assert (
+        KEEP_ALIVE_TIME - 1
+        < keep_alive.when() - push_lock.loop.time()
+        <= KEEP_ALIVE_TIME
+    )
+    # The call stands in for the timer firing; the cycle it schedules runs on the loop.
+    push_lock._keep_alive()
+    # Two yields: _deferred_update, the timer callback that creates the update
+    # task, runs after this test resumes from the first.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert push_lock._update_task is not None
+    await push_lock._update_task
+
+    push_lock._running = False
+
+    assert [
+        (Commands(command[0x01]), command[0x04]) for command in written[first_cycle:]
+    ] == [
+        (Commands.WRITESETTING, 0xB2),
+        (Commands.GETSTATUS, StatusType.LOCK_ONLY.value),
+    ]
     assert [state.lock for state in published] == [LockStatus.LOCKED]
 
 

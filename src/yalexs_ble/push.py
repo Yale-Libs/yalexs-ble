@@ -1205,20 +1205,14 @@ class PushLock:
     async def set_parameter(self, parameter: int, value: int) -> int:
         """Write one parameter and return the value field of the lock's reply.
 
-        After a write, answered or not, the next update cycle polls the lock status.
         Raises as get_parameter, plus ValueError for a value outside four bytes.
         """
         validate_parameter_id(parameter)
         validate_parameter_value(value)
-        try:
-            return await self._run_on_lock(
-                f"set_parameter 0x{parameter:02X}",
-                lambda lock: lock.set_parameter(parameter, value),
-            )
-        finally:
-            # The library does not rely on a push for a status change a write may make,
-            # and a write the lock did not answer may still have been applied.
-            self._force_lock_status_poll = True
+        return await self._run_on_lock(
+            f"set_parameter 0x{parameter:02X}",
+            lambda lock: lock.set_parameter(parameter, value),
+        )
 
     @operation_lock
     async def _run_on_lock(
