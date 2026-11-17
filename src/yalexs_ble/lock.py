@@ -197,6 +197,8 @@ NO_STATE_OPCODES = frozenset(
 KEYCODE_ACCESS_ALWAYS = 0x80
 KEYCODE_CREDENTIAL_PIN = 0x00
 KEYCODE_MAX_SLOT = 0xFFFF
+UINT8_MAX = 0xFF
+UINT32_MAX = 0xFFFFFFFF
 # Result code of a 0xBB op-response or keycode result.
 RESULT_BYTE = 0x0F
 
@@ -219,6 +221,28 @@ def validate_keycode_slot(slot: int) -> None:
     """Raise ValueError for a keypad slot outside the lock's range."""
     if not 1 <= slot <= KEYCODE_MAX_SLOT:
         raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
+
+
+def _validate_uint(value: int, max_value: int, name: str) -> None:
+    """Validate that value is a non-bool int within 0..max_value."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if not 0 <= value <= max_value:
+        raise ValueError(f"{name} out of range (0-{max_value}): {value}")
+
+
+def validate_keycode_access(
+    access_type: int = KEYCODE_ACCESS_ALWAYS,
+    start_time: int = 0,
+    end_time: int = 0,
+) -> None:
+    """Check only that each value fits its field.
+
+    What a value means is between the consumer and its lock.
+    """
+    _validate_uint(access_type, UINT8_MAX, "access_type")
+    _validate_uint(start_time, UINT32_MAX, "start_time")
+    _validate_uint(end_time, UINT32_MAX, "end_time")
 
 
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
@@ -759,14 +783,31 @@ class Lock:
         await self._send_keycode(cmd, "clear_keycode")
 
     @raise_if_not_connected
-    async def set_keycode(self, slot: int, pin: str) -> None:
-        """Program a PIN into a keypad slot with an always-valid schedule.
+    async def set_keycode(
+        self,
+        slot: int,
+        pin: str,
+        *,
+        access_type: int = KEYCODE_ACCESS_ALWAYS,
+        start_time: int = 0,
+        end_time: int = 0,
+    ) -> None:
+        """Program a PIN into a keypad slot.
 
         The slot is cleared first, so a KeycodeError from a later step
         leaves the slot empty; the error names the step that failed.
+
+        Schedule fields (written to ``KEYCODE_ACCESS``):
+
+        | Schedule | ``access_type`` | ``start_time`` / ``end_time`` |
+        |---|---|---|
+        | Always | ``0x80`` | ``0`` / ``0`` |
+        | Temporary | ``0x81`` | UTC epoch seconds |
+        | Recurring | ``0x01``-``0x7F`` (Sun=0..Sat=6) | Seconds of day (0-86399) |
         """
         validate_keycode_slot(slot)
         encoded = util.encode_keycode_pin(pin)
+        validate_keycode_access(access_type, start_time, end_time)
         assert self.session is not None  # nosec
         await self.clear_keycode(slot)
 
@@ -776,7 +817,9 @@ class Lock:
         await self._send_keycode(cmd, "set_keycode")
 
         cmd = self.session.build_command(Commands.KEYCODE_ACCESS)
-        cmd[0x0C] = KEYCODE_ACCESS_ALWAYS
+        cmd[0x04:0x08] = util._int_to_bytes(start_time, 4)
+        cmd[0x08:0x0C] = util._int_to_bytes(end_time, 4)
+        cmd[0x0C] = access_type
         cmd[0x0D] = KEYCODE_CREDENTIAL_PIN
         await self._send_keycode(cmd, "set_keycode_access")
 

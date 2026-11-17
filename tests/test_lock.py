@@ -1347,6 +1347,60 @@ async def test_set_keycode_odd_length_pin_and_high_slot() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("access_type", "start_time", "end_time"),
+    [
+        (0x81, 1_760_000_000, 1_760_021_600),
+        (0x81, 1_760_000_000, 0),
+        (0x81, 0, 1_760_003_600),
+        (0x3E, 28_800, 61_200),
+        (0x7F, 79_200, 21_600),
+    ],
+)
+async def test_set_keycode_with_schedule(
+    access_type: int, start_time: int, end_time: int
+) -> None:
+    lock, session = _keycode_lock([_result(op) for op in SET_KEYCODE_STEPS])
+    await lock.set_keycode(
+        3,
+        "123456",
+        access_type=access_type,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    access = session.sent[2]
+    assert access[0x01] == Commands.KEYCODE_ACCESS.value
+    assert int.from_bytes(access[0x04:0x08], "little") == start_time
+    assert int.from_bytes(access[0x08:0x0C], "little") == end_time
+    assert access[0x0C] == access_type
+    assert access[0x0D] == 0x00
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "exc_type", "match"),
+    [
+        ({"access_type": -1}, ValueError, "access_type out of range"),
+        ({"access_type": 0x100}, ValueError, "access_type out of range"),
+        ({"access_type": True}, TypeError, "access_type must be an int"),
+        ({"start_time": -1}, ValueError, "start_time out of range"),
+        ({"end_time": 0x1_0000_0000}, ValueError, "end_time out of range"),
+        ({"start_time": False}, TypeError, "start_time must be an int"),
+        ({"end_time": "100"}, TypeError, "end_time must be an int"),
+    ],
+)
+async def test_set_keycode_schedule_validation_errors(
+    kwargs: dict[str, Any],
+    exc_type: type[Exception],
+    match: str,
+) -> None:
+    lock, session = _keycode_lock([])
+    with pytest.raises(exc_type, match=match):
+        await lock.set_keycode(1, "1234", **kwargs)
+    assert session.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("error", "failing_step"),
     [(0x06, 0x2C), (0x39, 0x2C), (0x07, 0x28)],
 )

@@ -34,7 +34,7 @@ from yalexs_ble.const import (
     OperationError,
     StatusType,
 )
-from yalexs_ble.lock import ActivityLogOverrunError, Lock
+from yalexs_ble.lock import KEYCODE_ACCESS_ALWAYS, ActivityLogOverrunError, Lock
 from yalexs_ble.push import (
     _AUTH_FAILURE_HISTORY,
     _LOCK_OPERATION,
@@ -3570,7 +3570,13 @@ async def test_push_lock_keycode_round_trip() -> None:
         await push_lock.set_keycode(200, "135790")
         await push_lock.clear_keycode(200)
     lock.get_keycode.assert_awaited_once_with(200)
-    lock.set_keycode.assert_awaited_once_with(200, "135790")
+    lock.set_keycode.assert_awaited_once_with(
+        200,
+        "135790",
+        access_type=KEYCODE_ACCESS_ALWAYS,
+        start_time=0,
+        end_time=0,
+    )
     lock.clear_keycode.assert_awaited_once_with(200)
     assert push_lock._last_operation_complete_time != NEVER_TIME
 
@@ -3930,6 +3936,44 @@ async def test_push_lock_keycode_failure_logs_one_warning_without_the_pin(
     assert len(warnings) == 1
     assert "get_keycode" in warnings[0].getMessage()
     assert "135790" not in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_push_lock_set_keycode_with_schedule() -> None:
+    push_lock, lock = _keycode_push_lock()
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        await push_lock.set_keycode(
+            3,
+            "135790",
+            access_type=0x81,
+            start_time=1_760_000_000,
+            end_time=1_760_021_600,
+        )
+    lock.set_keycode.assert_awaited_once_with(
+        3,
+        "135790",
+        access_type=0x81,
+        start_time=1_760_000_000,
+        end_time=1_760_021_600,
+    )
+
+
+@pytest.mark.asyncio
+async def test_push_lock_set_keycode_refuses_bad_schedule_without_connecting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    push_lock, lock = _keycode_push_lock()
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(
+            push_lock, "_ensure_connected", AsyncMock(return_value=lock)
+        ) as ensure_connected,
+        pytest.raises(ValueError, match="access_type out of range"),
+    ):
+        await push_lock.set_keycode(1, "135790", access_type=0x100)
+    ensure_connected.assert_not_awaited()
+    lock.set_keycode.assert_not_awaited()
+    assert not caplog.records
 
 
 def _log_record(log_type: int, index: int = 0) -> bytes:

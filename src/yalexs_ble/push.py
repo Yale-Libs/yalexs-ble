@@ -42,7 +42,13 @@ from .const import (
     LockStateValue,
     LockStatus,
 )
-from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
+from .lock import (
+    KEYCODE_ACCESS_ALWAYS,
+    ActivityLogOverrunError,
+    Lock,
+    validate_keycode_access,
+    validate_keycode_slot,
+)
 from .session import (
     AuthError,
     BluetoothError,
@@ -1330,14 +1336,40 @@ class PushLock:
             "get_keycode", lambda lock: lock.get_keycode(slot)
         )
 
-    async def set_keycode(self, slot: int, pin: str) -> None:
+    async def set_keycode(
+        self,
+        slot: int,
+        pin: str,
+        *,
+        access_type: int = KEYCODE_ACCESS_ALWAYS,
+        start_time: int = 0,
+        end_time: int = 0,
+    ) -> None:
         """Program a PIN into a keypad slot.
 
         The slot is cleared first, so any failure after the Clear can leave it empty.
+
+        Schedule fields (written to ``KEYCODE_ACCESS``):
+
+        | Schedule | ``access_type`` | ``start_time`` / ``end_time`` |
+        |---|---|---|
+        | Always | ``0x80`` | ``0`` / ``0`` |
+        | Temporary | ``0x81`` | UTC epoch seconds |
+        | Recurring | ``0x01``-``0x7F`` (Sun=0..Sat=6) | Seconds of day (0-86399) |
         """
         validate_keycode_slot(slot)
         encode_keycode_pin(pin)
-        await self._run_on_lock("set_keycode", lambda lock: lock.set_keycode(slot, pin))
+        validate_keycode_access(access_type, start_time, end_time)
+        await self._run_on_lock(
+            "set_keycode",
+            lambda lock: lock.set_keycode(
+                slot,
+                pin,
+                access_type=access_type,
+                start_time=start_time,
+                end_time=end_time,
+            ),
+        )
 
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot."""
