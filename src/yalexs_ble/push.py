@@ -1957,6 +1957,9 @@ class PushLock:
                 if self._backlog_remaining:
                     self._backlog_remaining -= 1
             self._log_activity_capture(record, backlog)
+            # The drain holds the operation lock only for each read, so a callback that
+            # does not return blocks this drain and every later one but no command or
+            # update cycle.
             for callback in tuple(self._activity_callbacks):
                 if callback not in self._activity_callbacks:
                     continue
