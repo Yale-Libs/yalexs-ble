@@ -46,6 +46,7 @@ from .lock import (
     validate_keycode_slot,
     validate_parameter_id,
     validate_parameter_value,
+    validate_unity_parameter_value,
 )
 from .session import (
     AuthError,
@@ -1212,6 +1213,30 @@ class PushLock:
         return await self._run_on_lock(
             f"set_parameter 0x{parameter:02X}",
             lambda lock: lock.set_parameter(parameter, value),
+        )
+
+    async def get_unity_parameter(self, parameter: int) -> int:
+        """Read one Unity parameter from the lock and return the value it reports.
+
+        Raises as get_parameter, plus UnityParameterError when the lock reports
+        an error for the parameter.
+        """
+        validate_parameter_id(parameter)
+        return await self._run_on_lock(
+            f"get_unity_parameter 0x{parameter:02X}",
+            lambda lock: lock.get_unity_parameter(parameter),
+        )
+
+    async def set_unity_parameter(self, parameter: int, value: int) -> int:
+        """Write one Unity parameter and return the value in the lock's reply.
+
+        Raises as get_unity_parameter, plus ValueError for a value outside one byte.
+        """
+        validate_parameter_id(parameter)
+        validate_unity_parameter_value(value)
+        return await self._run_on_lock(
+            f"set_unity_parameter 0x{parameter:02X}",
+            lambda lock: lock.set_unity_parameter(parameter, value),
         )
 
     @operation_lock

@@ -65,6 +65,8 @@ class Commands(IntEnum):
     KEYCODE_ACCESS = 0x2B
     KEYCODE_COMMIT = 0x2C
     GETLOG = 0x2D
+    SETUNITY = 0x34
+    GETUNITY = 0x35
     KEYCODE_GET = 0x39
 
 

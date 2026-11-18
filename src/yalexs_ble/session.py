@@ -62,6 +62,18 @@ class KeycodeError(YaleXSBLEError):
         super().__init__(f"{command} failed: {name} (0x{error:02X})")
 
 
+class UnityParameterError(YaleXSBLEError):
+    """The lock reported a non-zero error byte for a Unity parameter."""
+
+    def __init__(self, command: str, parameter: int, error: int) -> None:
+        self.command = command
+        self.parameter = parameter
+        self.error = error
+        super().__init__(
+            f"Lock reported error 0x{error:02X} for Unity parameter 0x{parameter:02X}"
+        )
+
+
 class DisconnectedError(YaleXSBLEError):
     """Disconnected during response."""
 

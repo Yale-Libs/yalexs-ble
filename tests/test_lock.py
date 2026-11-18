@@ -48,6 +48,7 @@ from yalexs_ble.session import (
     OperationProgress,
     ResponseError,
     Session,
+    UnityParameterError,
 )
 from yalexs_ble.util import _simple_checksum
 
@@ -411,6 +412,10 @@ SETTINGS_READ_ACK = bytes.fromhex("aa0400282800000000000000000000000200")
 SETTINGS_READ_RESPONSE = bytes.fromhex("bb0400fb2800000008070807000000000000")
 SETTINGS_WRITE_ACK = bytes.fromhex("aa030075280000005a005a00000000000200")
 SETTINGS_WRITE_RESPONSE = bytes.fromhex("bb030066280000005a005a00000000000000")
+
+# Captured Unity acknowledgments, each with id 0x01 at byte 4.
+UNITY_READ_ACK = bytes.fromhex("aa35001e0100000000000000000000000200")
+UNITY_WRITE_ACK = bytes.fromhex("aa34001d0102000000000000000000000200")
 
 
 def test_settings_response_matcher_takes_value_frame_not_ack() -> None:
@@ -1149,6 +1154,8 @@ async def test_set_keycode_pin_validation(pin: str) -> None:
         ("get_keycode", (1,)),
         ("get_parameter", (0xB2,)),
         ("set_parameter", (0xB2, 30)),
+        ("get_unity_parameter", (0x01,)),
+        ("set_unity_parameter", (0x0D, 0xFF)),
     ],
 )
 async def test_lock_commands_require_a_connection(
@@ -1202,6 +1209,8 @@ def test_keycode_get_matcher_requires_the_echoed_slot() -> None:
         SETTINGS_READ_RESPONSE,
         SETTINGS_WRITE_ACK,
         SETTINGS_WRITE_RESPONSE,
+        UNITY_READ_ACK,
+        UNITY_WRITE_ACK,
     ],
     ids=bytes.hex,
 )
@@ -1648,10 +1657,11 @@ async def test_force_unlatch_does_not_retry_a_raising_write() -> None:
     assert isinstance(excinfo.value.__cause__, BleakError)
 
 
-def test_operation_failed_error_is_reachable_from_the_package_root() -> None:
-    """OperationFailedError is exported from the package root."""
-    assert yalexs_ble.OperationFailedError is OperationFailedError
-    assert "OperationFailedError" in yalexs_ble.__all__
+@pytest.mark.parametrize("error", [OperationFailedError, UnityParameterError])
+def test_an_error_is_reachable_from_the_package_root(error: type[Exception]) -> None:
+    """The error is exported from the package root."""
+    assert getattr(yalexs_ble, error.__name__) is error
+    assert error.__name__ in yalexs_ble.__all__
 
 
 @pytest.mark.asyncio
@@ -1766,6 +1776,16 @@ def _settings_frame(opcode: int, parameter: int, value: int) -> bytes:
     return bytes(frame)
 
 
+def _unity_frame(opcode: int, parameter: int, value: int) -> bytes:
+    """Build the 0xBB Unity reply with entry 0 set and entries 1 to 3 zero."""
+    frame = bytearray(RESPONSE_FRAME_LEN)
+    frame[0x00] = 0xBB
+    frame[0x01] = opcode
+    frame[0x04:0x07] = bytes((parameter, value, 0))
+    frame[0x03] = _simple_checksum(frame)
+    return bytes(frame)
+
+
 def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
     """Deliver frames on the notify path when the command is written."""
 
@@ -1851,6 +1871,63 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
             [],
             id="read-latch-pull-time-without-unlatch",
         ),
+        pytest.param(
+            "get_unity_parameter",
+            (0x01,),
+            [_unity_frame(Commands.GETUNITY.value, 0x01, value=2)],
+            2,
+            [],
+            id="unity-read-lone-answer",
+        ),
+        pytest.param(
+            "get_unity_parameter",
+            (0x01,),
+            [UNITY_READ_ACK, _unity_frame(Commands.GETUNITY.value, 0x01, value=2)],
+            2,
+            [],
+            id="unity-read-ack-then-answer",
+        ),
+        pytest.param(
+            "set_unity_parameter",
+            (0x01, 0x02),
+            [
+                UNITY_WRITE_ACK,
+                _unity_frame(Commands.SETUNITY.value, 0x01, value=5),
+            ],
+            5,
+            [],
+            id="unity-write-ack-then-answer-reporting-another-value",
+        ),
+        pytest.param(
+            "get_unity_parameter",
+            (0x01,),
+            [
+                _unity_frame(Commands.GETUNITY.value, 0x08, value=1),
+                _unity_frame(Commands.GETUNITY.value, 0x01, value=2),
+            ],
+            2,
+            [],
+            id="unity-read-answer-for-another-id-first",
+        ),
+        pytest.param(
+            "get_unity_parameter",
+            (0x01,),
+            [
+                _unity_frame(Commands.SETUNITY.value, 0x01, value=5),
+                _unity_frame(Commands.GETUNITY.value, 0x01, value=2),
+            ],
+            2,
+            [],
+            id="unity-read-setunity-reply-first",
+        ),
+        pytest.param(
+            "set_unity_parameter",
+            (0x0D, 0xFF),
+            [_unity_frame(Commands.SETUNITY.value, 0x0D, value=0xFF)],
+            0xFF,
+            [],
+            id="unity-write-lone-answer",
+        ),
     ],
 )
 async def test_a_parameter_command_completes_on_its_own_bb_frame(
@@ -1910,6 +1987,12 @@ async def test_set_parameter_writes_the_value_little_endian_and_returns_the_answ
         ("set_parameter", (0x100, 30), "not an unsigned one-byte value"),
         ("set_parameter", (0xB2, -1), "not an unsigned four-byte value"),
         ("set_parameter", (0xB2, 0x100000000), "not an unsigned four-byte value"),
+        ("get_unity_parameter", (-1,), "Parameter id is not an unsigned one-byte"),
+        ("get_unity_parameter", (0x100,), "Parameter id is not an unsigned one-byte"),
+        ("set_unity_parameter", (-1, 2), "Parameter id is not an unsigned one-byte"),
+        ("set_unity_parameter", (0x100, 2), "Parameter id is not an unsigned one-byte"),
+        ("set_unity_parameter", (0x01, -1), "value is not an unsigned one-byte"),
+        ("set_unity_parameter", (0x01, 0x100), "value is not an unsigned one-byte"),
     ],
 )
 async def test_parameter_commands_reject_an_argument_the_frame_cannot_hold(

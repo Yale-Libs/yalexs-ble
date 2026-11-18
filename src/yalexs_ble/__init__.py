@@ -73,6 +73,7 @@ from .session import (
     KeycodeError,
     OperationFailedError,
     OperationIncompleteError,
+    UnityParameterError,
     YaleXSBLEError,
 )
 from .util import (
@@ -153,6 +154,7 @@ __all__ = [
     "PushLock",
     "Tamper",
     "TamperType",
+    "UnityParameterError",
     "ValidatedLockConfig",
     "YaleXSBLEDiscovery",
     "YaleXSBLEError",

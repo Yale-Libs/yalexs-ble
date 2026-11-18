@@ -73,6 +73,7 @@ from yalexs_ble.session import (
     OperationIncompleteError,
     ResponseError,
     Session,
+    UnityParameterError,
 )
 from yalexs_ble.util import _simple_checksum
 
@@ -2591,7 +2592,17 @@ async def test_push_lock_keycode_error_propagates_without_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_push_lock_keycode_requires_running(
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("get_keycode", (1,)),
+        ("get_unity_parameter", (0x01,)),
+        ("set_unity_parameter", (0x0D, 0xFF)),
+    ],
+)
+async def test_push_lock_commands_require_running(
+    method: str,
+    args: tuple[int, ...],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     push_lock, _ = _keycode_push_lock()
@@ -2603,7 +2614,7 @@ async def test_push_lock_keycode_requires_running(
         ) as ensure_connected,
         pytest.raises(RuntimeError, match="not running"),
     ):
-        await push_lock.get_keycode(1)
+        await getattr(push_lock, method)(*args)
     ensure_connected.assert_not_awaited()
     assert not caplog.records
 
@@ -2658,7 +2669,18 @@ def _latch_reauth(address: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_push_lock_keycode_timeout_keeps_the_connection(
+@pytest.mark.parametrize(
+    ("method", "args", "name"),
+    [
+        ("set_keycode", (1, "135790"), "set_keycode"),
+        ("get_unity_parameter", (0x01,), "get_unity_parameter 0x01"),
+        ("set_unity_parameter", (0x0D, 0xFF), "set_unity_parameter 0x0D"),
+    ],
+)
+async def test_push_lock_command_timeout_keeps_the_connection(
+    method: str,
+    args: tuple[object, ...],
+    name: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     push_lock, lock, _session, client = _keycode_real_session(
@@ -2681,10 +2703,10 @@ async def test_push_lock_keycode_timeout_keeps_the_connection(
             wraps=push_lock._disconnect_with_timer,
         ) as idle_timer,
         patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.3)),
-        pytest.raises(TimeoutError, match="did not answer set_keycode") as raised,
+        pytest.raises(TimeoutError, match=f"did not answer {name}$") as raised,
     ):
         push_lock._reset_disconnect_timer()
-        await push_lock.set_keycode(1, "135790")
+        await getattr(push_lock, method)(*args)
 
     assert isinstance(raised.value.__cause__, TimeoutError)
     assert push_lock.auth is None
@@ -2695,9 +2717,8 @@ async def test_push_lock_keycode_timeout_keeps_the_connection(
     assert client.write_gatt_char.await_count == 1
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert (
-        "set_keycode failed: TimeoutError: Test Lock: lock did not answer"
-        in warnings[0].getMessage()
+    assert warnings[0].getMessage() == (
+        f"Test Lock: {name} failed: TimeoutError: Test Lock: lock did not answer {name}"
     )
 
 
@@ -7468,6 +7489,16 @@ def _parameter_answer(opcode: int, parameter: int, value: int) -> bytes:
     return _answer_frame(opcode, parameter, value.to_bytes(4, "little"))
 
 
+def _unity_answer(opcode: int, parameter: int, value: int, error: int = 0) -> bytes:
+    """Build a 0xBB Unity reply with entry 0 set and entries 1 to 3 zero."""
+    frame = bytearray(RESPONSE_FRAME_LEN)
+    frame[0x00] = 0xBB
+    frame[0x01] = opcode
+    frame[0x04:0x07] = bytes((parameter, value, error))
+    frame[0x03] = _simple_checksum(frame)
+    return bytes(frame)
+
+
 # The answers a cycle's status polls take, keyed by the opcode and subtype each
 # asks for; the battery answer clears the 3.0 V floor in _update_any_state.
 _STATUS_ANSWERS = {
@@ -7574,7 +7605,9 @@ async def test_push_parameter_commands_warn_once_on_no_answer(
 
 
 @pytest.mark.asyncio
-async def test_push_parameter_commands_publish_no_state() -> None:
+async def test_push_parameter_commands_publish_no_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A parameter answer publishes nothing and leaves the lock state as it was."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
     lock, session, client = _lock_on_a_real_session(push_lock)
@@ -7591,35 +7624,82 @@ async def test_push_parameter_commands_publish_no_state() -> None:
         session,
         client,
         {
-            (opcode, 0xB2): _parameter_answer(opcode, 0xB2, 30)
-            for opcode in (Commands.READSETTING.value, Commands.WRITESETTING.value)
+            **{
+                (opcode, 0xB2): _parameter_answer(opcode, 0xB2, 30)
+                for opcode in (Commands.READSETTING.value, Commands.WRITESETTING.value)
+            },
+            **{
+                (opcode, 0x0D): _unity_answer(opcode, 0x0D, 0xFF)
+                for opcode in (Commands.GETUNITY.value, Commands.SETUNITY.value)
+            },
         },
     )
 
-    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+    with (
+        caplog.at_level(logging.INFO, logger="yalexs_ble.lock"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+    ):
         assert await push_lock.get_parameter(0xB2) == 30
         assert await push_lock.set_parameter(0xB2, 30) == 30
+        assert await push_lock.get_unity_parameter(0x0D) == 0xFF
+        assert await push_lock.set_unity_parameter(0x0D, 0xFF) == 0xFF
 
     assert published == []
     assert push_lock.lock_state == before
+    assert "Unknown state" not in caplog.text
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("method", "args", "opcode", "answer"),
+    ("method", "args", "opcode", "answer", "returned"),
     [
         pytest.param(
-            "set_parameter", (0xB2, 30), Commands.WRITESETTING, 30, id="answered-write"
+            "set_parameter",
+            (0xB2, 30),
+            Commands.WRITESETTING,
+            _parameter_answer(Commands.WRITESETTING.value, 0xB2, 30),
+            30,
+            id="answered-write",
         ),
         pytest.param(
             "set_parameter",
             (0xB2, 30),
             Commands.WRITESETTING,
             None,
+            None,
             id="unanswered-write",
         ),
         pytest.param(
-            "get_parameter", (0xB2,), Commands.READSETTING, 30, id="answered-read"
+            "get_parameter",
+            (0xB2,),
+            Commands.READSETTING,
+            _parameter_answer(Commands.READSETTING.value, 0xB2, 30),
+            30,
+            id="answered-read",
+        ),
+        pytest.param(
+            "set_unity_parameter",
+            (0x0D, 0xFF),
+            Commands.SETUNITY,
+            _unity_answer(Commands.SETUNITY.value, 0x0D, 0xFF),
+            0xFF,
+            id="answered-unity-write",
+        ),
+        pytest.param(
+            "set_unity_parameter",
+            (0x0D, 0xFF),
+            Commands.SETUNITY,
+            None,
+            None,
+            id="unanswered-unity-write",
+        ),
+        pytest.param(
+            "get_unity_parameter",
+            (0x0D,),
+            Commands.GETUNITY,
+            _unity_answer(Commands.GETUNITY.value, 0x0D, 0xFF),
+            0xFF,
+            id="answered-unity-read",
         ),
     ],
 )
@@ -7627,7 +7707,8 @@ async def test_a_parameter_command_does_not_make_the_next_cycle_poll_the_lock_st
     method: str,
     args: tuple[int, ...],
     opcode: Commands,
-    answer: int | None,
+    answer: bytes | None,
+    returned: int | None,
 ) -> None:
     """A parameter read or write adds no lock status poll to the next update cycle."""
     push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3f")
@@ -7636,7 +7717,7 @@ async def test_a_parameter_command_does_not_make_the_next_cycle_poll_the_lock_st
     push_lock._client = lock
     answers = dict(_STATUS_ANSWERS)
     if answer is not None:
-        answers[(opcode.value, 0xB2)] = _parameter_answer(opcode.value, 0xB2, answer)
+        answers[(opcode.value, args[0])] = answer
     written = _record_and_answer(session, client, answers)
     published: list[LockState] = []
 
@@ -7649,7 +7730,7 @@ async def test_a_parameter_command_does_not_make_the_next_cycle_poll_the_lock_st
             if answer is not None
             else pytest.raises(TimeoutError, match="did not answer")
         ):
-            assert await getattr(push_lock, method)(*args) == answer
+            assert await getattr(push_lock, method)(*args) == returned
         await push_lock._update()
 
     push_lock._running = False
@@ -7658,7 +7739,7 @@ async def test_a_parameter_command_does_not_make_the_next_cycle_poll_the_lock_st
         (Commands.GETSTATUS, StatusType.BATTERY.value),
         (Commands.GETSTATUS, StatusType.DOOR_ONLY.value),
         (Commands.GETSTATUS, StatusType.LOCK_ONLY.value),
-        (opcode, 0xB2),
+        (opcode, args[0]),
     ]
     # The cycle under test publishes its state on completion, in every row.
     assert [state.lock for state in published] == [LockStatus.LOCKED]
@@ -7714,11 +7795,48 @@ async def test_keep_alive_after_an_answered_write_polls_the_lock_status() -> Non
 
 
 @pytest.mark.asyncio
-async def test_push_parameter_late_answer_is_taken_by_the_next_write() -> None:
-    """Known limit: a write of an id takes a late answer that arrives while it waits."""
+@pytest.mark.parametrize(
+    ("method", "first", "second", "late", "own", "returned"),
+    [
+        pytest.param(
+            "set_parameter",
+            (0xB2, 30),
+            (0xB2, 3),
+            _parameter_answer(Commands.WRITESETTING.value, 0xB2, 30),
+            _parameter_answer(Commands.WRITESETTING.value, 0xB2, 3),
+            30,
+            id="parameter-write",
+        ),
+        pytest.param(
+            "set_unity_parameter",
+            (0x0D, 0xFF),
+            (0x0D, 0x00),
+            _unity_answer(Commands.SETUNITY.value, 0x0D, 0xFF),
+            _unity_answer(Commands.SETUNITY.value, 0x0D, 0x00),
+            0xFF,
+            id="unity-write",
+        ),
+        pytest.param(
+            "get_unity_parameter",
+            (0x01,),
+            (0x01,),
+            _unity_answer(Commands.GETUNITY.value, 0x01, 2),
+            _unity_answer(Commands.GETUNITY.value, 0x01, 3),
+            2,
+            id="unity-read",
+        ),
+    ],
+)
+async def test_push_parameter_late_answer_is_taken_by_the_next_command_it_matches(
+    method: str,
+    first: tuple[int, ...],
+    second: tuple[int, ...],
+    late: bytes,
+    own: bytes,
+    returned: int,
+) -> None:
+    """Known limit: a waiting command takes a late answer matching its opcode and id."""
     push_lock, lock, session, client = _keycode_real_session("aa:bb:cc:dd:ee:36")
-    late = _parameter_answer(Commands.WRITESETTING.value, 0xB2, 30)
-    own = _parameter_answer(Commands.WRITESETTING.value, 0xB2, 3)
     writes = 0
 
     async def write_gatt_char(*_: object) -> None:
@@ -7734,9 +7852,11 @@ async def test_push_parameter_late_answer_is_taken_by_the_next_write() -> None:
         patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
         patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.01)),
     ):
-        with pytest.raises(TimeoutError, match="did not answer set_parameter 0xB2"):
-            await push_lock.set_parameter(0xB2, 30)
-        assert await push_lock.set_parameter(0xB2, 3) == 30
+        with pytest.raises(
+            TimeoutError, match=f"did not answer {method} 0x{first[0]:02X}"
+        ):
+            await getattr(push_lock, method)(*first)
+        assert await getattr(push_lock, method)(*second) == returned
 
     assert writes == 2
 
@@ -7748,6 +7868,10 @@ async def test_push_parameter_late_answer_is_taken_by_the_next_write() -> None:
         ("get_parameter", (0x100,), "not an unsigned one-byte value"),
         ("set_parameter", (0x100, 30), "not an unsigned one-byte value"),
         ("set_parameter", (0xB2, 0x100000000), "not an unsigned four-byte value"),
+        ("get_unity_parameter", (0x100,), "Parameter id is not an unsigned one-byte"),
+        ("set_unity_parameter", (-1, 2), "Parameter id is not an unsigned one-byte"),
+        ("set_unity_parameter", (0x01, 0x100), "value is not an unsigned one-byte"),
+        ("set_unity_parameter", (0x01, -1), "value is not an unsigned one-byte"),
     ],
 )
 async def test_push_parameter_commands_refuse_a_bad_argument_without_connecting(
@@ -7764,3 +7888,98 @@ async def test_push_parameter_commands_refuse_a_bad_argument_without_connecting(
             await getattr(push_lock, name)(*args)
 
     push_lock._running = False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args", "answer", "command", "returned"),
+    [
+        pytest.param(
+            "get_unity_parameter",
+            (0x01,),
+            _unity_answer(Commands.GETUNITY.value, 0x01, 2),
+            # Constructed GetUnity: id 0x01 in entry 0, entries 1 to 3 zero.
+            "ee3500da0100000000000000000000000200",
+            2,
+            id="read",
+        ),
+        pytest.param(
+            "set_unity_parameter",
+            (0x0D, 0xFF),
+            _unity_answer(Commands.SETUNITY.value, 0x0D, 0xFF),
+            # Constructed SetUnity: id 0x0D and value 0xFF in entry 0.
+            "ee3400d00dff000000000000000000000200",
+            0xFF,
+            id="write",
+        ),
+    ],
+)
+async def test_a_unity_parameter_command_returns_the_value_in_the_reply(
+    method: str,
+    args: tuple[int, ...],
+    answer: bytes,
+    command: str,
+    returned: int,
+) -> None:
+    """The call sends one entry and returns the value the reply holds for it."""
+    push_lock, lock, session, client = _keycode_real_session("aa:bb:cc:dd:ee:43")
+    written = _record_and_answer(
+        session, client, {(answer[0x01], answer[0x04]): answer}
+    )
+
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        assert await getattr(push_lock, method)(*args) == returned
+
+    push_lock._running = False
+    assert written == [bytes.fromhex(command)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "args", "opcode"),
+    [
+        ("get_unity_parameter", (0x01,), Commands.GETUNITY),
+        ("set_unity_parameter", (0x0D, 0xFF), Commands.SETUNITY),
+    ],
+)
+@pytest.mark.parametrize("error", [0x01, 0xFF], ids=["error-0x01", "error-0xFF"])
+async def test_a_unity_parameter_error_byte_raises_unity_parameter_error(
+    method: str,
+    args: tuple[int, ...],
+    opcode: Commands,
+    error: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-zero error byte raises UnityParameterError with command, id, and byte."""
+    push_lock, lock, session, client = _keycode_real_session("aa:bb:cc:dd:ee:44")
+    parameter = args[0]
+    written = _record_and_answer(
+        session,
+        client,
+        {
+            (opcode.value, parameter): _unity_answer(
+                opcode.value, parameter, 0, error=error
+            )
+        },
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        pytest.raises(UnityParameterError) as raised,
+    ):
+        await getattr(push_lock, method)(*args)
+
+    push_lock._running = False
+    assert raised.value.command == method
+    assert raised.value.parameter == parameter
+    assert raised.value.error == error
+    message = f"Lock reported error 0x{error:02X} for Unity parameter 0x{parameter:02X}"
+    assert str(raised.value) == message
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == [
+        f"Test Lock: {method} 0x{parameter:02X} failed: UnityParameterError: {message}"
+    ]
+    assert [(command[0x01], command[0x04]) for command in written] == [
+        (opcode.value, parameter)
+    ]

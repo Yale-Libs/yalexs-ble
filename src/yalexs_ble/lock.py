@@ -44,6 +44,7 @@ from .session import (
     OperationProgress,
     ResponseError,
     Session,
+    UnityParameterError,
     YaleXSBLEError,
 )
 
@@ -118,21 +119,20 @@ def convert_voltage_to_percentage(voltage: float) -> int:
     return AA_BATTERY_VOLTAGE_MAP[AA_BATTERY_VOLTAGE_LIST[pos]]
 
 
-def _settings_response_matcher(
-    command_value: int, setting_value: int
-) -> Callable[[bytes], bool]:
-    """Match the 0xBB settings response to one command opcode and setting id.
+def _settings_response_matcher(opcode: int, parameter: int) -> Callable[[bytes], bool]:
+    """Match the 0xBB reply with a command's opcode at byte 1 and its id at byte 4.
 
-    The 0xAA acknowledgment that may precede the response is not matched: its
-    value field holds zero on a read and the written value on a write.
+    A command's 0xAA acknowledgment, which may precede the response, is not
+    matched: its value field holds zero on a read and the written value on a
+    write.
     """
 
     def matches(data: bytes) -> bool:
         return (
             len(data) >= 0x0C
             and data[0x00] == 0xBB
-            and data[0x01] == command_value
-            and data[0x04] == setting_value
+            and data[0x01] == opcode
+            and data[0x04] == parameter
         )
 
     return matches
@@ -186,6 +186,8 @@ NO_STATE_OPCODES = frozenset(
         Commands.GETLOG.value,
         Commands.READSETTING.value,
         Commands.WRITESETTING.value,
+        Commands.SETUNITY.value,
+        Commands.GETUNITY.value,
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
@@ -229,6 +231,15 @@ def validate_parameter_value(value: int) -> None:
         raise ValueError(
             "Parameter value is not an unsigned four-byte value "
             f"(0 to 0xFFFFFFFF): {value}"
+        )
+
+
+def validate_unity_parameter_value(value: int) -> None:
+    """Raise ValueError for a Unity parameter value outside one unsigned byte."""
+    if not 0 <= value <= 0xFF:
+        raise ValueError(
+            "Unity parameter value is not an unsigned one-byte value "
+            f"(0 to 0xFF): {value}"
         )
 
 
@@ -909,6 +920,64 @@ class Lock:
             answered,
         )
         return answered
+
+    @raise_if_not_connected
+    async def get_unity_parameter(self, parameter: int) -> int:
+        """Read one Unity parameter and return the value the lock reports.
+
+        Raises as get_parameter does, plus UnityParameterError when the lock reports
+        an error for the parameter.
+        """
+        validate_parameter_id(parameter)
+        _LOGGER.debug("%s: Reading Unity parameter 0x%02X", self.name, parameter)
+        assert self.session is not None  # nosec
+        command = self.session.build_operation_command(Commands.GETUNITY, parameter)
+        value = await self._send_unity_command(command, "get_unity_parameter")
+        _LOGGER.debug(
+            "%s: Unity parameter 0x%02X reads 0x%02X", self.name, parameter, value
+        )
+        return value
+
+    @raise_if_not_connected
+    async def set_unity_parameter(self, parameter: int, value: int) -> int:
+        """Write one Unity parameter and return the value in the lock's reply.
+
+        Raises ValueError for an id or a value outside one byte, before any frame
+        is built, and otherwise as get_unity_parameter does.
+        """
+        validate_parameter_id(parameter)
+        validate_unity_parameter_value(value)
+        _LOGGER.debug(
+            "%s: Writing Unity parameter 0x%02X as 0x%02X", self.name, parameter, value
+        )
+        assert self.session is not None  # nosec
+        command = self.session.build_operation_command(Commands.SETUNITY, parameter)
+        command[0x05] = value
+        answered = await self._send_unity_command(command, "set_unity_parameter")
+        _LOGGER.debug(
+            "%s: Unity parameter 0x%02X write answered with 0x%02X",
+            self.name,
+            parameter,
+            answered,
+        )
+        return answered
+
+    async def _send_unity_command(self, command: bytearray, command_name: str) -> int:
+        """Send a GetUnity or SetUnity command for entry 0; return the reply's value.
+
+        Raises UnityParameterError when the reply's error byte for the entry is
+        not zero.
+        """
+        assert self.session is not None  # nosec
+        parameter = command[0x04]
+        response = await self.session.execute(
+            command,
+            command_name,
+            _settings_response_matcher(command[0x01], parameter),
+        )
+        if error := response[0x06]:
+            raise UnityParameterError(command_name, parameter, error)
+        return response[0x05]
 
     @raise_if_not_connected
     async def get_log(self) -> bytes:
