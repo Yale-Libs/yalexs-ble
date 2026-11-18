@@ -163,7 +163,7 @@ def test_the_capture_line_splits_on_spaces_into_its_fields_in_order(
         ),
     ):
         log_record(
-            logging.getLogger("yalexs_ble.activity_capture"),
+            "AA:BB:CC:DD:EE:FF",
             "Test Lock",
             bytes.fromhex(frame),
             True,

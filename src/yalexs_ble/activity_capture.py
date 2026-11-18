@@ -21,13 +21,8 @@ from .const import Brand, DoorStatus, LockStatus
 _LOGGER = logging.getLogger(__name__)
 
 
-def capture_logger(address: str) -> logging.Logger:
-    """Return the capture logger of the lock at address."""
-    return _LOGGER.getChild(address.replace(":", "").lower())
-
-
 def log_record(
-    logger: logging.Logger,
+    address: str,
     name: str,
     reply: bytes,
     backlog: bool,
@@ -35,10 +30,15 @@ def log_record(
     lock: LockStatus,
     door: DoorStatus,
 ) -> None:
-    """Log reply's timing, lock and door status, flag and both decodes as one line.
+    """Log reply's timing, lock and door status, flag, and both decodes as one line.
 
-    since_change is the seconds since the last settled lock change, or None.
+    The line goes to the capture logger of the lock at address, when that logger is
+    enabled for debug. since_change is the seconds since the last settled lock
+    change, or None.
     """
+    logger = _LOGGER.getChild(address.replace(":", "").lower())
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
     captured = time.time()
     yale = parse_log_event_packet(reply, Brand.YALE)
     time_stamp: int | None = getattr(yale, "time_stamp", None)

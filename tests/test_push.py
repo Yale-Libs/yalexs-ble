@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -18,7 +18,6 @@ from bleak_retry_connector import BleakNotFoundError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
-from yalexs_ble import activity_capture
 from yalexs_ble.activity_log import LogRecord, parse_log_event_packet
 from yalexs_ble.const import (
     ASSA_ABLOY_MFR_ID,
@@ -4125,20 +4124,32 @@ _READ_TIME = 0.6
 _WINDOW_READS = math.ceil(ACTIVITY_DRAIN_WINDOW / _READ_TIME) + 1
 
 
+_Entry = TypeVar("_Entry")
+
+
+def _due_on_a_clock(
+    clock: list[float], log: list[tuple[float, _Entry]]
+) -> _Entry | bytes:
+    """Move clock on by _READ_TIME, then take the first entry log holds by then.
+
+    Each entry is held from its time on clock; with none held, the GetLogError.
+    """
+    clock[0] += _READ_TIME
+    if not log or log[0][0] > clock[0]:
+        return _GET_LOG_ERROR
+    return log.pop(0)[1]
+
+
 def _log_on_a_clock(
     clock: list[float], log: list[tuple[float, bytes | Exception]]
 ) -> AsyncMock:
-    """A GetLog mock over log, which holds each entry from its time on clock.
+    """A GetLog mock answering each read with _due_on_a_clock over log.
 
-    Each read moves clock on by _READ_TIME, then takes the first entry held, or
-    answers the GetLogError when log holds none; an exception entry is raised.
+    An exception entry is raised.
     """
 
     async def get_log() -> bytes:
-        clock[0] += _READ_TIME
-        if not log or log[0][0] > clock[0]:
-            return _GET_LOG_ERROR
-        _, entry = log.pop(0)
+        entry = _due_on_a_clock(clock, log)
         if isinstance(entry, Exception):
             raise entry
         return entry
@@ -4149,18 +4160,13 @@ def _log_on_a_clock(
 def _replies_on_a_clock(
     clock: list[float], log: list[tuple[float, bytes]]
 ) -> Iterator[bytes]:
-    """GetLog replies over log, which holds each entry from its time on clock.
+    """GetLog replies, each from _due_on_a_clock over log.
 
-    Each reply moves clock on by _READ_TIME, then is the first entry held, or the
-    GetLogError when log holds none. The replies end after ACTIVITY_DRAIN_MARGIN,
-    so a drain that never ends fails its test.
+    The replies end after ACTIVITY_DRAIN_MARGIN, so a drain that never ends fails
+    its test.
     """
     for _ in range(ACTIVITY_DRAIN_MARGIN):
-        clock[0] += _READ_TIME
-        if not log or log[0][0] > clock[0]:
-            yield _GET_LOG_ERROR
-        else:
-            yield log.pop(0)[1]
+        yield _due_on_a_clock(clock, log)
 
 
 def _drain_on_a_clock(
@@ -4826,9 +4832,8 @@ async def test_a_settled_lock_change_during_a_drain_reads_on_for_its_window(
 ) -> None:
     """A settled lock change during a drain moves the window, and the drain reads on."""
     with _patched_clock() as clock:
-        # The log holds the records of before; the GetLogError answers the rest.
         push_lock, written, received = _drain_on_a_clock(
-            clock, [(clock[0], reply) for reply in before if reply != _GET_LOG_ERROR]
+            clock, [(clock[0], reply) for reply in before]
         )
 
         async def unlock_at_the_last_reply_before(
@@ -5059,19 +5064,17 @@ async def test_a_caller_queued_behind_a_drain_read_runs_before_the_next_read(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("backlog_remaining", "first_reply", "first_read"),
-    [
-        (0, lambda: _RECORDS[0], _GET_LOG),
-        (None, lambda: _count_reply(0), _COUNT_READ),
-    ],
-    ids=["get_log_reply", "unread_count_reply"],
+    "backlog_remaining", [0, None], ids=["get_log_reply", "unread_count_reply"]
 )
 async def test_a_cycle_due_in_the_turn_of_a_drain_reply_runs_before_the_next_get_log(
     backlog_remaining: int | None,
-    first_reply: Callable[[], bytes],
-    first_read: tuple[int, int],
 ) -> None:
     """An update timer firing in a drain reply's turn polls before the next GetLog."""
+    first_reply, first_read = (
+        (_RECORDS[0], _GET_LOG)
+        if backlog_remaining == 0
+        else (_count_reply(0), _COUNT_READ)
+    )
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:d4", always_connected=True)
     push_lock.register_log_record_callback(_recorder([]))
     push_lock._backlog_remaining = backlog_remaining
@@ -5080,7 +5083,7 @@ async def test_a_cycle_due_in_the_turn_of_a_drain_reply_runs_before_the_next_get
     session = lock.session
     assert session is not None
     loop = asyncio.get_running_loop()
-    log = iter([first_reply(), _GET_LOG_ERROR])
+    log = iter([first_reply, _GET_LOG_ERROR])
 
     async def answer(_char: object, command: bytearray, _response: bool) -> None:
         written.append(bytes(command))
@@ -5653,16 +5656,18 @@ async def test_a_bug_in_a_drain_read_is_logged_and_leaves_the_drain_owed(
 
 
 _CAPTURE_LOGGER = "yalexs_ble.activity_capture"
-# Upper case, so the tests pin that capture_logger lower-cases the address.
+# Upper case, so the tests pin that log_record lower-cases the address.
 _CAPTURE_ADDRESS = "AA:BB:CC:DD:EE:E0"
 # The capture logger of the lock at _CAPTURE_ADDRESS, written out so a test fails
-# if capture_logger names it differently.
+# if log_record names it differently.
 _LOCK_CAPTURE_LOGGER = f"{_CAPTURE_LOGGER}.aabbccddeee0"
 
 
 @pytest.fixture
 def logger_levels() -> Iterator[Callable[[str, int], None]]:
     """Set the levels of named loggers for the test, and restore each after it."""
+    # caplog.set_level also sets its handler's level, which would hide the debug
+    # lines a row at info must show absent.
     saved: dict[str, int] = {}
 
     def set_level(name: str, level: int) -> None:
@@ -5817,7 +5822,7 @@ async def test_without_debug_for_the_capture_logger_no_line_and_no_decode_run(
     # its readers.
     with patch(
         "yalexs_ble.activity_capture.parse_log_event_packet",
-        wraps=activity_capture.parse_log_event_packet,
+        wraps=parse_log_event_packet,
     ) as parse:
         await _drain_on_a_door_change(push_lock)
 
@@ -5895,12 +5900,8 @@ async def test_since_change_counts_monotonic_seconds_from_the_settled_lock_chang
 ) -> None:
     """since_change is "-" with no settled lock change, else the seconds since it."""
     logger_levels(_CAPTURE_LOGGER, logging.DEBUG)
-    push_lock = _named_push_lock(_CAPTURE_ADDRESS, always_connected=False)
-    push_lock.register_log_record_callback(_recorder([]))
-    _ready_to_drain(push_lock)
     with _patched_clock() as clock:
-        mock_lock = _mock_link(push_lock, [])
-        mock_lock.get_log = _log_on_a_clock(clock, [])
+        push_lock, _, _ = _drain_on_a_clock(clock, [])
         push_lock._update_any_state([change])
         await _drained(push_lock)
 

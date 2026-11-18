@@ -202,8 +202,7 @@ ACTIVITY_DRAIN_FAILURE_BACKOFF = 3600
 # a backlog drain also gets its unread count.
 ACTIVITY_DRAIN_MARGIN = 128
 # Seconds we allow the lock to write its first record of a settled change of the
-# displayed lock status. Until a record is read after the change, a GetLogError whose
-# dirty bit is clear ends a drain only when its read started after these seconds.
+# displayed lock status.
 ACTIVITY_DRAIN_WINDOW = 2.0
 
 # Receives each decoded activity log record and its backlog flag.
@@ -501,9 +500,10 @@ class PushLock:
         self._backlog_remaining: int | None = None
         self._activity_drain_pending = False
         self._last_settled_lock_change_time = NEVER_TIME
-        # Whether a drain has read a record, a GetLog reply other than a
-        # GetLogError, since the last settled change of the displayed lock status.
-        self._activity_record_since_lock_change = False
+        # When the drain window ends: ACTIVITY_DRAIN_WINDOW after the last settled
+        # lock change, and NEVER_TIME once a record, a GetLog reply other than a
+        # GetLogError, is read after it.
+        self._activity_drain_window_end = NEVER_TIME
         self._activity_drain_failures = 0
         self._earliest_activity_drain_time = NEVER_TIME
         self._activity_drain_task: asyncio.Task[None] | None = None
@@ -1443,7 +1443,9 @@ class PushLock:
             changes["lock"] = display.lock
             if display.settled:
                 self._last_settled_lock_change_time = time.monotonic()
-                self._activity_record_since_lock_change = False
+                self._activity_drain_window_end = (
+                    self._last_settled_lock_change_time + ACTIVITY_DRAIN_WINDOW
+                )
                 self._owe_activity_drain()
         if lock_state.secure != display.secure:
             changes["secure"] = display.secure
@@ -1830,8 +1832,8 @@ class PushLock:
         )
 
     def _activity_drain_window_open(self, started: float) -> bool:
-        """True for a read started within the window after the last settled change."""
-        return started < self._last_settled_lock_change_time + ACTIVITY_DRAIN_WINDOW
+        """True for a read started before the drain window's end."""
+        return started < self._activity_drain_window_end
 
     def _owe_activity_drain(self) -> None:
         """Mark the activity log for a drain and start the drain task if one is due."""
@@ -1864,8 +1866,8 @@ class PushLock:
         Returns the reply and the time the read started, or None, having sent
         nothing, when no log record callback is left.
         """
-        # This yield lets an update task created in the loop turn in which the last
-        # reply arrived ask for the lock before the drain asks for it again.
+        # This yield lets a task created in the loop turn in which the last reply
+        # arrived ask for the operation lock before the drain does.
         await asyncio.sleep(0)
         async with self._operation_lock:
             if not self._activity_callbacks:
@@ -1932,11 +1934,10 @@ class PushLock:
     ) -> bool:
         """Decode and deliver read and each GetLog reply after it until the drain ends.
 
-        A GetLogError whose dirty bit is clear ends the drain once a record has been
-        read since the last settled lock change, or when its read started after the
-        drain window's end, and otherwise resets budget to ACTIVITY_DRAIN_MARGIN.
-        Returns False, after a backoff and a warning, when budget replies in a row
-        hold no GetLogError whose dirty bit is clear.
+        A GetLogError whose dirty bit is clear ends the drain when its read started
+        after the drain window's end, and otherwise resets budget to
+        ACTIVITY_DRAIN_MARGIN. Returns False, after a backoff and a warning, when
+        budget replies in a row hold no GetLogError whose dirty bit is clear.
         """
         replies = 0
         while read is not None:
@@ -1951,7 +1952,7 @@ class PushLock:
                 if end:
                     self._backlog_remaining = 0
             else:
-                self._activity_record_since_lock_change = True
+                self._activity_drain_window_end = NEVER_TIME
                 # None means a backlog was armed mid-read; this record is in it.
                 backlog = self._backlog_remaining != 0
                 if self._backlog_remaining:
@@ -1974,13 +1975,7 @@ class PushLock:
                         exc_info=True,
                     )
             if end:
-                # The window is the time we allow the lock to write its first record
-                # of the change, so an empty log after a record read since the change
-                # ends the drain.
-                if (
-                    self._activity_record_since_lock_change
-                    or not self._activity_drain_window_open(started)
-                ):
+                if not self._activity_drain_window_open(started):
                     return True
                 budget, replies = ACTIVITY_DRAIN_MARGIN, 0
             elif replies == budget:
@@ -2029,15 +2024,12 @@ class PushLock:
         )
 
     def _log_activity_capture(self, record: LogRecord, backlog: bool) -> None:
-        """Log record's capture line when its capture logger is enabled for debug."""
-        logger = activity_capture.capture_logger(self.address)
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
+        """Pass record to activity_capture.log_record with the lock's status."""
         since_change = None
         if self._last_settled_lock_change_time != NEVER_TIME:
             since_change = time.monotonic() - self._last_settled_lock_change_time
         activity_capture.log_record(
-            logger,
+            self.address,
             self.name,
             record.raw,
             backlog,
