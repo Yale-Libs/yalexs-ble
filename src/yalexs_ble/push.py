@@ -205,9 +205,6 @@ ACTIVITY_DRAIN_MARGIN = 128
 # displayed lock status. Until a record is read after the change, a GetLogError whose
 # dirty bit is clear ends a drain only when its read started after these seconds.
 ACTIVITY_DRAIN_WINDOW = 2.0
-# Seconds from the capture's registration, its last GetLogError whose dirty bit
-# is clear, or its last ask, whichever is latest, to its next ask for a drain.
-ACTIVITY_CAPTURE_DRAIN_DELAY = 3600.0
 
 # Receives each decoded activity log record and its backlog flag.
 LogRecordCallback = Callable[[LogRecord, bool], Awaitable[None]]
@@ -511,8 +508,6 @@ class PushLock:
         self._earliest_activity_drain_time = NEVER_TIME
         self._activity_drain_task: asyncio.Task[None] | None = None
         self._activity_drain_read_holds_lock = False
-        self._remove_activity_capture: Callable[[], None] | None = None
-        self._activity_capture_timer: asyncio.TimerHandle | None = None
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
@@ -1958,6 +1953,7 @@ class PushLock:
                 backlog = self._backlog_remaining != 0
                 if self._backlog_remaining:
                     self._backlog_remaining -= 1
+            self._log_activity_capture(record, backlog)
             for callback in tuple(self._activity_callbacks):
                 if callback not in self._activity_callbacks:
                     continue
@@ -2026,10 +2022,11 @@ class PushLock:
             time.monotonic() + ACTIVITY_DRAIN_FAILURE_BACKOFF
         )
 
-    async def _activity_capture(
-        self, logger: logging.Logger, record: LogRecord, backlog: bool
-    ) -> None:
-        """Log the capture line for record; the log's end reschedules the next ask."""
+    def _log_activity_capture(self, record: LogRecord, backlog: bool) -> None:
+        """Log record's capture line when its capture logger is enabled for debug."""
+        logger = activity_capture.capture_logger(self.address)
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         since_change = None
         if self._last_settled_lock_change_time != NEVER_TIME:
             since_change = time.monotonic() - self._last_settled_lock_change_time
@@ -2042,30 +2039,6 @@ class PushLock:
             self.lock_status,
             self.door_status,
         )
-        if isinstance(record, GetLogError) and not record.dirty_bit:
-            self._restart_activity_capture_timer(logger)
-
-    def _restart_activity_capture_timer(self, logger: logging.Logger) -> None:
-        """Schedule the capture's next ask ACTIVITY_CAPTURE_DRAIN_DELAY from now."""
-        self._cancel_activity_capture_timer()
-        self._activity_capture_timer = self.loop.call_later(
-            ACTIVITY_CAPTURE_DRAIN_DELAY, self._ask_for_activity_drain, logger
-        )
-
-    def _cancel_activity_capture_timer(self) -> None:
-        """Cancel the timer for the capture's next ask."""
-        if self._activity_capture_timer:
-            self._activity_capture_timer.cancel()
-            self._activity_capture_timer = None
-
-    def _ask_for_activity_drain(self, logger: logging.Logger) -> None:
-        """Owe a drain for the capture, and request an update when the link is down."""
-        activity_capture.log_drain_ask(logger, self.name, ACTIVITY_CAPTURE_DRAIN_DELAY)
-        self._restart_activity_capture_timer(logger)
-        self._owe_activity_drain()
-        if not self.is_connected:
-            # The drain never connects; the update's connection starts it.
-            self._schedule_future_update_with_debounce(MANUAL_UPDATE_COALESCE_SECONDS)
 
     async def _set_slow_connection_params(self, lock: Lock) -> None:
         """Set slow BLE connection parameters to conserve battery."""
@@ -2250,23 +2223,12 @@ class PushLock:
         if device := await get_device(self.address):
             self.set_ble_device(device)
             self._schedule_future_update_with_debounce(ADV_UPDATE_COALESCE_SECONDS)
-        # The level is read here once, so a change takes effect at the next start().
-        if (logger := activity_capture.capture_logger(self.address)) is not None:
-            self._remove_activity_capture = self.register_log_record_callback(
-                functools.partial(self._activity_capture, logger)
-            )
-            self._restart_activity_capture_timer(logger)
-            activity_capture.log_capture_on(logger, self.name)
 
         return self._cancel
 
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
-        if self._remove_activity_capture is not None:
-            self._remove_activity_capture()
-            self._remove_activity_capture = None
-        self._cancel_activity_capture_timer()
         if self._activity_drain_task is not None:
             self._activity_drain_task.cancel()
         if not self._operation_in_flight:

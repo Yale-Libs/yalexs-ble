@@ -1,7 +1,9 @@
-"""Debug-log every activity log record the library reads, in both numberings.
+"""Log each GetLog reply a drain reads, with its decodes.
 
-On for every lock when this logger's own level is DEBUG, or for one lock through
-its child logger, named by its address in lower case without colons.
+Each lock's lines are debug lines on the child logger of this module's logger
+named for the lock's Bluetooth address, in lower case without colons, for example
+yalexs_ble.activity_capture.aabbccddeeff for AA:BB:CC:DD:EE:FF. Debug enabled for
+that logger turns the lines on, as for any logger.
 """
 
 from __future__ import annotations
@@ -19,26 +21,9 @@ from .const import Brand, DoorStatus, LockStatus
 _LOGGER = logging.getLogger(__name__)
 
 
-def capture_logger(address: str) -> logging.Logger | None:
-    """Return address's capture logger, or None when the capture is off for it."""
-    logger = _LOGGER.getChild(address.replace(":", "").lower())
-    if logging.DEBUG in (_LOGGER.level, logger.level):
-        return logger
-    return None
-
-
-def log_capture_on(logger: logging.Logger, name: str) -> None:
-    """Log that the capture of name's records has started."""
-    logger.debug("%s: capture on", name)
-
-
-def log_drain_ask(logger: logging.Logger, name: str, delay: float) -> None:
-    """Log the capture's ask for a drain after delay seconds."""
-    logger.debug(
-        "%s: no GetLogError with the dirty bit clear for %d s, asking for a drain",
-        name,
-        delay,
-    )
+def capture_logger(address: str) -> logging.Logger:
+    """Return the capture logger of the lock at address."""
+    return _LOGGER.getChild(address.replace(":", "").lower())
 
 
 def log_record(
