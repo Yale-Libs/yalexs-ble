@@ -3,7 +3,7 @@ import logging
 import math
 import struct
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -4066,7 +4066,7 @@ def _activity_push_lock(
 
 
 def _drain_on_a_real_session(
-    push_lock: PushLock, replies: list[bytes]
+    push_lock: PushLock, replies: Iterable[bytes]
 ) -> tuple[Lock, list[bytes]]:
     """Connect push_lock to a real Lock and Session that answer with replies.
 
@@ -4147,6 +4147,44 @@ def _log_on_a_clock(
     return AsyncMock(side_effect=get_log)
 
 
+def _replies_on_a_clock(
+    clock: list[float], log: list[tuple[float, bytes]]
+) -> Iterator[bytes]:
+    """GetLog replies over log, which holds each entry from its time on clock.
+
+    Each reply moves clock on by _READ_TIME, then is the first entry held, or the
+    GetLogError when log holds none. The replies end after ACTIVITY_DRAIN_MARGIN,
+    so a drain that never ends fails its test.
+    """
+    for _ in range(ACTIVITY_DRAIN_MARGIN):
+        clock[0] += _READ_TIME
+        if not log or log[0][0] > clock[0]:
+            yield _GET_LOG_ERROR
+        else:
+            yield log.pop(0)[1]
+
+
+def _drain_on_a_clock(
+    clock: list[float],
+    log: list[tuple[float, bytes]],
+    *,
+    always_connected: bool = False,
+) -> tuple[PushLock, list[bytes], list[tuple[bytes, bool]]]:
+    """A running PushLock on a real Lock and Session over log, with one recorder.
+
+    Each GetLog answers as _replies_on_a_clock does. Returns the push lock, the
+    commands written, and the replies the recorder receives. No backlog is armed
+    and no drain has started.
+    """
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:d3", always_connected=always_connected)
+    received: list[tuple[bytes, bool]] = []
+    # Registered before the lock is up, so no drain starts here.
+    push_lock.register_log_record_callback(_recorder(received))
+    push_lock._backlog_remaining = 0
+    _, written = _drain_on_a_real_session(push_lock, _replies_on_a_clock(clock, log))
+    return push_lock, written, received
+
+
 @pytest.mark.asyncio
 async def test_the_records_within_the_unread_count_are_delivered_as_backlog() -> None:
     """After a registration into an empty list, the first N records are backlog."""
@@ -4198,10 +4236,11 @@ async def test_a_get_log_error_with_the_dirty_bit_is_delivered_and_the_drain_rea
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("changes", "expected"),
+    ("changes", "log", "expected"),
     [
         (
             [DoorStatus.OPENED, DoorStatus.CLOSED],
+            [(0.0, _RECORDS[0]), (1.5, _RECORDS[1])],
             [
                 (_RECORDS[0], True),
                 (_GET_LOG_ERROR, False),
@@ -4211,11 +4250,11 @@ async def test_a_get_log_error_with_the_dirty_bit_is_delivered_and_the_drain_rea
         ),
         (
             [LockStatus.LOCKED],
+            [(1.5, _RECORDS[1])],
             [
-                (_RECORDS[0], True),
+                (_GET_LOG_ERROR, False),
                 (_GET_LOG_ERROR, False),
                 (_RECORDS[1], False),
-                (_GET_LOG_ERROR, False),
                 (_GET_LOG_ERROR, False),
             ],
         ),
@@ -4223,14 +4262,16 @@ async def test_a_get_log_error_with_the_dirty_bit_is_delivered_and_the_drain_rea
     ids=["next drain", "same drain in the window"],
 )
 async def test_the_get_log_error_ends_a_backlog_the_log_ran_out_before(
-    changes: list[LockStatus | DoorStatus], expected: list[tuple[bytes, bool]]
+    changes: list[LockStatus | DoorStatus],
+    log: list[tuple[float, bytes]],
+    expected: list[tuple[bytes, bool]],
 ) -> None:
     """A GetLogError read with backlog left ends it; a later record is not backlog."""
     with _patched_clock() as clock:
         push_lock, mock_lock, received = _activity_push_lock([], count=2)
         changed = clock[0]
         mock_lock.get_log = _log_on_a_clock(
-            clock, [(changed, _RECORDS[0]), (changed + 1.5, _RECORDS[1])]
+            clock, [(changed + offset, reply) for offset, reply in log]
         )
         for change in changes:
             push_lock._update_any_state([change])
@@ -4646,42 +4687,68 @@ async def test_each_new_connection_starts_a_drain_at_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("change", "reads"),
-    [(LockStatus.LOCKED, _WINDOW_READS), (DoorStatus.OPENED, 1)],
-    ids=["lock", "door"],
+    ("change", "log", "replies"),
+    [
+        (LockStatus.LOCKED, [_RECORDS[0]], [_RECORDS[0], _GET_LOG_ERROR]),
+        (
+            LockStatus.LOCKED,
+            [_RECORDS[0], _RECORDS[1]],
+            [_RECORDS[0], _RECORDS[1], _GET_LOG_ERROR],
+        ),
+        (LockStatus.LOCKED, [], [_GET_LOG_ERROR] * _WINDOW_READS),
+        (
+            LockStatus.LOCKED,
+            [_DIRTY_GET_LOG_ERROR, _RECORDS[0]],
+            [_DIRTY_GET_LOG_ERROR, _RECORDS[0], _GET_LOG_ERROR],
+        ),
+        (DoorStatus.OPENED, [_RECORDS[0]], [_RECORDS[0], _GET_LOG_ERROR]),
+        (DoorStatus.OPENED, [], [_GET_LOG_ERROR]),
+    ],
+    ids=[
+        "lock-record",
+        "lock-two-records",
+        "lock-no-record",
+        "lock-dirty-then-record",
+        "door-record",
+        "door-no-record",
+    ],
 )
-async def test_a_change_drains_at_once_and_a_lock_change_reads_on_for_the_window(
-    change: LockStatus | DoorStatus, reads: int
+async def test_a_drain_ends_at_the_get_log_error_after_a_record_or_the_window(
+    change: LockStatus | DoorStatus, log: list[bytes], replies: list[bytes]
 ) -> None:
-    """A change drains at once; a settled lock change's drain reads past the window."""
+    """A change's drain ends at a GetLogError after a record, or after the window."""
     with _patched_clock() as clock:
-        push_lock, mock_lock, received = _activity_push_lock([])
-        mock_lock.get_log = _log_on_a_clock(clock, [])
-        await _update_and_drain(push_lock, mock_lock)
-        assert mock_lock.get_log.await_count == 1
-
+        push_lock, written, received = _drain_on_a_clock(
+            clock, [(clock[0], reply) for reply in log]
+        )
         push_lock._update_any_state([change])
         await _drained(push_lock)
 
-    assert mock_lock.get_log.await_count == 1 + reads
-    assert received == [(_GET_LOG_ERROR, False)] * (1 + reads)
-    mock_lock.unread_event_count.assert_not_awaited()
+    assert _commands(written) == [_GET_LOG] * len(replies)
+    assert received == [(reply, False) for reply in replies]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "always_connected", [False, True], ids=["on-demand", "always-connected"]
+    ("always_connected", "first"),
+    [
+        (False, _GET_LOG_ERROR),
+        (True, _GET_LOG_ERROR),
+        (False, _DIRTY_GET_LOG_ERROR),
+    ],
+    ids=["on-demand", "always-connected", "dirty-get-log-error-first"],
 )
 async def test_a_record_written_after_a_settled_lock_change_is_read_in_the_window(
-    always_connected: bool,
+    always_connected: bool, first: bytes
 ) -> None:
     """A record written 1.5 s after a settled lock change is read in the window."""
     with _patched_clock() as clock:
-        push_lock, mock_lock, received = _activity_push_lock(
-            [], always_connected=always_connected
-        )
         changed = clock[0]
-        mock_lock.get_log = _log_on_a_clock(clock, [(changed + 1.5, _RECORDS[0])])
+        push_lock, written, received = _drain_on_a_clock(
+            clock,
+            [(changed, first), (changed + 1.5, _RECORDS[0])],
+            always_connected=always_connected,
+        )
         delivered: list[float] = []
 
         async def note_the_time(record: LogRecord, _backlog: bool) -> None:
@@ -4692,11 +4759,13 @@ async def test_a_record_written_after_a_settled_lock_change_is_read_in_the_windo
         push_lock._update_any_state([LockStatus.LOCKED])
         await _drained(push_lock)
 
+    # The GetLogError after the record ends the drain, although its read started
+    # inside the window.
+    assert _commands(written) == [_GET_LOG] * 4
     assert received == [
-        (_GET_LOG_ERROR, False),
+        (first, False),
         (_GET_LOG_ERROR, False),
         (_RECORDS[0], False),
-        (_GET_LOG_ERROR, False),
         (_GET_LOG_ERROR, False),
     ]
     assert len(delivered) == 1
@@ -4742,27 +4811,40 @@ async def test_the_get_log_sent_after_the_window_reads_a_record_written_in_it(
 
 
 @pytest.mark.asyncio
-async def test_a_settled_lock_change_inside_the_window_moves_its_end() -> None:
-    """A settled lock change in the window moves its end, and the drain reads on."""
+@pytest.mark.parametrize(
+    ("first", "before"),
+    [
+        (LockStatus.LOCKED, [_GET_LOG_ERROR, _GET_LOG_ERROR]),
+        (LockStatus.LOCKED, [_RECORDS[0]]),
+        (DoorStatus.OPENED, [_RECORDS[0]]),
+    ],
+    ids=["in-a-lock-window", "after-a-lock-record", "after-a-door-record"],
+)
+async def test_a_settled_lock_change_during_a_drain_reads_on_for_its_window(
+    first: LockStatus | DoorStatus, before: list[bytes]
+) -> None:
+    """A settled lock change during a drain moves the window, and the drain reads on."""
     with _patched_clock() as clock:
-        push_lock, mock_lock, received = _activity_push_lock([])
-        mock_lock.get_log = _log_on_a_clock(clock, [])
+        # The log holds the records of before; the GetLogError answers the rest.
+        push_lock, written, received = _drain_on_a_clock(
+            clock, [(clock[0], reply) for reply in before if reply != _GET_LOG_ERROR]
+        )
 
-        async def unlock_at_the_second_reply(
+        async def unlock_at_the_last_reply_before(
             _record: LogRecord, _backlog: bool
         ) -> None:
-            if len(received) == 2:
+            if len(received) == len(before):
                 push_lock._update_any_state([LockStatus.UNLOCKED])
 
-        push_lock.register_log_record_callback(unlock_at_the_second_reply)
-        push_lock._update_any_state([LockStatus.LOCKED])
+        push_lock.register_log_record_callback(unlock_at_the_last_reply_before)
+        push_lock._update_any_state([first])
         await _drained(push_lock)
 
-    # The drain sends two reads before the second change and _WINDOW_READS from
-    # it; the drain the second change owes then reads once.
-    reads = 2 + _WINDOW_READS + 1
-    assert mock_lock.get_log.await_count == reads
-    assert received == [(_GET_LOG_ERROR, False)] * reads
+    # A record read before the unlock does not count, so the drain sends
+    # _WINDOW_READS from it; the drain the unlock owes then reads once.
+    replies = [*before, *[_GET_LOG_ERROR] * (_WINDOW_READS + 1)]
+    assert _commands(written) == [_GET_LOG] * len(replies)
+    assert received == [(reply, False) for reply in replies]
     assert push_lock.lock_status is LockStatus.UNLOCKED
 
 
