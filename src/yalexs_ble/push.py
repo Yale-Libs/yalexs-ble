@@ -1864,6 +1864,9 @@ class PushLock:
         Returns the reply and the time the read started, or None, having sent
         nothing, when no log record callback is left.
         """
+        # This yield lets an update task created in the loop turn in which the last
+        # reply arrived ask for the lock before the drain asks for it again.
+        await asyncio.sleep(0)
         async with self._operation_lock:
             if not self._activity_callbacks:
                 return None

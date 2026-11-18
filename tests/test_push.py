@@ -4092,6 +4092,7 @@ def _commands(written: list[bytes]) -> list[tuple[int, int]]:
 
 _COUNT_READ = (Commands.GETSTATUS.value, StatusType.LOCK_EVENTS_UNREAD.value)
 _GET_LOG = (Commands.GETLOG.value, 0x00)
+_LOCK_STATUS_POLL = (Commands.GETSTATUS.value, StatusType.LOCK_ONLY.value)
 
 
 async def _drained(push_lock: PushLock) -> None:
@@ -4584,8 +4585,9 @@ async def test_a_backlog_armed_while_a_drain_waits_for_the_lock_is_counted_first
 
     async with push_lock._operation_lock:
         push_lock._update_any_state([DoorStatus.OPENED])
-        # The drain starts and waits for the lock.
-        await asyncio.sleep(0)
+        # The drain starts, yields once before its read, and waits for the lock.
+        for _ in range(2):
+            await asyncio.sleep(0)
         unregister()
         push_lock.register_log_record_callback(_recorder(received))
     await _drained(push_lock)
@@ -4629,8 +4631,9 @@ async def test_a_drain_sends_no_read_once_its_last_reader_left_during_the_wait(
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
         await operation_lock.acquire()
         push_lock._update_any_state([DoorStatus.OPENED])
-        # The drain starts and waits for the lock.
-        await asyncio.sleep(0)
+        # The drain starts, yields once before its read, and waits for the lock.
+        for _ in range(2):
+            await asyncio.sleep(0)
         for _ in range(reads):
             # Queued behind the drain, the lock comes back after the drain's read.
             operation_lock.release()
@@ -5052,6 +5055,51 @@ async def test_a_caller_queued_behind_a_drain_read_runs_before_the_next_read(
         await push_lock._update_task
 
     assert order == ["get_log", queued, "get_log"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backlog_remaining", "first_reply", "first_read"),
+    [
+        (0, lambda: _RECORDS[0], _GET_LOG),
+        (None, lambda: _count_reply(0), _COUNT_READ),
+    ],
+    ids=["get_log_reply", "unread_count_reply"],
+)
+async def test_a_cycle_due_in_the_turn_of_a_drain_reply_runs_before_the_next_get_log(
+    backlog_remaining: int | None,
+    first_reply: Callable[[], bytes],
+    first_read: tuple[int, int],
+) -> None:
+    """An update timer firing in a drain reply's turn polls before the next GetLog."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:d4", always_connected=True)
+    push_lock.register_log_record_callback(_recorder([]))
+    push_lock._backlog_remaining = backlog_remaining
+    lock, written = _drain_on_a_real_session(push_lock, [])
+    push_lock._lock_state = _known_state(LockStatus.LOCKED)
+    session = lock.session
+    assert session is not None
+    loop = asyncio.get_running_loop()
+    log = iter([first_reply(), _GET_LOG_ERROR])
+
+    async def answer(_char: object, command: bytearray, _response: bool) -> None:
+        written.append(bytes(command))
+        if (command[0x01], command[0x04]) == _LOCK_STATUS_POLL:
+            session._notify(0, bytearray(_with_checksum(_STATUS_PUSH_LOCKED)))
+        elif len(written) == 1:
+            # The reply is handled in the next loop turn, as the update timer fires.
+            loop.call_soon(session._notify, 0, bytearray(next(log)))
+            await push_lock.update()
+        else:
+            session._notify(0, bytearray(next(log)))
+
+    cast(MagicMock, lock.client).write_gatt_char = AsyncMock(side_effect=answer)
+
+    await _drain_on_a_door_change(push_lock)
+    assert push_lock._update_task is not None
+    await push_lock._update_task
+
+    assert _commands(written) == [first_read, _LOCK_STATUS_POLL, _GET_LOG]
 
 
 @pytest.mark.asyncio
