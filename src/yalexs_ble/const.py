@@ -68,9 +68,12 @@ class Commands(IntEnum):
     KEYCODE_GET = 0x39
 
 
-# The log_type at byte 4 of the GETLOG reply that ends the log, the vendor's
-# GetLogError record.
+# The log_type at byte 4 of the vendor's GetLogError record, the GETLOG reply that
+# says the log is empty, unless its dirty bit is set.
 LOG_TYPE_GET_LOG_ERROR = 0x80
+# Bit 3 of byte 5 of a GetLogError reply, the vendor's dirty bit. The lock sets
+# it while a record is on its way, so the log is not empty.
+GET_LOG_ERROR_DIRTY_BIT = 0x08
 
 
 class OperationError(IntEnum):
