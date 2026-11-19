@@ -1109,17 +1109,21 @@ async def test_a_poll_is_not_answered_by_a_frame_of_another_subtype(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("frame", "unread"),
-    [(DEPTH_FRAME, 242), (NEGATIVE_DEPTH_FRAME, -559038737)],
-    ids=["captured", "top-bit-set"],
+    ("frame", "unread", "raises"),
+    [
+        (DEPTH_FRAME, 242, False),
+        # Built to DEPTH_FRAME's layout with 1023 in the count.
+        (_with_checksum("bb02000009000000ff030000000000000200"), 1023, False),
+        # Built to DEPTH_FRAME's layout with 1024 in the count.
+        (_with_checksum("bb0200000900000000040000000000000200"), 1024, True),
+        (NEGATIVE_DEPTH_FRAME, -559038737, True),
+    ],
+    ids=["captured", "largest-accepted", "too-large", "top-bit-set"],
 )
 async def test_unread_event_count_returns_the_signed_four_byte_count(
-    frame: bytes, unread: int
+    frame: bytes, unread: int, raises: bool
 ) -> None:
-    """The count read sends GETSTATUS LOCK_EVENTS_UNREAD and reads [8:12] signed.
-
-    A negative count is not a depth and raises instead of returning.
-    """
+    """The LOCK_EVENTS_UNREAD poll returns [8:12] signed, raising outside 0 to 1023."""
     lock, session = _connected_lock()
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
@@ -1128,7 +1132,7 @@ async def test_unread_event_count_returns_the_signed_four_byte_count(
     write = AsyncMock(side_effect=deliver)
     session.client.write_gatt_char = write
 
-    if unread < 0:
+    if raises:
         with pytest.raises(ResponseError, match=f"{unread} is not a depth"):
             await lock.unread_event_count()
     else:

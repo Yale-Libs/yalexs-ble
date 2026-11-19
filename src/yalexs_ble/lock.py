@@ -248,6 +248,8 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
 
 
 _GETLOG_MATCHER = _poll_response_matcher(Commands.GETLOG.value)
+# Twice the 512 records the activity log was seen to hold.
+UNREAD_COUNT_LIMIT = 1024
 
 
 class Lock:
@@ -911,15 +913,16 @@ class Lock:
 
     @raise_if_not_connected
     async def unread_event_count(self) -> int:
-        """Read the activity log's unread count; the read removes no record.
+        """Return the activity log's unread count, read signed from bytes 8 to 11.
 
-        A negative count, signed at bytes 8 to 11, is not a depth and raises.
+        The status poll removes no record. A count below 0, or of UNREAD_COUNT_LIMIT
+        or more, raises ResponseError.
         """
         response = await self._poll_status(
             StatusType.LOCK_EVENTS_UNREAD, "unread_event_count"
         )
         count = util._bytes_to_int(response[0x08:0x0C], signed=True)
-        if count < 0:
+        if count < 0 or count >= UNREAD_COUNT_LIMIT:
             raise ResponseError(f"Unread count {count} is not a depth")
         return count
 

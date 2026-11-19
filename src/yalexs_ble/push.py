@@ -1896,6 +1896,8 @@ class PushLock:
             # covered, and a backlog armed while this drain waited is counted.
             self._activity_drain_pending = False
             if self._backlog_remaining is None:
+                # A future PR sends ClearLog here for a count refused as too large,
+                # with the same failure handling.
                 return await lock.unread_event_count()
             return await lock.get_log()
 
