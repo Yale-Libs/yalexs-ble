@@ -245,6 +245,10 @@ def _select_yale_payload(
     return min(present, key=lambda item: (len(item[1]) != 1, not item[1]))
 
 
+class _ActivityDrainReadError(Exception):
+    """Raised by a drain read that failed, once the failure is logged."""
+
+
 async def _get_log(lock: Lock) -> bytes:
     """Read the lock's oldest activity log record."""
     return await lock.get_log()
@@ -1866,7 +1870,9 @@ class PushLock:
         """Send one read on the link under the operation lock, never connecting.
 
         Returns the reply and the time the read started, or None, having sent
-        nothing, when no log record callback is left.
+        nothing, when no log record callback is left. Raises _ActivityDrainReadError
+        when the link is down or the read raises another retryable error; only the
+        second counts as a failed drain.
         """
         # This yield lets a task created in the loop turn in which the last reply
         # arrived ask for the operation lock before the drain does.
@@ -1874,12 +1880,19 @@ class PushLock:
         async with self._operation_lock:
             if not self._activity_callbacks:
                 return None
-            if (lock := self._client) is None:
-                raise DisconnectedError("Lock is not connected")
-            started = time.monotonic()
-            self._activity_drain_read_holds_lock = True
             try:
+                if (lock := self._client) is None:
+                    raise DisconnectedError("Lock is not connected")  # noqa: TRY301
+                started = time.monotonic()
+                self._activity_drain_read_holds_lock = True
                 result = await read(lock)
+            except DisconnectedError as err:
+                # A dropped link is no drain failure; the next connection drains.
+                _LOGGER.debug("%s: Activity log drain ended: %s", self.name, err)
+                raise _ActivityDrainReadError from err
+            except (TimeoutError, *RETRYABLE_EXCEPTIONS) as err:
+                self._note_activity_drain_failure(err)
+                raise _ActivityDrainReadError from err
             finally:
                 self._activity_drain_read_holds_lock = False
             self._complete_operation(time.monotonic())
@@ -1921,11 +1934,8 @@ class PushLock:
                 ended = await self._deliver_activity_log(
                     (first, started), ACTIVITY_DRAIN_MARGIN
                 )
-        except DisconnectedError as err:
-            # A dropped link is no drain failure; the next connection drains.
-            _LOGGER.debug("%s: Activity log drain ended: %s", self.name, err)
-        except (TimeoutError, *RETRYABLE_EXCEPTIONS) as err:
-            self._note_activity_drain_failure(err)
+        except _ActivityDrainReadError:
+            return False
         finally:
             if not ended:
                 self._activity_drain_pending = True

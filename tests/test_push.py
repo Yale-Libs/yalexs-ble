@@ -5773,6 +5773,37 @@ async def test_a_bug_in_a_drain_read_is_logged_and_leaves_the_drain_owed(
     assert push_lock._activity_drain_pending is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("background_task_failure_expected")
+@pytest.mark.parametrize(
+    "target",
+    [
+        "yalexs_ble.push.parse_log_event_packet",
+        "yalexs_ble.push.activity_capture.log_record",
+    ],
+    ids=["decode", "capture"],
+)
+async def test_a_bug_in_the_decode_or_capture_is_an_error_not_a_drain_failure(
+    target: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An AttributeError in the decode or capture is an ERROR; the drain stays owed."""
+    push_lock, mock_lock, received = _activity_push_lock([_RECORDS[0], _GET_LOG_ERROR])
+    with (
+        patch(target, side_effect=AttributeError("bug")),
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+    ):
+        await _update_and_drain(push_lock, mock_lock)
+
+    assert [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ] == [(logging.ERROR, "Test Lock: Background task failed: bug")]
+    assert not [r for r in caplog.records if "Reading lock activity" in r.getMessage()]
+    assert push_lock._activity_drain_pending is True
+    assert received == []
+
+
 _CAPTURE_LOGGER = "yalexs_ble.activity_capture"
 # Upper case, so the tests pin that log_record lower-cases the address.
 _CAPTURE_ADDRESS = "AA:BB:CC:DD:EE:E0"
