@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import math
 import struct
@@ -60,6 +61,7 @@ from yalexs_ble.push import (
     JAMMED_HOLD_TIME,
     KEEP_ALIVE_TIME,
     LOCK_STALE_STATE_DEBOUNCE_DELAY,
+    LOG_RECORD_CALLBACK_WARNING_TIME,
     NEVER_TIME,
     OPERATION_IN_PROGRESS_DEFER_SECONDS,
     RECONNECT_BACKOFF_TIME,
@@ -4414,6 +4416,122 @@ async def test_a_raising_callback_is_logged_and_the_drain_goes_on(
     ]
     assert all(r.exc_info for r in warnings)
     assert "Reading lock activity failed" not in caplog.text
+
+
+async def _loop_clock_moves_on(seconds: float) -> None:
+    """Run every event loop timer due within seconds from now, with no real wait."""
+    loop = asyncio.get_running_loop()
+    passed = asyncio.Event()
+    loop.call_later(seconds, passed.set)
+    real_time = loop.time
+    with patch.object(loop, "time", lambda: real_time() + seconds):
+        await asyncio.wait_for(passed.wait(), 1)
+
+
+def _held_on_the_first_record(
+    push_lock: PushLock,
+    wrap: Callable[[LogRecordCallback], LogRecordCallback] = lambda held: held,
+) -> tuple[asyncio.Event, asyncio.Event, list[str], LogRecordCallback]:
+    """Register a log record callback whose first call returns only once released.
+
+    The callback is registered as wrap returns it. Returns the event set when that
+    call starts, the event that releases it, how that call ended, "returned" or
+    "cancelled", and the registered callback.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+    ended: list[str] = []
+
+    async def held(_record: LogRecord, _backlog: bool) -> None:
+        if started.is_set():
+            return
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            ended.append("cancelled")
+            raise
+        ended.append("returned")
+
+    callback = wrap(held)
+    push_lock.register_log_record_callback(callback)
+    return started, release, ended, callback
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wrap", "running", "warnings"),
+    [
+        (lambda held: held, LOG_RECORD_CALLBACK_WARNING_TIME - 1, []),
+        (
+            lambda held: held,
+            LOG_RECORD_CALLBACK_WARNING_TIME + 1,
+            [
+                "Test Lock: A log record callback"
+                " _held_on_the_first_record.<locals>.held has not returned"
+                " within 2.0 seconds (log_type 0x07)"
+            ],
+        ),
+        (
+            functools.partial,
+            LOG_RECORD_CALLBACK_WARNING_TIME + 1,
+            [
+                "Test Lock: A log record callback {callback!r} has not returned"
+                " within 2.0 seconds (log_type 0x07)"
+            ],
+        ),
+    ],
+    ids=["returns-within", "returns-after", "partial-returns-after"],
+)
+async def test_a_callback_still_running_at_the_warning_time_logs_one_warning(
+    wrap: Callable[[LogRecordCallback], LogRecordCallback],
+    running: float,
+    warnings: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The drain warns once for a callback running at the warning time and awaits it."""
+    push_lock, mock_lock, received = _activity_push_lock(
+        [_CODE_OPERATION_RECORD, _GET_LOG_ERROR]
+    )
+    started, release, ended, callback = _held_on_the_first_record(push_lock, wrap)
+    warnings = [warning.format(callback=callback) for warning in warnings]
+
+    with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
+        await _run_update(push_lock, mock_lock)
+        await asyncio.wait_for(started.wait(), 1)
+        await _loop_clock_moves_on(running)
+        assert [r.getMessage() for r in caplog.records] == warnings
+        assert mock_lock.get_log.await_count == 1
+        release.set()
+        await _drained(push_lock)
+        # A warning timer not cancelled on the callback's return would fire here.
+        await _loop_clock_moves_on(LOG_RECORD_CALLBACK_WARNING_TIME + 1)
+
+    assert [r.getMessage() for r in caplog.records] == warnings
+    assert ended == ["returned"]
+    assert received == [(_CODE_OPERATION_RECORD, False), (_GET_LOG_ERROR, False)]
+    assert mock_lock.get_log.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_callback_running_when_the_lock_stops_is_cancelled_with_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stop cancels a running callback with the drain, and no warning follows."""
+    push_lock, mock_lock, received = _activity_push_lock([_RECORDS[0], _GET_LOG_ERROR])
+    started, _, ended, _ = _held_on_the_first_record(push_lock)
+
+    with caplog.at_level(logging.WARNING, logger="yalexs_ble.push"):
+        await _run_update(push_lock, mock_lock)
+        await asyncio.wait_for(started.wait(), 1)
+        push_lock._cancel()
+        await _drained(push_lock)
+        await _loop_clock_moves_on(LOG_RECORD_CALLBACK_WARNING_TIME + 1)
+
+    assert ended == ["cancelled"]
+    assert not caplog.records
+    assert received == [(_RECORDS[0], False)]
+    assert mock_lock.get_log.await_count == 1
 
 
 @pytest.mark.asyncio

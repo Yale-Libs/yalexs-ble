@@ -204,6 +204,8 @@ ACTIVITY_DRAIN_MARGIN = 128
 # Seconds we allow the lock to write its first record of a settled change of the
 # displayed lock status.
 ACTIVITY_DRAIN_WINDOW = 2.0
+# Seconds after which the drain warns that a log record callback has not returned.
+LOG_RECORD_CALLBACK_WARNING_TIME = 2.0
 
 # Receives each decoded activity log record and its backlog flag.
 LogRecordCallback = Callable[[LogRecord, bool], Awaitable[None]]
@@ -1966,6 +1968,16 @@ class PushLock:
             for callback in tuple(self._activity_callbacks):
                 if callback not in self._activity_callbacks:
                     continue
+                warning = self.loop.call_later(
+                    LOG_RECORD_CALLBACK_WARNING_TIME,
+                    _LOGGER.warning,
+                    "%s: A log record callback %s has not returned within %s seconds"
+                    " (log_type 0x%02X)",
+                    self.name,
+                    getattr(callback, "__qualname__", None) or repr(callback),
+                    LOG_RECORD_CALLBACK_WARNING_TIME,
+                    record.log_type,
+                )
                 try:
                     await callback(record, backlog)
                 except Exception:  # pylint: disable=broad-except
@@ -1976,6 +1988,8 @@ class PushLock:
                         record.log_type,
                         exc_info=True,
                     )
+                finally:
+                    warning.cancel()
             if end:
                 if not self._activity_drain_window_open(started):
                     return True
