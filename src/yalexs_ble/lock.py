@@ -25,8 +25,6 @@ from .const import (
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_STATUS,
     VALUE_TO_OPERATION_ERROR,
-    AutoLockMode,
-    AutoLockState,
     BatteryState,
     Commands,
     DoorStatus,
@@ -34,7 +32,6 @@ from .const import (
     LockStateValue,
     LockStatus,
     OperationError,
-    SettingType,
     StatusType,
 )
 from .secure_session import SecureSession
@@ -47,6 +44,7 @@ from .session import (
     OperationProgress,
     ResponseError,
     Session,
+    UnityParameterError,
     YaleXSBLEError,
 )
 
@@ -121,24 +119,20 @@ def convert_voltage_to_percentage(voltage: float) -> int:
     return AA_BATTERY_VOLTAGE_MAP[AA_BATTERY_VOLTAGE_LIST[pos]]
 
 
-def _settings_response_matcher(
-    command_value: int, setting_value: int
-) -> Callable[[bytes], bool]:
-    """Match the 0xBB settings frame answering one command/setting pair.
+def _parameter_response_matcher(opcode: int, parameter: int) -> Callable[[bytes], bool]:
+    """Match the 0xBB reply with a command's opcode at byte 1 and its id at byte 4.
 
-    A settings command (READSETTING/WRITESETTING) is answered by two frames:
-    an 0xAA acknowledgment echoing the request, then the 0xBB frame carrying
-    the stored value. The acknowledgment's value field is zero, so completing
-    the solicited wait on it misreads every setting; the wait must hold out
-    for the 0xBB frame that echoes the command opcode and the setting id.
+    A command's 0xAA acknowledgment, which may precede the response, is not
+    matched: its value field holds zero on a read and the written value on a
+    write.
     """
 
     def matches(data: bytes) -> bool:
         return (
             len(data) >= 0x0C
             and data[0x00] == 0xBB
-            and data[0x01] == command_value
-            and data[0x04] == setting_value
+            and data[0x01] == opcode
+            and data[0x04] == parameter
         )
 
     return matches
@@ -163,8 +157,6 @@ def _poll_response_matcher(
     alone; an acknowledgment carries back the request's own byte[4], which is
     zero for that command and reads as a lock operation record, so requiring
     the 0xBB frame keeps an acknowledgment from being returned as a record.
-    auto_lock_status is a poll too, but it completes on its acknowledgment by
-    design (see its docstring), so it is not typed here.
     """
 
     def matches(data: bytes) -> bool:
@@ -173,7 +165,7 @@ def _poll_response_matcher(
             # so this length check is unreachable through it. It is the
             # matcher's own floor, for a caller with no session behind it, and
             # it covers the highest byte the match reads, the subtype at 0x04.
-            # _settings_response_matcher above carries a floor of its own.
+            # _parameter_response_matcher above has a floor of its own.
             len(data) > 0x04
             and data[0x00] == 0xBB
             and data[0x01] == opcode
@@ -192,6 +184,10 @@ NO_STATE_OPCODES = frozenset(
         Commands.KEYCODE_COMMIT.value,
         Commands.KEYCODE_GET.value,
         Commands.GETLOG.value,
+        Commands.READSETTING.value,
+        Commands.WRITESETTING.value,
+        Commands.SETUNITY.value,
+        Commands.GETUNITY.value,
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
@@ -219,6 +215,32 @@ def validate_keycode_slot(slot: int) -> None:
     """Raise ValueError for a keypad slot outside the lock's range."""
     if not 1 <= slot <= KEYCODE_MAX_SLOT:
         raise ValueError(f"Keycode slot out of range (1-{KEYCODE_MAX_SLOT}): {slot}")
+
+
+def validate_parameter_id(parameter: int) -> None:
+    """Raise ValueError for a parameter id that does not fit one unsigned byte."""
+    if not 0 <= parameter <= 0xFF:
+        raise ValueError(
+            f"Parameter id is not an unsigned one-byte value (0 to 0xFF): {parameter}"
+        )
+
+
+def validate_parameter_value(value: int) -> None:
+    """Raise ValueError for a parameter value that does not fit four unsigned bytes."""
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError(
+            "Parameter value is not an unsigned four-byte value "
+            f"(0 to 0xFFFFFFFF): {value}"
+        )
+
+
+def validate_unity_parameter_value(value: int) -> None:
+    """Raise ValueError for a Unity parameter value outside one unsigned byte."""
+    if not 0 <= value <= 0xFF:
+        raise ValueError(
+            "Unity parameter value is not an unsigned one-byte value "
+            f"(0 to 0xFF): {value}"
+        )
 
 
 def _ack_matcher(opcode: int, operation_byte: int) -> Callable[[bytes], bool]:
@@ -418,26 +440,9 @@ class Lock:
                 if state[4] == StatusType.LOCK_EVENTS_UNREAD.value:
                     # Answered through unread_event_count(); no state to publish.
                     return ()
-            elif (
-                state[1] == Commands.WRITESETTING.value
-                or state[1] == Commands.READSETTING.value
-            ):
-                if state[4] == SettingType.AUTOLOCK.value:
-                    return [self._parse_auto_lock_state(state)]
         elif state[0] == 0xAA:
             if state[1] in (Commands.UNLOCK.value, Commands.LOCK.value):
                 return ()  # Operation ack; state arrives in the 0xBB op-response
-            if state[1] in (
-                Commands.READSETTING.value,
-                Commands.WRITESETTING.value,
-            ):
-                # ACK for a settings command (for example auto-lock, setting
-                # 0x28). It carries no state -- the value arrives in the 0xBB
-                # settings response -- so
-                # recognize and ignore it rather than logging "Unknown state".
-                # Kept specific to the settings opcodes so a new ACK type on
-                # another model still surfaces as an unknown frame.
-                return ()
         return None
 
     def _internal_state_callback(self, state: bytes) -> None:
@@ -676,46 +681,6 @@ class Lock:
             retry_after_write=False,
         )
 
-    @raise_if_not_connected
-    async def set_auto_lock(self, mode: AutoLockMode, duration: int) -> None:
-        """Change the auto lock setting (0x28).
-
-        The value is two little-endian uint16 timers laid consecutively at
-        [8:12]: the never-opened timer at [8:10] and the door-close timer at
-        [10:12]. Both zero = off; ``n`` in the never-opened timer alone =
-        instant with an ``n`` second delay; a timed relock sets both timers to
-        the same ``n`` seconds. There is no mode byte -- the mode is implied by
-        which timers are set, and the read side reports the never-opened timer
-        (see ``_parse_auto_lock_state``).
-        """
-        _LOGGER.debug(
-            "%s: Setting auto lock to mode=%d, dur=%d", self.name, mode, duration
-        )
-        assert self.session is not None  # nosec
-        if mode == AutoLockMode.OFF or duration == 0:
-            value = 0
-        elif not 1 <= duration <= 0xFFFE:
-            # Each timer is a uint16; cap conservatively below the field
-            # maximum.
-            raise ValueError(f"Auto lock duration out of range (1-65534): {duration}")
-        elif mode == AutoLockMode.TIMER:
-            value = duration | (duration << 16)
-        else:  # INSTANT
-            value = duration
-
-        cmd = self.session.build_operation_command(
-            Commands.WRITESETTING, SettingType.AUTOLOCK
-        )
-        util._copy(cmd, util._int_to_bytes(value, 4), destLocation=0x08)
-        await self.session.execute(
-            cmd,
-            "set_auto_lock",
-            _settings_response_matcher(
-                Commands.WRITESETTING.value, SettingType.AUTOLOCK.value
-            ),
-        )
-        _LOGGER.debug("%s: Finished setting auto lock", self.name)
-
     async def _send_keycode(
         self, cmd: bytearray, command_name: str, slot: int | None = None
     ) -> bytes:
@@ -807,14 +772,8 @@ class Lock:
         opcode: int,
         cmd_byte: int,
         command_name: str,
-        response_matcher: Callable[[bytes], bool] | None = None,
+        response_matcher: Callable[[bytes], bool],
     ) -> bytes:
-        # The matcher is passed in rather than built here from opcode and
-        # cmd_byte, because auto_lock_status uses this method too and has to
-        # stay untyped: it completes on its acknowledgment so that a lock with
-        # no auto lock support does not hold the wait open for the full
-        # response timeout. Building a matcher here would type that read as
-        # well.
         assert self.session is not None  # nosec
         command = self.session.build_operation_command(opcode, cmd_byte)
         _LOGGER.debug("%s: send: [%s] [%s]", self.name, command.hex(), hex(cmd_byte))
@@ -849,32 +808,6 @@ class Lock:
                 "%s: Unrecognized door_status_str code: %s", self.name, hex(door_status)
             )
         return door_status_enum
-
-    def _parse_auto_lock_state(self, response: bytes) -> AutoLockState:
-        """Parse the auto lock state from a READSETTING (setting 0x28) response.
-
-        The auto-lock time is two little-endian uint16 timers laid
-        consecutively at ``response[8:12]``; there is no mode byte. The
-        never-opened timer is at [8:10] and the door-close timer at [10:12]. A
-        Timed relock sets both timers to the same seconds, so a non-zero
-        door-close timer signals Timed. A value with only the never-opened
-        timer set is Instant; both zero is off. The mode is derived from which
-        timers are set, never read from a wire byte.
-
-        The Timed decode reports the never-opened timer: it is the field the
-        app displays, and releases before the two-timer encoding stored the
-        user's seconds there, so those values read back as set. A zero
-        never-opened timer falls back to the door-close timer. A write derived
-        from this state sets both timers to the same value.
-        """
-        value = util._bytes_to_int(response[0x08:0x0C])
-        if value == 0:
-            return AutoLockState(AutoLockMode.OFF, 0)
-        never_opened = value & 0xFFFF
-        door_close = (value >> 16) & 0xFFFF
-        if door_close:
-            return AutoLockState(AutoLockMode.TIMER, never_opened or door_close)
-        return AutoLockState(AutoLockMode.INSTANT, never_opened)
 
     @raise_if_not_connected
     async def lock_status(self) -> LockStatus:
@@ -937,23 +870,114 @@ class Lock:
         return self._parse_battery_state(response)
 
     @raise_if_not_connected
-    async def auto_lock_status(self) -> None:
-        """Request the auto-lock setting.
+    async def get_parameter(self, parameter: int) -> int:
+        """Read one parameter and return the value the lock reports.
 
-        The wait completes on the READSETTING acknowledgment, whose value field
-        is zero, so it carries no setting; there is nothing to return. The
-        stored setting arrives moments later as a 0xBB settings response on the
-        notify path, which the push layer decodes and applies. Waiting for that
-        settings response instead would stall the poll for the full write
-        timeout on a lock that never answers READSETTING (no auto-lock support).
+        Raises ValueError for an id outside one byte, before any frame is built,
+        and TimeoutError when the lock does not answer within the session's wait.
         """
-        _LOGGER.debug("%s: Executing auto_lock_status", self.name)
-        await self._execute_command(
+        validate_parameter_id(parameter)
+        _LOGGER.debug("%s: Reading parameter 0x%02X", self.name, parameter)
+        response = await self._execute_command(
             Commands.READSETTING,
-            SettingType.AUTOLOCK,
-            "auto_lock_status",
+            parameter,
+            "get_parameter",
+            _parameter_response_matcher(Commands.READSETTING.value, parameter),
         )
-        _LOGGER.debug("%s: Finished executing auto_lock_status", self.name)
+        # Byte 5 is not read, because its meaning in a parameter response is not known.
+        value = util._bytes_to_int(response[0x08:0x0C])
+        _LOGGER.debug("%s: Parameter 0x%02X reads 0x%08X", self.name, parameter, value)
+        return value
+
+    @raise_if_not_connected
+    async def set_parameter(self, parameter: int, value: int) -> int:
+        """Write one parameter and return the value field of the lock's reply.
+
+        Raises ValueError for an id outside one byte or a value outside four bytes,
+        before any frame is built, and TimeoutError as get_parameter does.
+        """
+        validate_parameter_id(parameter)
+        validate_parameter_value(value)
+        _LOGGER.debug(
+            "%s: Writing parameter 0x%02X as 0x%08X", self.name, parameter, value
+        )
+        assert self.session is not None  # nosec
+        command = self.session.build_operation_command(Commands.WRITESETTING, parameter)
+        command[0x08:0x0C] = util._int_to_bytes(value, 4)
+        response = await self.session.execute(
+            command,
+            "set_parameter",
+            _parameter_response_matcher(Commands.WRITESETTING.value, parameter),
+        )
+        # Byte 5 is not read, as in get_parameter, and the reply's value is not
+        # compared with the value written, because the library interprets no
+        # parameter.
+        answered = util._bytes_to_int(response[0x08:0x0C])
+        _LOGGER.debug(
+            "%s: Parameter 0x%02X write answered with 0x%08X",
+            self.name,
+            parameter,
+            answered,
+        )
+        return answered
+
+    @raise_if_not_connected
+    async def get_unity_parameter(self, parameter: int) -> int:
+        """Read one Unity parameter and return the value the lock reports.
+
+        Raises as get_parameter does, plus UnityParameterError when the lock reports
+        an error for the parameter.
+        """
+        validate_parameter_id(parameter)
+        _LOGGER.debug("%s: Reading Unity parameter 0x%02X", self.name, parameter)
+        assert self.session is not None  # nosec
+        command = self.session.build_operation_command(Commands.GETUNITY, parameter)
+        value = await self._send_unity_command(command, "get_unity_parameter")
+        _LOGGER.debug(
+            "%s: Unity parameter 0x%02X reads 0x%02X", self.name, parameter, value
+        )
+        return value
+
+    @raise_if_not_connected
+    async def set_unity_parameter(self, parameter: int, value: int) -> int:
+        """Write one Unity parameter and return the value in the lock's reply.
+
+        Raises ValueError for an id or a value outside one byte, before any frame
+        is built, and otherwise as get_unity_parameter does.
+        """
+        validate_parameter_id(parameter)
+        validate_unity_parameter_value(value)
+        _LOGGER.debug(
+            "%s: Writing Unity parameter 0x%02X as 0x%02X", self.name, parameter, value
+        )
+        assert self.session is not None  # nosec
+        command = self.session.build_operation_command(Commands.SETUNITY, parameter)
+        command[0x05] = value
+        answered = await self._send_unity_command(command, "set_unity_parameter")
+        _LOGGER.debug(
+            "%s: Unity parameter 0x%02X write answered with 0x%02X",
+            self.name,
+            parameter,
+            answered,
+        )
+        return answered
+
+    async def _send_unity_command(self, command: bytearray, command_name: str) -> int:
+        """Send a GetUnity or SetUnity command for entry 0; return the reply's value.
+
+        Raises UnityParameterError when the reply's error byte for the entry is
+        not zero.
+        """
+        assert self.session is not None  # nosec
+        parameter = command[0x04]
+        response = await self.session.execute(
+            command,
+            command_name,
+            _parameter_response_matcher(command[0x01], parameter),
+        )
+        if error := response[0x06]:
+            raise UnityParameterError(command_name, parameter, error)
+        return response[0x05]
 
     @raise_if_not_connected
     async def get_log(self) -> bytes:
