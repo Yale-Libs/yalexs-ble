@@ -16,7 +16,7 @@ from yalexs_ble.lock import (
     _ack_matcher,
     _keycode_response_matcher,
     _operation_response_matcher,
-    _settings_response_matcher,
+    _parameter_response_matcher,
 )
 from yalexs_ble.push import RETRYABLE_EXCEPTIONS, SLOW_TIMEOUT
 from yalexs_ble.secure_session import SecureSession
@@ -65,7 +65,7 @@ async def test_settings_wait_skips_ack_and_completes_on_value_frame() -> None:
     """A matcher holds the wait past the acknowledgment until the response arrives."""
     received: list[bytes] = []
     session = _make_session(received)
-    matcher = _settings_response_matcher(Commands.READSETTING.value, SETTING_ID)
+    matcher = _parameter_response_matcher(Commands.READSETTING.value, SETTING_ID)
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
         # The wait is armed before the GATT write, so both response frames
@@ -140,7 +140,7 @@ async def test_corrupt_frame_disarms_the_wait_and_the_command_is_retried() -> No
     """
     received: list[bytes] = []
     session = _make_session(received)
-    matcher = _settings_response_matcher(Commands.READSETTING.value, SETTING_ID)
+    matcher = _parameter_response_matcher(Commands.READSETTING.value, SETTING_ID)
     frames = [CORRUPT_ANSWER, READ_ANSWER]
 
     async def deliver(*_args: object, **_kwargs: object) -> None:

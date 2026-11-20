@@ -36,8 +36,8 @@ from yalexs_ble.lock import (
     _ack_matcher,
     _keycode_response_matcher,
     _operation_response_matcher,
+    _parameter_response_matcher,
     _poll_response_matcher,
-    _settings_response_matcher,
     convert_voltage_to_percentage,
 )
 from yalexs_ble.session import (
@@ -418,12 +418,12 @@ UNITY_READ_ACK = bytes.fromhex("aa35001e0100000000000000000000000200")
 UNITY_WRITE_ACK = bytes.fromhex("aa34001d0102000000000000000000000200")
 
 
-def test_settings_response_matcher_takes_value_frame_not_ack() -> None:
+def test_parameter_response_matcher_takes_value_frame_not_ack() -> None:
     """The matcher takes the 0xBB frame with its opcode and setting id and no other."""
-    write_matcher = _settings_response_matcher(
+    write_matcher = _parameter_response_matcher(
         Commands.WRITESETTING.value, SETTINGS_WRITE_RESPONSE[0x04]
     )
-    other_id_matcher = _settings_response_matcher(Commands.WRITESETTING.value, 0x9E)
+    other_id_matcher = _parameter_response_matcher(Commands.WRITESETTING.value, 0x9E)
     battery_answer = bytes.fromhex("bb0200a50f00000079140000000000000200")
 
     assert write_matcher(SETTINGS_WRITE_RESPONSE)

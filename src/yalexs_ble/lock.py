@@ -119,7 +119,7 @@ def convert_voltage_to_percentage(voltage: float) -> int:
     return AA_BATTERY_VOLTAGE_MAP[AA_BATTERY_VOLTAGE_LIST[pos]]
 
 
-def _settings_response_matcher(opcode: int, parameter: int) -> Callable[[bytes], bool]:
+def _parameter_response_matcher(opcode: int, parameter: int) -> Callable[[bytes], bool]:
     """Match the 0xBB reply with a command's opcode at byte 1 and its id at byte 4.
 
     A command's 0xAA acknowledgment, which may precede the response, is not
@@ -165,7 +165,7 @@ def _poll_response_matcher(
             # so this length check is unreachable through it. It is the
             # matcher's own floor, for a caller with no session behind it, and
             # it covers the highest byte the match reads, the subtype at 0x04.
-            # _settings_response_matcher above carries a floor of its own.
+            # _parameter_response_matcher above has a floor of its own.
             len(data) > 0x04
             and data[0x00] == 0xBB
             and data[0x01] == opcode
@@ -882,7 +882,7 @@ class Lock:
             Commands.READSETTING,
             parameter,
             "get_parameter",
-            _settings_response_matcher(Commands.READSETTING.value, parameter),
+            _parameter_response_matcher(Commands.READSETTING.value, parameter),
         )
         # Byte 5 is not read, because its meaning in a parameter response is not known.
         value = util._bytes_to_int(response[0x08:0x0C])
@@ -907,7 +907,7 @@ class Lock:
         response = await self.session.execute(
             command,
             "set_parameter",
-            _settings_response_matcher(Commands.WRITESETTING.value, parameter),
+            _parameter_response_matcher(Commands.WRITESETTING.value, parameter),
         )
         # Byte 5 is not read, as in get_parameter, and the reply's value is not
         # compared with the value written, because the library interprets no
@@ -973,7 +973,7 @@ class Lock:
         response = await self.session.execute(
             command,
             command_name,
-            _settings_response_matcher(command[0x01], parameter),
+            _parameter_response_matcher(command[0x01], parameter),
         )
         if error := response[0x06]:
             raise UnityParameterError(command_name, parameter, error)
