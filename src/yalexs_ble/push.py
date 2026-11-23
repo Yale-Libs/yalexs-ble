@@ -182,18 +182,10 @@ DOOR_STATUS_TIMEOUT_COOLDOWN = 300
 BATTERY_REFRESH_INTERVAL = 600
 
 # How long the status poll asks for the lock status alone once the combined
-# poll stands down (24 hours). An unanswered combined poll costs the response
-# timeout, or a reconnect when the link drops, so a lock that does not answer it
-# is asked again once a day.
+# poll stands down (24 hours).
 COMBINED_STATUS_POLL_FAILURE_BACKOFF = 86400
 
-# Unanswered combined polls in a row that stand the combined poll down. A
-# combined poll is unanswered when its wait times out and the lock-only poll
-# after it answers, or when the link was up as the poll started and the poll
-# fails with a disconnect. Three are required so that one lost notification
-# does not stand it down. Only an answered combined poll resets the count, so
-# once the backoff lapses one more unanswered poll stands the combined poll down
-# again.
+# Unanswered combined polls in a row that stand the combined poll down.
 COMBINED_STATUS_POLL_FAILURE_THRESHOLD = 3
 
 # How often to re-read the auto lock setting after a successful read (1 hour).
@@ -550,14 +542,10 @@ class PushLock:
         self._earliest_door_status_attempt_time = NEVER_TIME
         # Scheduled battery refresh time (in always_connected mode)
         self._next_battery_refresh_time = NEVER_TIME
-        # Earliest next combined lock and door status poll, set when the
-        # stand-down is armed. Like the timers above it is not reset on
-        # reconnect, so the backoff outlives the connection that armed it.
+        # Earliest next combined lock and door status poll.
         self._earliest_combined_status_poll_time = float("-inf")
-        # Consecutive unanswered combined polls, as
-        # COMBINED_STATUS_POLL_FAILURE_THRESHOLD counts them. Reset by a combined
-        # poll that answers. Like the deadline above, it is not reset on
-        # reconnect.
+        # Unanswered combined polls in a row (see
+        # COMBINED_STATUS_POLL_FAILURE_THRESHOLD).
         self._unanswered_combined_status_polls = 0
         # Auto lock read backoff, mirroring the battery timers above. They
         # persist across reconnects, so a lock that does not answer the read is
@@ -1565,16 +1553,7 @@ class PushLock:
         _LOGGER.debug("%s: Finished validate", self.name)
 
     async def _poll_battery(self, lock: Lock, *, force: bool = False) -> bool:
-        """Poll battery if needed: periodic refresh, cooldown, errors.
-
-        Battery state requires a poll of the lock to update. In always_connected mode
-        _seen_this_session never clears, so once the refresh deadline passes
-        BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
-        force asks even when the reading is current.
-
-        Returns True only when the lock answered, so an unanswered request does
-        not count as the cycle's keep-alive traffic.
-        """
+        """Poll the battery if needed; return True only if the lock answered."""
         assert self._lock_info is not None  # nosec
         if not self._lock_info.battery_reporting:
             _LOGGER.debug(
@@ -1648,17 +1627,8 @@ class PushLock:
         return lock_info
 
     async def _poll_door_status(self, lock: Lock, *, force: bool = False) -> bool:
-        """Request the door status from a lock with a door sensor.
-
-        force asks even when the reading is current. Unforced, the request is
-        skipped while _seen_this_session holds DoorStatus, and while the combined
-        status poll is in use, since that poll reads the door. Returns True only
-        when the lock answered, so an unanswered request does not count as the
-        cycle's keep-alive traffic. A timeout is caught here and holds the request
-        off for DOOR_STATUS_TIMEOUT_COOLDOWN; left to propagate, it would reach the
-        retry decorator and be handled as a lost connection.
-        """
-        if not (self._lock_info and self._lock_info.door_sense):
+        """Request the door status if needed; return True only if the lock answered."""
+        if not self._door_sense_resolved():
             return False
         if not force and (
             DoorStatus in self._seen_this_session or self._combined_status_poll_in_use()
@@ -1686,6 +1656,10 @@ class PushLock:
             return False
         self._record_auth_success()
         return True
+
+    def _door_sense_resolved(self) -> bool:
+        """Return whether the lock is treated as having a door sensor."""
+        return bool(self._lock_info and self._lock_info.door_sense)
 
     def _arm_auto_lock_read_backoff_if_exhausted(self, now: float) -> bool:
         """Arm the read backoff once the failure count hits the limit.
@@ -1789,26 +1763,18 @@ class PushLock:
         return True
 
     def _combined_status_poll_in_use(self) -> bool:
-        """Whether the status poll asks for the door status as well.
-
-        True on a running watcher whose lock has a door sensor, with no stand-down
-        in force, so validate() on a watcher that has not been started sends the
-        lock-only poll.
-        """
+        """Return whether the status poll asks for the door status as well."""
         return (
             self._running
-            and self._lock_info is not None
-            and self._lock_info.door_sense
+            and self._door_sense_resolved()
             and time.monotonic() >= self._earliest_combined_status_poll_time
         )
 
     def _count_unanswered_combined_status_poll(self) -> None:
         """Count an unanswered combined poll; at the threshold, stand it down."""
         self._unanswered_combined_status_polls += 1
-        # One unanswered poll is not actionable on its own, so it is logged at
-        # debug and only the stand-down below warns.
         _LOGGER.debug(
-            "%s: combined status poll unanswered, %d in a row",
+            "%s: Combined status poll unanswered, %d in a row",
             self.name,
             self._unanswered_combined_status_polls,
         )
@@ -1823,11 +1789,8 @@ class PushLock:
         self._earliest_combined_status_poll_time = (
             time.monotonic() + COMBINED_STATUS_POLL_FAILURE_BACKOFF
         )
-        # The warning repeats each time a poll after the backoff goes
-        # unanswered, so the log shows that the lock still does not answer the
-        # combined poll.
         _LOGGER.warning(
-            "%s: the lock has not answered the combined lock and door status "
+            "%s: The lock has not answered the combined lock and door status "
             "poll %d times; polling the lock status alone for %d seconds and "
             "the door status on its own request",
             self.name,
@@ -1836,23 +1799,7 @@ class PushLock:
         )
 
     async def _poll_status(self, lock: Lock) -> None:
-        """Poll the lock status, and the door status while the combined poll is in use.
-
-        A combined poll whose wait times out after its write returned is followed
-        by the lock-only poll, and counts as unanswered once that poll answers. A
-        disconnect, or a write that does not return, on a link that was up as the
-        combined poll started also counts, and the error is raised to the retry
-        decorator. COMBINED_STATUS_POLL_FAILURE_THRESHOLD unanswered combined
-        polls in a row stand the combined poll down for
-        COMBINED_STATUS_POLL_FAILURE_BACKOFF. A lock-only poll that also goes
-        unanswered raises and is not counted, because a lock that answers neither
-        poll has shown nothing about the subtype; such a lock pays both response
-        timeouts on every attempt of the retry decorator. Any other failure of
-        the combined poll raises and is not counted.
-
-        After a stand-down the standalone door request can still be deferred by
-        its own cooldown.
-        """
+        """Poll the lock status, and the door too while the combined poll is in use."""
         if not self._combined_status_poll_in_use():
             await lock.lock_status()
             self._record_auth_success()
@@ -1870,19 +1817,16 @@ class PushLock:
                 # a drop, with no lock-only poll.
                 self._count_unanswered_combined_status_poll()
                 raise
-            # Only a timeout falls back to the lock-only poll. Any other
-            # retryable error is logged below and raised to the retry decorator.
+            # A lock that answers neither poll has shown nothing about the subtype,
+            # so this combined poll is counted only after the lock-only poll answers.
             await lock.lock_status()
             self._record_auth_success()
             self._count_unanswered_combined_status_poll()
-            return
         except RETRYABLE_EXCEPTIONS as err:
             # TimeoutError is a member of RETRYABLE_EXCEPTIONS, so its clause
-            # stays above this one or the fallback above is never reached. The
-            # debug line names this poll, so a reconnect that follows can be
-            # traced to it.
+            # stays above this one or the fallback above is never reached.
             _LOGGER.debug(
-                "%s: combined status poll failed with %s",
+                "%s: Combined status poll failed with %s",
                 self.name,
                 type(err).__name__,
             )
@@ -1893,8 +1837,9 @@ class PushLock:
             ):
                 self._count_unanswered_combined_status_poll()
             raise
-        self._unanswered_combined_status_polls = 0
-        self._record_auth_success()
+        else:
+            self._unanswered_combined_status_polls = 0
+            self._record_auth_success()
 
     @operation_lock
     async def _update(self) -> None:
@@ -1949,8 +1894,8 @@ class PushLock:
             self._force_lock_status_poll
             or LockStatus not in self._seen_this_session
             or (
-                self._combined_status_poll_in_use()
-                and DoorStatus not in self._seen_this_session
+                DoorStatus not in self._seen_this_session
+                and self._combined_status_poll_in_use()
             )
             or (
                 not made_request

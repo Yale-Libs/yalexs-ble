@@ -1080,8 +1080,8 @@ def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
         ),
         (
             "lock_and_door_status",
-            BATTERY_FRAME,
-            BatteryState(5.241, 28),
+            LOCK_FRAME,
+            LockStatus.UNLOCKED,
             LOCK_AND_DOOR_FRAME,
             (LockStatus.LOCKED, DoorStatus.OPENED),
         ),
@@ -1991,60 +1991,36 @@ def test_op_response_callback_fires_on_op_responses_not_acks() -> None:
     assert op_calls == [1, 1]
 
 
-@pytest.mark.asyncio
-async def test_lock_and_door_status_sends_the_combined_subtype() -> None:
-    """The combined poll asks for DOOR_AND_LOCK and reads both bytes.
-
-    The subtype it writes is what selects the answer's layout, so the written
-    command has 0x2F at byte[4] and only a frame declaring that subtype
-    ends the wait.
-    """
-    lock, session = _connected_lock()
-    written: list[bytes] = []
-
-    async def deliver(_char: object, command: bytearray, _response: object) -> None:
-        written.append(bytes(command))
-        # A lock-only answer declares another subtype, so it does not end this wait.
-        session._notify(0, bytearray(LOCK_FRAME))
-        assert session._notify_future is not None
-        session._notify(0, bytearray(LOCK_AND_DOOR_FRAME))
-
-    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-
-    assert await lock.lock_and_door_status() == (LockStatus.LOCKED, DoorStatus.OPENED)
-    assert written[0][0x01] == Commands.GETSTATUS.value
-    assert written[0][0x04] == StatusType.DOOR_AND_LOCK.value
-
-
-def test_an_init_door_byte_publishes_unknown_without_the_unrecognized_line(
+@pytest.mark.parametrize(
+    ("frame", "emitted", "logged"),
+    [
+        pytest.param(
+            LOCK_AND_DOOR_INIT_FRAME,
+            [LockStatus.LOCKED, DoorStatus.UNKNOWN],
+            [],
+            id="U",
+        ),
+        # A built DOOR_ONLY answer whose door byte is outside the enum.
+        pytest.param(
+            _with_checksum("bb0200122e0000007f000000000000000000"),
+            [DoorStatus.UNKNOWN],
+            ["mylock: Unrecognized door_status_str code: 0x7f"],
+            id="outside-the-enum",
+        ),
+    ],
+)
+def test_only_a_door_byte_outside_the_enum_is_logged(
     caplog: pytest.LogCaptureFixture,
+    frame: bytes,
+    emitted: list[LockStateValue],
+    logged: list[str],
 ) -> None:
-    """Row U: a 0x00 door byte on a 0x2F frame is emitted as DoorStatus.UNKNOWN.
-
-    0x00 is Init, a defined value of the enum, so only a byte the enum has no
-    value for is logged.
-    """
-    emitted: list[list[LockStateValue]] = []
-    lock = _make_lock(lambda states: emitted.append(list(states)))
+    """Row U: 0x00 publishes UNKNOWN; only a door byte outside the enum is logged."""
+    states: list[list[LockStateValue]] = []
+    lock = _make_lock(lambda values: states.append(list(values)))
 
     with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
-        lock._internal_state_callback(LOCK_AND_DOOR_INIT_FRAME)
+        lock._internal_state_callback(frame)
 
-    assert emitted == [[LockStatus.LOCKED, DoorStatus.UNKNOWN]]
-    assert "Unrecognized" not in caplog.text
-
-
-def test_an_unrecognized_door_byte_on_the_door_only_answer_is_logged(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The standalone door answer keeps the unrecognized-code diagnostic."""
-    emitted: list[list[LockStateValue]] = []
-    lock = _make_lock(lambda states: emitted.append(list(states)))
-
-    with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
-        lock._internal_state_callback(
-            _with_checksum("bb0200122e0000007f000000000000000000")
-        )
-
-    assert emitted == [[DoorStatus.UNKNOWN]]
-    assert "Unrecognized door_status_str code: 0x7f" in caplog.text
+    assert states == [emitted]
+    assert [line for line in caplog.messages if "Unrecognized" in line] == logged

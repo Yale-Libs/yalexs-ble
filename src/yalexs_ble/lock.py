@@ -842,11 +842,7 @@ class Lock:
         return lock_status_enum
 
     def _parse_door_status(self, door_status: int) -> DoorStatus:
-        """Parse the door state from the response.
-
-        Init (0x00) and a byte outside the enum both decode to DoorStatus.UNKNOWN,
-        and only the byte outside the enum is logged.
-        """
+        """Parse the door state from the response."""
         door_status_enum = VALUE_TO_DOOR_STATUS.get(door_status)
         if door_status_enum is None:
             _LOGGER.info(
@@ -885,9 +881,6 @@ class Lock:
     async def lock_status(self) -> LockStatus:
         """Poll the lock status alone (GETSTATUS subtype LOCK_ONLY)."""
         response = await self._poll_status(StatusType.LOCK_ONLY, "lock_status")
-        # The answering frame was already decoded and logged on the notify
-        # path, so the bare lookup here keeps the unrecognized-code
-        # diagnostic to one line per frame.
         return VALUE_TO_LOCK_STATUS.get(response[0x08], LockStatus.UNKNOWN)
 
     @raise_if_not_connected
@@ -896,9 +889,6 @@ class Lock:
         response = await self._poll_status(
             StatusType.DOOR_AND_LOCK, "lock_and_door_status"
         )
-        # The answering frame was already decoded and logged on the notify
-        # path, so the bare lookups here keep the unrecognized-code
-        # diagnostic to one line per frame.
         return (
             VALUE_TO_LOCK_STATUS.get(response[0x08], LockStatus.UNKNOWN),
             VALUE_TO_DOOR_STATUS.get(response[0x09], DoorStatus.UNKNOWN),
@@ -908,9 +898,6 @@ class Lock:
     async def door_status(self) -> DoorStatus:
         """Poll the door status alone (GETSTATUS subtype DOOR_ONLY)."""
         response = await self._poll_status(StatusType.DOOR_ONLY, "door_status")
-        # The answering frame was already decoded and logged on the notify
-        # path, so the bare lookup here keeps the unrecognized-code
-        # diagnostic to one line per frame.
         return VALUE_TO_DOOR_STATUS.get(response[0x08], DoorStatus.UNKNOWN)
 
     def _parse_battery_state(self, response: bytes) -> BatteryState:
@@ -925,7 +912,11 @@ class Lock:
         return BatteryState(voltage, percentage)
 
     async def _poll_status(self, status_type: StatusType, name: str) -> bytes:
-        """Send a GetStatus for status_type and return the reply of that subtype."""
+        """Send a GetStatus for status_type and return the reply of that subtype.
+
+        The notify path has already logged any unrecognized code in the reply, so
+        a caller reads its bytes without logging.
+        """
         _LOGGER.debug("%s: Executing %s", self.name, name)
         response = await self._execute_command(
             Commands.GETSTATUS,
