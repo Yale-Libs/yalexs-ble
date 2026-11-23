@@ -882,10 +882,7 @@ class PushLock:
         await self._execute_disconnect()
 
     async def _async_handle_disconnected(self, exc: Exception) -> None:
-        """Disconnect after a failed attempt of a retried call.
-
-        Skips the disconnect while another task holds the connect lock.
-        """
+        """Disconnect after a failed attempt of a retried call."""
         if self._connect_lock.locked():
             _LOGGER.debug("%s: Connect lock held, skipping cleanup", self.name)
             return
