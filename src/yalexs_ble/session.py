@@ -415,11 +415,11 @@ class Session:
             _LOGGER.exception("%s: Disconnect after a failed write raised", self.name)
 
     def _check_link_for_write(self) -> None:
-        """Raise BleakError if the link is down or a write on this session failed."""
+        """Raise if the link is down or a write on this session has failed."""
         if not self.client.is_connected:
-            raise BleakError("disconnected")
+            raise DisconnectedError(f"{self.name}: disconnected")
         if self._disconnect_task is not None:
-            raise BleakError("disconnect started after a failed write")
+            raise DisconnectedError(f"{self.name}: a write on this session failed")
 
     async def _locked_write(
         self,

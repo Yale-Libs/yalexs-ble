@@ -478,6 +478,21 @@ def _secure_on_air(frame: bytes | bytearray) -> bytes:
     return encryptor.update(bytes(frame[0x00:0x10])) + bytes(frame[0x10:0x12])
 
 
+def _lock_decryptor(key: bytes, mode: modes.Mode) -> Callable[[bytes], bytes]:
+    """Return a function that decrypts written frames as the lock does."""
+    decryptor = Cipher(algorithms.AES(key), mode).decryptor()
+    return lambda frame: decryptor.update(frame[0x00:0x10]) + frame[0x10:]
+
+
+def _make_secure_session() -> SecureSession:
+    """Create a SecureSession keyed with SESSION_KEY on a mock client."""
+    session = SecureSession(
+        MagicMock(is_connected=True), "testlock", asyncio.Lock(), set(), 1
+    )
+    session.set_key(SESSION_KEY)
+    return session
+
+
 @pytest.mark.asyncio
 async def test_a_secure_session_handshake_frame_still_answers_its_wait() -> None:
     """The authentication path shares _notify, so admission runs on it too.
@@ -487,9 +502,7 @@ async def test_a_secure_session_handshake_frame_still_answers_its_wait() -> None
     callback both run on the handshake. A handshake reply has to clear them,
     and it carries no state callback to fall back on.
     """
-    client = MagicMock(is_connected=True)
-    session = SecureSession(client, "testlock", asyncio.Lock(), set(), 1)
-    session.set_key(SESSION_KEY)
+    session = _make_secure_session()
     # The lock's reply to the key exchange, checksummed as the lock stamps it.
     answer = session.build_command(0x02)
     session._write_checksum(answer)
@@ -509,33 +522,26 @@ async def test_a_secure_session_handshake_frame_still_answers_its_wait() -> None
     ("make_session", "mode"),
     [
         pytest.param(
-            lambda client: Session(client, "testlock", asyncio.Lock(), set()),
-            modes.CBC(bytes(0x10)),
-            id="cbc",
+            lambda: _make_session([], SESSION_KEY), modes.CBC(bytes(0x10)), id="cbc"
         ),
-        pytest.param(
-            lambda client: SecureSession(client, "testlock", asyncio.Lock(), set(), 1),
-            modes.ECB(),  # nosec
-            id="secure-ecb",
-        ),
+        pytest.param(_make_secure_session, modes.ECB(), id="secure-ecb"),  # nosec
     ],
 )
 @pytest.mark.asyncio
 async def test_every_attempt_decrypts_at_the_lock_to_the_command(
-    make_session: Callable[[MagicMock], Session], mode: modes.Mode
+    make_session: Callable[[], Session], mode: modes.Mode
 ) -> None:
     """A retried write decrypts at the lock to the command, as the first one does."""
-    client = MagicMock(is_connected=True)
-    session = make_session(client)
-    session.set_key(SESSION_KEY)
-    lock_decryptor = Cipher(algorithms.AES(SESSION_KEY), mode).decryptor()
+    session = make_session()
+    client = session.client
+    decrypt_at_the_lock = _lock_decryptor(SESSION_KEY, mode)
     command = session.build_command(Commands.GETSTATUS)
     expected = bytearray(command)
     session._write_checksum(expected)
     at_the_lock: list[bytes] = []
 
     async def deliver(_char: object, frame: bytes, _response: bool) -> None:
-        at_the_lock.append(lock_decryptor.update(frame[0x00:0x10]) + frame[0x10:])
+        at_the_lock.append(decrypt_at_the_lock(frame))
         # A short frame fails each attempt's wait, so all three attempts are written.
         session._notify(0, bytearray(9))
 
@@ -712,8 +718,7 @@ async def test_execute_operation_happy_path() -> None:
     assert result == bytes(op_response)
     assert client.write_gatt_char.await_count == 1
     frame = client.write_gatt_char.await_args.args[1]
-    lock_decryptor = Cipher(algorithms.AES(bytes(16)), modes.CBC(bytes(16))).decryptor()
-    assert lock_decryptor.update(frame[0x00:0x10]) + frame[0x10:] == command
+    assert _lock_decryptor(bytes(16), modes.CBC(bytes(16)))(frame) == command
     assert progress.write_attempted is True
     assert progress.acknowledged is True
     write_cb.assert_called_once()
@@ -1957,13 +1962,7 @@ async def test_execute_operation_rejects_a_used_progress_record(
 
 @pytest.mark.asyncio
 async def test_execute_operation_not_connected_raises_disconnected() -> None:
-    """The pre-write connected-guard raises, converted to DisconnectedError.
-
-    The one exit taken before the write call, so it is where write_attempted
-    stays False: a caller that must never re-send a command reads that
-    record, and every later exit has to report the command as possibly
-    delivered.
-    """
+    """An operation on a down link raises DisconnectedError with no write attempted."""
     session, client = _make_operation_session()
     client.is_connected = False
     progress = OperationProgress()
@@ -2027,13 +2026,21 @@ async def _never_returns(*_args: object, **_kwargs: object) -> None:
     await asyncio.Event().wait()
 
 
+def _lose_the_link(client: MagicMock) -> Callable[..., Awaitable[None]]:
+    async def write(*_args: object, **_kwargs: object) -> None:
+        client.is_connected = False
+        raise BleakError("write failed")
+
+    return write
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("run", "write", "raised", "raised_next", "writes", "disconnects"),
     [
         pytest.param(
             _poll,
-            BleakError("write failed"),
+            lambda _client: BleakError("write failed"),
             BleakError,
             DisconnectedError,
             1,
@@ -2042,7 +2049,7 @@ async def _never_returns(*_args: object, **_kwargs: object) -> None:
         ),
         pytest.param(
             _poll,
-            _never_returns,
+            lambda _client: _never_returns,
             TimeoutError,
             DisconnectedError,
             1,
@@ -2051,7 +2058,7 @@ async def _never_returns(*_args: object, **_kwargs: object) -> None:
         ),
         pytest.param(
             _operation,
-            BleakError("write failed"),
+            lambda _client: BleakError("write failed"),
             BleakError,
             DisconnectedError,
             1,
@@ -2059,21 +2066,36 @@ async def _never_returns(*_args: object, **_kwargs: object) -> None:
             id="operation-write-raises",
         ),
         pytest.param(
-            _poll, None, TimeoutError, TimeoutError, 2, 0, id="poll-answer-missing"
+            _poll,
+            lambda _client: None,
+            TimeoutError,
+            TimeoutError,
+            2,
+            0,
+            id="poll-answer-missing",
+        ),
+        pytest.param(
+            _poll,
+            _lose_the_link,
+            BleakError,
+            DisconnectedError,
+            1,
+            0,
+            id="poll-link-down-during-write",
         ),
     ],
 )
-async def test_a_write_that_does_not_return_ends_the_link(
+async def test_a_write_that_raises_or_hangs_ends_the_link_only_while_it_is_up(
     run: Callable[[Session], Awaitable[bytes]],
-    write: object,
+    write: Callable[[MagicMock], object],
     raised: type[BaseException],
     raised_next: type[BaseException],
     writes: int,
     disconnects: int,
 ) -> None:
-    """A write that raises or hangs ends the link and the next command is refused."""
+    """A write that raises or hangs ends a live link and the next command is refused."""
     session = _make_session([])
-    session.client.write_gatt_char = AsyncMock(side_effect=write)
+    session.client.write_gatt_char = AsyncMock(side_effect=write(session.client))
 
     with patch.object(util, "asyncio_timeout", _short_timeout):
         with pytest.raises(raised):
@@ -2084,26 +2106,6 @@ async def test_a_write_that_does_not_return_ends_the_link(
 
     assert session.client.write_gatt_char.await_count == writes
     assert session.client.disconnect.await_count == disconnects
-
-
-@pytest.mark.asyncio
-async def test_a_write_that_fails_with_the_link_already_down_starts_no_disconnect() -> (
-    None
-):
-    """A link that dropped during the write needs no disconnect."""
-    session = _make_session([])
-
-    async def lose_the_link(*_args: object, **_kwargs: object) -> None:
-        session.client.is_connected = False
-        raise BleakError("write failed")
-
-    session.client.write_gatt_char = AsyncMock(side_effect=lose_the_link)
-
-    with pytest.raises(BleakError, match="write failed"):
-        await _poll(session)
-    await asyncio.sleep(0)
-
-    assert session.client.disconnect.await_count == 0
 
 
 @pytest.mark.asyncio
