@@ -19,10 +19,10 @@ from bleak_retry_connector import BleakNotFoundError
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 import yalexs_ble
+from tests.esp_proxy import EspClient, EspProxy, esp_backend, esp_connections
 from yalexs_ble.activity_log import LogRecord, parse_log_event_packet
 from yalexs_ble.const import (
     ASSA_ABLOY_MFR_ID,
-    READ_CHARACTERISTIC,
     SECURE_WRITE_CHARACTERISTIC,
     WRITE_CHARACTERISTIC,
     YALE_MFR_ID,
@@ -50,6 +50,7 @@ from yalexs_ble.push import (
     ACTIVITY_DRAIN_FAILURE_THRESHOLD,
     ACTIVITY_DRAIN_MARGIN,
     ACTIVITY_DRAIN_WINDOW,
+    ADV_UPDATE_COALESCE_SECONDS,
     APPLE_MFR_ID,
     AUTH_FAILURE_TO_START_REAUTH,
     AUTO_LOCK_READ_FAILURE_BACKOFF,
@@ -2361,12 +2362,12 @@ async def test_set_auto_lock_write_resets_read_backoff() -> None:
 
 
 def _named_push_lock(
-    address: str, *, always_connected: bool, **kwargs: Any
+    address: str, *, always_connected: bool, key: str = "0800200c9a66", **kwargs: Any
 ) -> PushLock:
-    """A named PushLock with the canonical test key and slot."""
+    """A named PushLock with the canonical test slot and, by default, key."""
     push_lock = PushLock(
         address=address,
-        key="0800200c9a66",
+        key=key,
         key_index=1,
         always_connected=always_connected,
         **kwargs,
@@ -9952,17 +9953,22 @@ async def _started_on_a_real_lock(
     return push_lock
 
 
-def _held_disconnect(
-    events: list[str], closing: asyncio.Event, disconnecting: asyncio.Event
-) -> Callable[[], Awaitable[None]]:
-    """A disconnect that sets disconnecting and returns once closing is set."""
+async def _stopped_in_its_disconnect(
+    address: str, events: list[str]
+) -> tuple[PushLock, asyncio.Event]:
+    """A stopped PushLock whose teardown is in its disconnect until the event is set."""
+    closing = asyncio.Event()
+    disconnecting = asyncio.Event()
 
     async def disconnect() -> None:
         disconnecting.set()
         await closing.wait()
         events.append("disconnected")
 
-    return disconnect
+    stopped = await _started_on_a_real_lock(address, disconnect)
+    stopped._cancel()
+    await disconnecting.wait()
+    return stopped, closing
 
 
 async def _start_on_a_known_device(push_lock: PushLock) -> None:
@@ -9972,11 +9978,29 @@ async def _start_on_a_known_device(push_lock: PushLock) -> None:
         await push_lock.start()
 
 
+async def _start_and_record(start: Awaitable[None], events: list[str]) -> None:
+    """Await a start() call, then append "started" to events."""
+    await start
+    events.append("started")
+
+
+def _link_held_in_connect() -> tuple[MagicMock, asyncio.Event]:
+    """A mock Lock whose connect sets the event and never returns."""
+    connecting = asyncio.Event()
+
+    async def connect(_max_attempts: int) -> None:
+        connecting.set()
+        await asyncio.Event().wait()
+
+    link = MagicMock(spec=Lock, is_connected=False)
+    link.connect = AsyncMock(side_effect=connect)
+    return link, connecting
+
+
 def _first_link(push_lock: PushLock, connected: Callable[[], None]) -> MagicMock:
     """A mock Lock for push_lock's next connect that answers a first update cycle."""
-    link = MagicMock(is_connected=True)
-    link.lock_status = publishing_read(push_lock, LockStatus.LOCKED)
-    link.door_status = publishing_read(push_lock, DoorStatus.CLOSED)
+    link = _answering_lock(push_lock)
+    link.is_connected = True
     link.auto_lock_status = AsyncMock()
     link.connect = AsyncMock(side_effect=lambda _max_attempts: connected())
     link.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
@@ -10005,13 +10029,7 @@ async def test_start_waits_for_the_disconnect_of_the_last_stop(
 ) -> None:
     """start() returns after its address's last teardown, before the first connect."""
     events: list[str] = []
-    closing = asyncio.Event()
-    disconnecting = asyncio.Event()
-    stopped = await _started_on_a_real_lock(
-        stopped_address, _held_disconnect(events, closing, disconnecting)
-    )
-    stopped._cancel()
-    await disconnecting.wait()
+    stopped, closing = await _stopped_in_its_disconnect(stopped_address, events)
     started = (
         stopped
         if restarted is None
@@ -10019,18 +10037,17 @@ async def test_start_waits_for_the_disconnect_of_the_last_stop(
     )
     link = _first_link(started, lambda: events.append("connected"))
 
-    async def start() -> None:
-        await _start_on_a_known_device(started)
-        events.append("started")
-
     with (
         patch.object(started, "_get_lock_instance", return_value=link),
         caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
     ):
-        starting = asyncio.create_task(start())
+        starting = asyncio.create_task(
+            _start_and_record(_start_on_a_known_device(started), events)
+        )
         await asyncio.sleep(0)  # start() runs up to its wait
         closing.set()
         await starting
+        await _loop_clock_moves_on(ADV_UPDATE_COALESCE_SECONDS)
         await started.wait_for_first_update(1)
 
     assert events == ["disconnected", "started", "connected"]
@@ -10052,14 +10069,8 @@ async def test_start_does_not_wait_without_a_stop_of_its_address(
 ) -> None:
     """start() does not wait when no teardown of its address is running."""
     events: list[str] = []
-    closing = asyncio.Event()
-    disconnecting = asyncio.Event()
     if stopped_address is not None:
-        stopped = await _started_on_a_real_lock(
-            stopped_address, _held_disconnect(events, closing, disconnecting)
-        )
-        stopped._cancel()
-        await disconnecting.wait()
+        stopped, closing = await _stopped_in_its_disconnect(stopped_address, events)
     push_lock = _named_push_lock("AA:BB:CC:DD:EE:D3", always_connected=False)
 
     await asyncio.wait_for(_start_on_a_known_device(push_lock), 1)
@@ -10095,17 +10106,13 @@ async def test_a_stop_during_another_keeps_its_entry_until_its_own_teardown_ends
     await asyncio.gather(*first._background_tasks)
     started = _named_push_lock(address, always_connected=False)
 
-    async def start() -> None:
-        await _start(started)
-        events.append("started")
-
-    starting = asyncio.create_task(start())
+    starting = asyncio.create_task(_start_and_record(_start(started), events))
     await asyncio.sleep(0)  # start() runs up to its wait
     closing["second"].set()
     await starting
 
     assert events == ["first disconnected", "second disconnected", "started"]
-    assert address not in _PENDING_TEARDOWNS
+    assert _PENDING_TEARDOWNS.pending(address) is None
 
 
 @pytest.mark.asyncio
@@ -10113,14 +10120,8 @@ async def test_a_start_cancelled_while_it_waits_leaves_the_teardown_to_finish() 
     """A start() cancelled while it waits leaves the teardown to finish."""
     address = "AA:BB:CC:DD:EE:D6"
     events: list[str] = []
-    closing = asyncio.Event()
-    disconnecting = asyncio.Event()
-    stopped = await _started_on_a_real_lock(
-        address, _held_disconnect(events, closing, disconnecting)
-    )
-    stopped._cancel()
+    stopped, closing = await _stopped_in_its_disconnect(address, events)
     (teardown,) = stopped._background_tasks
-    await disconnecting.wait()
     starting = asyncio.create_task(
         _start(_named_push_lock(address, always_connected=False))
     )
@@ -10167,11 +10168,7 @@ async def test_start_goes_on_after_a_teardown_that_failed(
     await disconnecting.wait()
     started = _named_push_lock(address, always_connected=False)
 
-    async def start() -> None:
-        await _start(started)
-        events.append("started")
-
-    starting = asyncio.create_task(start())
+    starting = asyncio.create_task(_start_and_record(_start(started), events))
     await asyncio.sleep(0)  # start() runs up to its wait
     if ending == "raised":
         closing.set()
@@ -10191,15 +10188,8 @@ async def test_a_restart_after_a_stop_during_a_connect_keeps_the_next_link() -> 
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
     push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
-    connecting = asyncio.Event()
     closing = asyncio.Event()
-
-    async def connect(_max_attempts: int) -> None:
-        connecting.set()
-        await asyncio.Event().wait()
-
-    old = MagicMock(spec=Lock, is_connected=False)
-    old.connect = AsyncMock(side_effect=connect)
+    old, connecting = _link_held_in_connect()
     old.disconnect = AsyncMock(side_effect=closing.wait)
     new = MagicMock(spec=Lock, is_connected=True)
 
@@ -10236,22 +10226,17 @@ async def test_a_restart_after_a_stop_during_a_connect_keeps_the_next_link() -> 
 async def test_a_restart_during_the_first_update_gets_its_own_first_update() -> None:
     """A lock restarted during its first update gets the restart's own first update."""
     push_lock = _named_push_lock("AA:BB:CC:DD:EE:DD", always_connected=False)
-    connecting = asyncio.Event()
-
-    async def connect(_max_attempts: int) -> None:
-        connecting.set()
-        await asyncio.Event().wait()
-
-    old = MagicMock(spec=Lock, is_connected=False)
-    old.connect = AsyncMock(side_effect=connect)
+    old, connecting = _link_held_in_connect()
     new = _first_link(push_lock, lambda: None)
 
     with patch.object(push_lock, "_get_lock_instance", side_effect=[old, new]):
         await _start_on_a_known_device(push_lock)
         first_wait = asyncio.create_task(push_lock.wait_for_first_update(5))
+        await _loop_clock_moves_on(ADV_UPDATE_COALESCE_SECONDS)
         await asyncio.wait_for(connecting.wait(), 1)
         push_lock._cancel()
         await _start_on_a_known_device(push_lock)
+        await _loop_clock_moves_on(ADV_UPDATE_COALESCE_SECONDS)
         await push_lock.wait_for_first_update(1)
 
     new.connect.assert_awaited_once()
@@ -10299,11 +10284,7 @@ async def test_start_waits_for_the_disconnect_a_stopped_drain_write_started() ->
     stopped._cancel()
     started = _named_push_lock(address, always_connected=False)
 
-    async def start() -> None:
-        await _start(started)
-        events.append("started")
-
-    starting = asyncio.create_task(start())
+    starting = asyncio.create_task(_start_and_record(_start(started), events))
     # Time enough for start() to return, were it not waiting.
     await asyncio.wait({starting}, timeout=0.05)
     closing.set()
@@ -10337,11 +10318,7 @@ async def test_start_waits_for_a_stopped_drain_to_end() -> None:
     stopped._cancel()
     started = _named_push_lock(address, always_connected=False)
 
-    async def start() -> None:
-        await _start(started)
-        events.append("started")
-
-    starting = asyncio.create_task(start())
+    starting = asyncio.create_task(_start_and_record(_start(started), events))
     # Time enough for start() to return, were it not waiting.
     await asyncio.wait({starting}, timeout=0.05)
     finishing.set()
@@ -10401,136 +10378,6 @@ async def test_validate_disconnects_its_client_before_it_returns(
     _AUTH_FAILURE_HISTORY.auth_success(address)
 
 
-class _EspProxy:
-    """A fake ESPHome Bluetooth proxy for one address."""
-
-    def __init__(self) -> None:
-        self.log: list[str] = []
-        self.clients: list[_EspClient] = []
-        self.next_secure_write_error: BleakError | None = None
-        self._waiting: list[asyncio.Future[None]] = []
-
-    async def establish(
-        self, _cls: Any, _device: Any, _name: str, disconnected: Any, **_: Any
-    ) -> "_EspClient":
-        """Return a new connected client, in place of establish_connection."""
-        self.log.append("connect")
-        client = _EspClient(self, disconnected)
-        if (error := self.next_secure_write_error) is not None:
-            self.next_secure_write_error = None
-            client.next_write_error[SECURE_WRITE_CHARACTERISTIC] = error
-        return client
-
-    def request_disconnect(self) -> asyncio.Future[None]:
-        self.log.append("disconnect request")
-        loop = asyncio.get_running_loop()
-        waiter = loop.create_future()
-        self._waiting.append(waiter)
-        loop.call_later(0.005, self.send_connected_false, "connected=False")
-        return waiter
-
-    def send_connected_false(self, entry: str) -> None:
-        self.log.append(entry)
-        for waiter in self._waiting:
-            if not waiter.done():
-                waiter.set_result(None)
-        self._waiting.clear()
-        for client in list(self.clients):
-            client.link_down()
-
-
-class _EspClient:
-    """A client of _EspProxy, whose is_connected turns False at the proxy's answer."""
-
-    def __init__(self, proxy: _EspProxy, disconnected: Any) -> None:
-        self.proxy = proxy
-        self.is_connected = True
-        self.down = asyncio.Event()
-        self.next_write_error: dict[str, BleakError] = {}
-        self.hold_after_answer: asyncio.Event | None = None
-        self._disconnected = disconnected
-        self._notify: dict[str, Callable[[int, bytearray], None]] = {}
-        self._writes: set[asyncio.Future[None]] = set()
-        self.services = MagicMock()
-        self.services.get_characteristic = lambda uuid: SimpleNamespace(uuid=uuid)
-        proxy.clients.append(self)
-
-    async def start_notify(self, char: Any, callback: Any) -> None:
-        self._notify[char.uuid] = callback
-
-    async def stop_notify(self, _char: Any) -> None:
-        return None
-
-    async def set_connection_params(self, *_: Any) -> None:
-        return None
-
-    async def clear_cache(self) -> bool:
-        return True
-
-    async def write_gatt_char(self, char: Any, data: bytes, _response: bool) -> None:
-        if not self.is_connected:
-            raise BleakError("not connected")
-        if (error := self.next_write_error.pop(char.uuid, None)) is not None:
-            await asyncio.sleep(0)
-            raise error
-        if char.uuid == SECURE_WRITE_CHARACTERISTIC:
-            # Every secure write is answered as the shutdown command is, by the
-            # lock ending the link.
-            asyncio.get_running_loop().call_soon(
-                self.proxy.send_connected_false, "the lock ends the link"
-            )
-            ended = asyncio.get_running_loop().create_future()
-            self._writes.add(ended)
-            await ended
-        reply = bytearray(data)
-        reply[0x00] = 0xBB
-        reply[0x03] = 0
-        reply[0x03] = _simple_checksum(reply)
-        asyncio.get_running_loop().call_soon(
-            self._notify[READ_CHARACTERISTIC], 0, reply
-        )
-
-    async def disconnect(self) -> None:
-        answered = self.proxy.request_disconnect()
-        try:
-            await answered
-        finally:
-            self.link_down()
-        if self.hold_after_answer is not None:
-            await self.hold_after_answer.wait()
-
-    def link_down(self) -> None:
-        if not self.is_connected:
-            return
-        self.is_connected = False
-        self.down.set()
-        self.proxy.clients.remove(self)
-        for ended in self._writes:
-            if not ended.done():
-                ended.set_exception(BleakError("changed connection status"))
-        self._disconnected(self)
-
-
-@contextmanager
-def _esp_backend(proxy: _EspProxy, *, handshake: bool = False) -> Iterator[None]:
-    """Connect every Lock through proxy, with identity ciphers unless handshake."""
-
-    async def setup_session(lock: Lock) -> None:
-        for session in (lock.session, lock.secure_session):
-            assert session is not None
-            session.cipher_encrypt = MagicMock(update=bytes)
-            session.cipher_decrypt = MagicMock(update=bytes)
-        lock.is_secure = True
-
-    with (
-        patch("yalexs_ble.lock.establish_connection", proxy.establish),
-        patch.object(Lock, "_setup_session", setup_session)
-        if not handshake
-        else nullcontext(),
-    ):
-        yield
-
-
 # The session raises the first as it is and, after its first request, the second
 # as DisconnectedError.
 _GATT_ERROR = BleakError("Bluetooth GATT Error handle=18 error=2 description=Error")
@@ -10539,13 +10386,26 @@ _GATT_ERROR_133 = BleakError(
 )
 
 
-async def _running_on_the_proxy(proxy: _EspProxy, address: str) -> PushLock:
-    """A running, always-connected lock whose first update connected through proxy."""
+async def _running_on_the_proxy(address: str) -> PushLock:
+    """A running, always-connected lock.
+
+    Its first update connected through the caller's esp_backend().
+    """
     push_lock = _backoff_lock(address)
     push_lock._lock_info = TEST_LOCK_INFO
     push_lock.set_ble_device(BLEDevice(address, "Test Lock", None))
     await push_lock._update()
     return push_lock
+
+
+async def _lock_on_the_proxy(proxy: EspProxy, address: str) -> tuple[Lock, EspClient]:
+    """A Lock connected through proxy, and its client."""
+    push_lock = _named_push_lock(address, always_connected=False)
+    push_lock.set_ble_device(BLEDevice(address, "Test Lock", None))
+    lock = push_lock._get_lock_instance()
+    with esp_backend(proxy):
+        await lock.connect()
+    return lock, proxy.clients[0]
 
 
 @pytest.mark.asyncio
@@ -10556,11 +10416,12 @@ async def test_a_failed_write_sends_one_disconnect_before_the_retry_connects(
     error: BleakError,
 ) -> None:
     """A write that fails with the link up ends it with one disconnect request."""
-    proxy = _EspProxy()
-    with _esp_backend(proxy):
-        push_lock = await _running_on_the_proxy(proxy, "AA:BB:CC:DD:EE:E2")
+    proxy = EspProxy()
+    with esp_backend(proxy):
+        push_lock = await _running_on_the_proxy("AA:BB:CC:DD:EE:E2")
         proxy.clients[0].next_write_error[WRITE_CHARACTERISTIC] = error
-        await push_lock._update()
+        with patch("yalexs_ble.push.asyncio.sleep", new=AsyncMock()):
+            await push_lock._update()
 
     assert proxy.log == ["connect", "disconnect request", "connected=False", "connect"]
 
@@ -10571,9 +10432,9 @@ async def test_a_failed_shutdown_write_sends_one_disconnect_before_the_next_star
 ):
     """A stop whose shutdown write fails with the link up sends one disconnect."""
     address = "AA:BB:CC:DD:EE:E3"
-    proxy = _EspProxy()
-    with _esp_backend(proxy):
-        stopped = await _running_on_the_proxy(proxy, address)
+    proxy = EspProxy()
+    with esp_backend(proxy):
+        stopped = await _running_on_the_proxy(address)
         proxy.clients[0].next_write_error[SECURE_WRITE_CHARACTERISTIC] = _GATT_ERROR_133
         stopped._cancel()
         await asyncio.wait_for(
@@ -10606,13 +10467,8 @@ async def test_disconnect_of_a_down_link_sends_no_request(
     failed_write: bool, log: list[str]
 ) -> None:
     """Lock.disconnect() of a down link sends no request and waits for a running one."""
-    proxy = _EspProxy()
-    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E4", always_connected=False)
-    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
-    lock = push_lock._get_lock_instance()
-    with _esp_backend(proxy):
-        await lock.connect()
-    client = proxy.clients[0]
+    proxy = EspProxy()
+    lock, client = await _lock_on_the_proxy(proxy, "AA:BB:CC:DD:EE:E4")
     client.hold_after_answer = asyncio.Event()
     if failed_write:
         client.next_write_error[WRITE_CHARACTERISTIC] = _GATT_ERROR
@@ -10645,18 +10501,14 @@ async def test_disconnect_of_a_down_link_sends_no_request(
 )
 async def test_a_failed_handshake_write_sends_one_disconnect(error: BleakError) -> None:
     """A handshake write that fails with the link up ends it with one disconnect."""
-    proxy = _EspProxy()
+    proxy = EspProxy()
     proxy.next_secure_write_error = error
-    push_lock = PushLock(
-        address="AA:BB:CC:DD:EE:E5",
-        key="00" * 16,
-        key_index=1,
-        always_connected=False,
+    push_lock = _named_push_lock(
+        "AA:BB:CC:DD:EE:E5", always_connected=False, key="00" * 16
     )
-    push_lock._name = "Test Lock"
     push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
 
-    with _esp_backend(proxy, handshake=True), pytest.raises(BleakError):
+    with esp_connections(proxy), pytest.raises(BleakError):
         await push_lock._ensure_connected()
 
     assert proxy.log == ["connect", "disconnect request", "connected=False"]
@@ -10690,13 +10542,8 @@ async def test_disconnect_sends_a_request_when_a_raised_disconnect_left_the_link
     log: list[str],
 ) -> None:
     """Lock.disconnect() sends a request if a raised disconnect left the link up."""
-    proxy = _EspProxy()
-    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E6", always_connected=False)
-    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
-    lock = push_lock._get_lock_instance()
-    with _esp_backend(proxy):
-        await lock.connect()
-    client = proxy.clients[0]
+    proxy = EspProxy()
+    lock, client = await _lock_on_the_proxy(proxy, "AA:BB:CC:DD:EE:E6")
     real_disconnect = client.disconnect
     released = asyncio.Event()
     if not waited:
@@ -10736,13 +10583,8 @@ async def test_disconnect_logs_a_disconnect_request_that_raises(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Lock.disconnect() logs a raised disconnect request at DEBUG and returns."""
-    proxy = _EspProxy()
-    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E7", always_connected=False)
-    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
-    lock = push_lock._get_lock_instance()
-    with _esp_backend(proxy):
-        await lock.connect()
-    client = proxy.clients[0]
+    proxy = EspProxy()
+    lock, client = await _lock_on_the_proxy(proxy, "AA:BB:CC:DD:EE:E7")
 
     with (
         patch.object(
@@ -10796,6 +10638,7 @@ async def test_a_first_wait_ending_after_a_restart_leaves_the_restart_its_update
         await asyncio.wait({first_wait})
         if not restarted_wait_first:
             restarted_wait = asyncio.create_task(push_lock.wait_for_first_update(1))
+        await _loop_clock_moves_on(ADV_UPDATE_COALESCE_SECONDS)
         await restarted_wait
 
     link.connect.assert_awaited_once()
@@ -10842,12 +10685,10 @@ async def test_two_waits_for_one_first_update_both_return() -> None:
 
     with patch.object(push_lock, "_get_lock_instance", return_value=link):
         await _start_on_a_known_device(push_lock)
-        await asyncio.wait_for(
-            asyncio.gather(
-                push_lock.wait_for_first_update(1),
-                push_lock.wait_for_first_update(1),
-            ),
-            2,
+        waits = asyncio.gather(
+            push_lock.wait_for_first_update(1), push_lock.wait_for_first_update(1)
         )
+        await _loop_clock_moves_on(ADV_UPDATE_COALESCE_SECONDS)
+        await asyncio.wait_for(waits, 2)
 
     link.connect.assert_awaited_once()

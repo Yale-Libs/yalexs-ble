@@ -960,27 +960,20 @@ class Lock:
         _LOGGER.debug("%s: Disconnecting from the lock", self.name)
         # While a failed write's disconnect runs, the answer to a second request can
         # end the next client's link to the address.
-        if (
-            not self.client
-            or not self.client.is_connected
-            or self._disconnects_after_failed_write()
-        ):
-            await self._wait_for_disconnect_after_failed_write()
-            return
-
-        try:
-            await self._shutdown_connection()
-        except BleakError:
-            _LOGGER.debug(
-                "%s: Failed to shutdown connection to lock", self.name, exc_info=True
-            )
-        finally:
-            # A write that fails with the link up during the shutdown starts a
-            # disconnect after the check above, and the wait below then sends a
-            # request only if that disconnect leaves the link up.
-            if not self._disconnects_after_failed_write():
-                await self._request_disconnect()
+        if self._link_up and not self._running_failed_write_disconnects():
+            try:
+                await self._shutdown_connection()
+            finally:
+                # A write that fails with the link up during the shutdown starts a
+                # disconnect after the check above.
+                if not self._running_failed_write_disconnects():
+                    await self._request_disconnect()
         await self._wait_for_disconnect_after_failed_write()
+
+    @property
+    def _link_up(self) -> bool:
+        """Return True if the BLE client's link is up."""
+        return bool(self.client and self.client.is_connected)
 
     async def _request_disconnect(self) -> None:
         """Send a disconnect request, logging a BleakError it raises."""
@@ -992,16 +985,16 @@ class Lock:
                 "%s: Failed to disconnect from lock", self.name, exc_info=True
             )
 
-    def _disconnects_after_failed_write(self) -> set[asyncio.Task[None]]:
+    def _running_failed_write_disconnects(self) -> set[asyncio.Task[None]]:
         """Return the failed-write disconnects of either session still running."""
         return {task for task in self._failed_write_disconnects if not task.done()}
 
     async def _wait_for_disconnect_after_failed_write(self) -> None:
         """Wait for running failed-write disconnects, then disconnect a link left up."""
-        if pending := self._disconnects_after_failed_write():
+        if pending := self._running_failed_write_disconnects():
             await asyncio.wait(pending)
             # A disconnect that raised can leave the link up.
-            if self.client and self.client.is_connected:
+            if self._link_up:
                 await self._request_disconnect()
 
     async def _shutdown_connection(self) -> None:

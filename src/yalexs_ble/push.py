@@ -291,17 +291,33 @@ class AuthFailureHistory:
 
 _AUTH_FAILURE_HISTORY = AuthFailureHistory()
 
-# _PENDING_TEARDOWNS holds the teardown task of each address's last stop,
-# keyed by the address in upper case, until the task ends. Every PushLock shares it,
-# because a stopped instance's teardown can drop another instance's connection to
-# the same address.
-_PENDING_TEARDOWNS: dict[str, asyncio.Task[None]] = {}
+
+class _PendingTeardowns:
+    """Hold the teardown task of the last stop for each address until it ends."""
+
+    def __init__(self) -> None:
+        """Init the record."""
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+
+    def pending(self, address: str) -> asyncio.Task[None] | None:
+        """Return the teardown held for the address, whatever its letter case."""
+        return self._tasks.get(address.upper())
+
+    def record(self, address: str, task: asyncio.Task[None]) -> None:
+        """Hold task as the address's teardown until it ends."""
+        key = address.upper()
+        self._tasks[key] = task
+        task.add_done_callback(functools.partial(self._forget, key))
+
+    def _forget(self, key: str, task: asyncio.Task[None]) -> None:
+        """Remove the key's entry if it still holds task."""
+        if self._tasks.get(key) is task:
+            del self._tasks[key]
 
 
-def _forget_teardown(address: str, task: asyncio.Task[None]) -> None:
-    """Remove the address's entry if it still holds task."""
-    if _PENDING_TEARDOWNS.get(address) is task:
-        del _PENDING_TEARDOWNS[address]
+# Every PushLock shares it, because a stopped instance's teardown can drop another
+# instance's connection to the same address.
+_PENDING_TEARDOWNS = _PendingTeardowns()
 
 
 def retry_bluetooth_connection_error(
@@ -857,7 +873,7 @@ class PushLock:
         )
 
     async def _execute_forced_disconnect(self, reason: str) -> None:
-        """Execute forced disconnection."""
+        """Execute forced disconnection and wait for the canceled drain task to end."""
         self._cancel_disconnect_timer()
         _LOGGER.debug("%s: Executing forced disconnect: %s", self.name, reason)
         if (update_task := self._update_task) and not update_task.done():
@@ -866,6 +882,8 @@ class PushLock:
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await update_task
         await self._execute_disconnect()
+        if (drain := self._activity_drain_task) is not None:
+            await asyncio.wait((drain,))
 
     def _disconnect_with_timer(self, timeout: float) -> None:
         """
@@ -2249,7 +2267,7 @@ class PushLock:
 
     async def start(self) -> Callable[[], None]:
         """Start watching for updates after the address's last teardown has ended."""
-        if (teardown := _PENDING_TEARDOWNS.get(self.address.upper())) is not None:
+        if (teardown := _PENDING_TEARDOWNS.pending(self.address)) is not None:
             _LOGGER.debug("%s: Waiting for the last stop's teardown", self.name)
             # asyncio.wait leaves the teardown running if start() is canceled, and
             # raises neither its exception nor its cancellation here.
@@ -2276,16 +2294,10 @@ class PushLock:
             # Kept while a command is in flight so a jam reported during it
             # still ends its attempts; the stopped exit resets it instead.
             self._reset_jam_state()
-        address = self.address.upper()
-        teardown = self.background_task(self._async_teardown())
-        _PENDING_TEARDOWNS[address] = teardown
-        teardown.add_done_callback(functools.partial(_forget_teardown, address))
-
-    async def _async_teardown(self) -> None:
-        """Run the forced disconnect, then wait for the canceled drain task to end."""
-        await self._execute_forced_disconnect("stopping")
-        if (drain := self._activity_drain_task) is not None:
-            await asyncio.wait((drain,))
+        _PENDING_TEARDOWNS.record(
+            self.address,
+            self.background_task(self._execute_forced_disconnect("stopping")),
+        )
 
     def background_task(self, fut: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         """Run fut as a logged background task and return the task."""
@@ -2313,9 +2325,6 @@ class PushLock:
             raise RuntimeError("Not running")
         if (future := self._first_update_future) is None:
             raise RuntimeError("Already waited for first update")
-        # The timeout and the caller's cancellation both cancel future, and a
-        # start() after a stop can replace _first_update_future while this waits,
-        # so the attribute is cleared only while it still holds future.
         try:
             async with asyncio_timeout(timeout):
                 await future
@@ -2324,6 +2333,7 @@ class PushLock:
                 "No advertisement received before timeout"
             ) from ex
         finally:
+            # A start() after a stop can replace _first_update_future while this waits.
             if self._first_update_future is future:
                 self._first_update_future = None
 
