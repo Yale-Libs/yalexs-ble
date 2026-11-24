@@ -2108,6 +2108,53 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("stop_notify_error", "shutdown_error", "logger", "logged"),
+    [
+        pytest.param(
+            EOFError(),
+            None,
+            "yalexs_ble.session",
+            "mylock: D-Bus stopping notify: EOFError",
+            id="stop-notify",
+        ),
+        pytest.param(
+            None,
+            TimeoutError(),
+            "yalexs_ble.lock",
+            "mylock: Failed to cleanly disconnect from lock: TimeoutError",
+            id="shutdown-command",
+        ),
+    ],
+)
+async def test_a_shutdown_step_that_fails_with_no_message_logs_its_type_as_the_cause(
+    stop_notify_error: Exception | None,
+    shutdown_error: Exception | None,
+    logger: str,
+    logged: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A disconnect logs a shutdown step's failure with the exception's type name."""
+    lock, session = _connected_lock()
+    client = lock.client
+    assert isinstance(client, MagicMock)
+    client.start_notify = AsyncMock()
+    client.stop_notify = AsyncMock(side_effect=stop_notify_error)
+    await session.start_notify()
+    lock.is_secure = True
+    lock.secure_session = MagicMock(
+        build_command=MagicMock(return_value=bytearray(RESPONSE_FRAME_LEN)),
+        execute=AsyncMock(side_effect=shutdown_error, return_value=None),
+        stop_notify=AsyncMock(),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble"):
+        await lock.disconnect()
+
+    assert (logger, logging.DEBUG, logged) in caplog.record_tuples
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("method", "args", "frames", "value", "states"),
     [
         pytest.param(

@@ -62,6 +62,7 @@ from .session import (
     YaleXSBLEError,
 )
 from .util import (
+    _exc_cause,
     asyncio_timeout,
     encode_keycode_pin,
     is_disconnected_error,
@@ -777,7 +778,9 @@ class PushLock:
                     asked = True
             except (TimeoutError, *RETRYABLE_EXCEPTIONS) as ex:
                 # The cycle at the floor's end retries and reports the link.
-                _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
+                _LOGGER.debug(
+                    "%s: Keep-alive read failed: %s", self.name, _exc_cause(ex)
+                )
                 return
             if asked:
                 # A request, so the floor check and the keep-alive count from it.
@@ -891,7 +894,9 @@ class PushLock:
 
     async def _async_handle_disconnected(self, exc: Exception) -> None:
         """Clean up after a disconnect."""
-        _LOGGER.debug("%s: Disconnected due to %s, cleaning up", self.name, exc)
+        _LOGGER.debug(
+            "%s: Disconnected due to %s, cleaning up", self.name, _exc_cause(exc)
+        )
         if self._connect_lock.locked():
             _LOGGER.error(
                 "%s: Disconnected while connection was in progress, ignoring",
@@ -939,7 +944,9 @@ class PushLock:
                 await self._client.connect(max_attempts)
             except BaseException as ex:  # Might be cancelled
                 _LOGGER.debug(
-                    "%s: Failed to connect due to %s, forcing disconnect", self.name, ex
+                    "%s: Failed to connect due to %s, forcing disconnect",
+                    self.name,
+                    _exc_cause(ex),
                 )
                 try:
                     await self._client.disconnect()
@@ -1233,7 +1240,7 @@ class PushLock:
             _LOGGER.debug(
                 "%s: Failed to execute lock operation due to %s",
                 self.name,
-                ex,
+                _exc_cause(ex),
             )
             raise
         _LOGGER.debug("%s: Finished %s", self.name, op_attr)
@@ -1331,7 +1338,7 @@ class PushLock:
             _LOGGER.debug(
                 "%s: Failed to execute set auto lock operation due to %s",
                 self.name,
-                ex,
+                _exc_cause(ex),
             )
             raise
         self._complete_operation(time.monotonic())
@@ -1382,7 +1389,8 @@ class PushLock:
                 ) from outcome
         except Exception as err:
             # A ResponseError's message can hold the rejected frame's hex.
-            detail = "" if isinstance(err, ResponseError) else f": {err}"
+            message = "" if isinstance(err, ResponseError) else str(err)
+            detail = f": {message}" if message else ""
             _LOGGER.warning(
                 "%s: %s failed: %s%s", self.name, name, type(err).__name__, detail
             )
@@ -1602,7 +1610,7 @@ class PushLock:
                 "%s: Battery request timed out (%s), will retry in %d "
                 "seconds. Continuing with other updates.",
                 self.name,
-                err,
+                _exc_cause(err),
                 BATTERY_TIMEOUT_COOLDOWN,
             )
             # Set cooldown to prevent repeated timeouts.
@@ -1919,7 +1927,7 @@ class PushLock:
             _LOGGER.debug(
                 "%s: Reading lock activity failed (%s), will retry on next update.",
                 self.name,
-                err,
+                _exc_cause(err),
             )
             return
         self._activity_drain_failures = 0
@@ -1930,7 +1938,7 @@ class PushLock:
             "%s: Reading lock activity keeps failing (%s); "
             "not trying again for %d seconds",
             self.name,
-            err,
+            _exc_cause(err),
             ACTIVITY_DRAIN_FAILURE_BACKOFF,
         )
 
@@ -2147,7 +2155,10 @@ class PushLock:
         self._background_tasks.discard(task)
         if not task.cancelled() and (exc := task.exception()) is not None:
             _LOGGER.error(
-                "%s: Background task failed: %s", self.name, exc, exc_info=exc
+                "%s: Background task failed: %s",
+                self.name,
+                _exc_cause(exc),
+                exc_info=exc,
             )
 
     async def wait_for_first_update(self, timeout: float) -> None:

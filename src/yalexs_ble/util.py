@@ -108,6 +108,11 @@ def is_disconnected_error(error: Exception) -> bool:
     )
 
 
+def _exc_cause(exc: BaseException) -> str:
+    """Return the exception's message, or its type name when it has none."""
+    return str(exc) or type(exc).__name__
+
+
 @dataclass
 class ValidatedLockConfig:
     """A validated lock configuration."""

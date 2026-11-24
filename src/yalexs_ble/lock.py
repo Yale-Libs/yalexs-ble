@@ -1051,7 +1051,9 @@ class Lock:
         except (TimeoutError, BleakError, EOFError) as err:
             if not util.is_disconnected_error(err):
                 _LOGGER.debug(
-                    "%s: Failed to cleanly disconnect from lock: %s", self.name, err
+                    "%s: Failed to cleanly disconnect from lock: %s",
+                    self.name,
+                    util._exc_cause(err),
                 )
             return
         except YaleXSBLEError as err:

@@ -356,7 +356,17 @@ async def test_push_lock_brand_is_the_models_else_the_paired_else_august(
 
 
 @pytest.mark.asyncio
-async def test_background_task_logs_exception(caplog):
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [
+        (BleakError("simulated background failure"), "simulated background failure"),
+        (AssertionError(), "AssertionError"),
+    ],
+    ids=["message", "no-message"],
+)
+async def test_background_task_logs_exception(
+    error: Exception, cause: str, caplog: pytest.LogCaptureFixture
+) -> None:
     """Background task failures should be logged with the lock name."""
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
@@ -367,7 +377,7 @@ async def test_background_task_logs_exception(caplog):
     push_lock._name = "Test Lock"
 
     async def boom():
-        raise BleakError("simulated background failure")
+        raise error
 
     with caplog.at_level("ERROR", logger="yalexs_ble.push"):
         push_lock.background_task(boom())
@@ -376,12 +386,11 @@ async def test_background_task_logs_exception(caplog):
         await asyncio.sleep(0)  # let the done-callback run
 
     assert not push_lock._background_tasks
-    assert any(
-        "Background task failed" in record.message
-        and "Test Lock" in record.message
-        and "simulated background failure" in record.message
-        for record in caplog.records
-    )
+    assert (
+        "yalexs_ble.push",
+        logging.ERROR,
+        f"Test Lock: Background task failed: {cause}",
+    ) in caplog.record_tuples
 
 
 @pytest.mark.asyncio
@@ -1548,15 +1557,20 @@ async def test_keep_alive_read_stands_down_once_a_request_proved_the_link() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("model", "read", "error"),
+    ("model", "read", "error", "cause"),
     [
-        ("ASL-03", "battery", DisconnectedError("link dropped")),
-        ("SL-103", "door_status", BleakError("gone")),
+        ("ASL-03", "battery", DisconnectedError("link dropped"), "link dropped"),
+        ("SL-103", "door_status", BleakError("gone"), "gone"),
+        ("ASL-03", "battery", EOFError(), "EOFError"),
     ],
-    ids=["battery", "door"],
+    ids=["battery", "door", "no-message"],
 )
 async def test_keep_alive_read_yields_to_a_disconnect_and_contains_a_failure(
-    model: str, read: str, error: Exception, caplog: pytest.LogCaptureFixture
+    model: str,
+    read: str,
+    error: Exception,
+    cause: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The read is skipped once the link dropped, and a failing read only logs."""
     push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:09", model)
@@ -1580,7 +1594,11 @@ async def test_keep_alive_read_yields_to_a_disconnect_and_contains_a_failure(
             await asyncio.gather(*push_lock._background_tasks)
 
     getattr(mock_lock, read).assert_awaited_once()
-    assert "Keep-alive read failed" in caplog.text
+    assert (
+        "yalexs_ble.push",
+        logging.DEBUG,
+        f"Test Lock: Keep-alive read failed: {cause}",
+    ) in caplog.record_tuples
     assert "Background task failed" not in caplog.text
 
 
@@ -1703,6 +1721,63 @@ async def test_async_handle_disconnected_executes_disconnect_when_idle() -> None
 
     mock_cancel.assert_called_once()
     mock_disconnect.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [(TimeoutError(), "TimeoutError"), (TimeoutError("no answer"), "no answer")],
+    ids=["no-message", "message"],
+)
+async def test_an_unanswered_status_poll_names_its_cause_in_each_disconnect_line(
+    error: TimeoutError, cause: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A status poll that times out logs each cleanup with its cause."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:2a", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    mock_lock = _answering_lock(push_lock)
+    mock_lock.auto_lock_status = AsyncMock()
+    mock_lock.lock_status = AsyncMock(side_effect=error)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", return_value=mock_lock),
+        pytest.raises(TimeoutError),
+    ):
+        await push_lock._update()
+
+    assert [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if "Disconnected due to" in r.getMessage()
+    ] == [
+        (logging.DEBUG, f"Test Lock: Disconnected due to {cause}, cleaning up")
+    ] * DEFAULT_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_connect_names_cancelled_error_in_its_disconnect_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A connect cancelled with no message logs CancelledError as its cause."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:2b", always_connected=False)
+    link = MagicMock(
+        connect=AsyncMock(side_effect=asyncio.CancelledError()),
+        disconnect=AsyncMock(),
+    )
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_get_lock_instance", return_value=link),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await push_lock._ensure_connected()
+
+    assert (
+        "yalexs_ble.push",
+        logging.DEBUG,
+        "Test Lock: Failed to connect due to CancelledError, forcing disconnect",
+    ) in caplog.record_tuples
 
 
 class _MockRetryLock:
@@ -2711,6 +2786,62 @@ async def test_set_auto_lock_write_retries_twice_then_gives_up(
         await push_lock._set_auto_lock(AutoLockMode.TIMER, 30)
 
     assert mock_lock.set_auto_lock.await_count == AUTO_LOCK_WRITE_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_an_auto_lock_write_that_times_out_names_timeout_error_as_its_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each attempt that times out with no message logs TimeoutError as its cause."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:9a", always_connected=False)
+    push_lock._running = True
+    mock_lock = MagicMock()
+    mock_lock.set_auto_lock = AsyncMock(side_effect=TimeoutError())
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", return_value=mock_lock),
+        patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
+        patch("yalexs_ble.push.asyncio.sleep", new_callable=AsyncMock),
+        pytest.raises(TimeoutError),
+    ):
+        await push_lock._set_auto_lock(AutoLockMode.TIMER, 30)
+
+    assert [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if "Failed to execute set auto lock operation" in r.getMessage()
+    ] == [
+        (
+            logging.DEBUG,
+            "Test Lock: Failed to execute set auto lock operation due to TimeoutError",
+        )
+    ] * AUTO_LOCK_WRITE_ATTEMPTS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [(TimeoutError(), "TimeoutError"), (TimeoutError("no answer"), "no answer")],
+    ids=["no-message", "message"],
+)
+async def test_a_battery_request_that_times_out_names_its_cause(
+    error: TimeoutError, cause: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A battery request that times out logs its cause at INFO."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:9b", always_connected=False)
+    push_lock._lock_info = TEST_LOCK_INFO
+    mock_lock = MagicMock(battery=AsyncMock(side_effect=error))
+
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.push"):
+        assert await push_lock._poll_battery(mock_lock) is True
+
+    assert (
+        "yalexs_ble.push",
+        logging.INFO,
+        f"Test Lock: Battery request timed out ({cause}), will retry in "
+        f"{BATTERY_TIMEOUT_COOLDOWN} seconds. Continuing with other updates.",
+    ) in caplog.record_tuples
 
 
 @pytest.mark.asyncio
@@ -3886,6 +4017,40 @@ async def test_push_lock_keycode_stopped_in_flight_is_not_sent_again(
     assert "clear_keycode failed: ResultUnknownError" in warnings[0].getMessage()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (EOFError(), "Test Lock: clear_keycode failed: EOFError"),
+        (
+            EOFError("link closed"),
+            "Test Lock: clear_keycode failed: EOFError: link closed",
+        ),
+    ],
+    ids=["no-message", "message"],
+)
+async def test_push_lock_command_failure_warning_names_the_type_and_any_message(
+    error: EOFError, message: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    push_lock, lock = _keycode_push_lock()
+    lock.clear_keycode.side_effect = error
+    with (
+        caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+        patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
+        pytest.raises(EOFError) as raised,
+    ):
+        await push_lock.clear_keycode(1)
+
+    assert raised.value is error
+    assert lock.clear_keycode.await_count == DEFAULT_ATTEMPTS
+    assert [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ] == [(logging.WARNING, message)]
+
+
 def _timeout_of(seconds: float) -> Callable[[float], Any]:
     """A util.asyncio_timeout replacement with a fixed deadline."""
     return lambda _: asyncio.timeout(seconds)
@@ -4502,14 +4667,23 @@ async def test_a_drain_that_stops_early_leaves_the_rest_of_the_backlog() -> None
 
 
 @pytest.mark.asyncio
-async def test_a_count_that_is_not_a_depth_ends_the_drain_as_a_failure(
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [
+        (
+            ResponseError("Unread count -559038737 is not a depth"),
+            "Unread count -559038737 is not a depth",
+        ),
+        (TimeoutError(), "TimeoutError"),
+    ],
+    ids=["refused", "unanswered"],
+)
+async def test_a_refused_or_unanswered_count_ends_the_drain_as_a_failure(
+    error: Exception, cause: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A refused count sends no GetLog, stays owed and counts as a failed drain."""
+    """A refused or unanswered count skips GetLog, stays owed, and fails the drain."""
     push_lock, mock_lock, received = _activity_push_lock([], count=0)
-    mock_lock.unread_event_count = AsyncMock(
-        side_effect=ResponseError("Unread count -559038737 is not a depth")
-    )
+    mock_lock.unread_event_count = AsyncMock(side_effect=error)
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
         for _ in range(ACTIVITY_DRAIN_FAILURE_THRESHOLD):
             await _run_update(push_lock, mock_lock)
@@ -4521,7 +4695,7 @@ async def test_a_count_that_is_not_a_depth_ends_the_drain_as_a_failure(
     assert [r.levelno for r in lines] == [logging.DEBUG] * (
         ACTIVITY_DRAIN_FAILURE_THRESHOLD - 1
     ) + [logging.WARNING]
-    assert all("-559038737 is not a depth" in r.getMessage() for r in lines)
+    assert all(f"({cause})" in r.getMessage() for r in lines)
 
 
 @pytest.mark.asyncio
@@ -7556,6 +7730,37 @@ async def test_early_disconnect_retries_to_exhaustion_then_stamps_unknown() -> N
     assert emissions == [LockStatus.UNKNOWN]
     assert push_lock.lock_status is LockStatus.UNKNOWN
     assert push_lock._operation_window_open is False
+
+
+@pytest.mark.asyncio
+async def test_a_lock_operation_that_times_out_names_timeout_error_as_its_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each attempt that times out with no message logs TimeoutError as its cause."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:3e")
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+    mock_lock = MagicMock()
+    mock_lock.force_lock = AsyncMock(side_effect=TimeoutError())
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=mock_lock)),
+        patch.object(push_lock, "_schedule_future_update"),
+        patch.object(push_lock, "_async_handle_disconnected", AsyncMock()),
+        pytest.raises(TimeoutError),
+    ):
+        await push_lock.lock()
+
+    assert [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if "Failed to execute lock operation" in r.getMessage()
+    ] == [
+        (
+            logging.DEBUG,
+            "Test Lock: Failed to execute lock operation due to TimeoutError",
+        )
+    ] * DEFAULT_ATTEMPTS
 
 
 @pytest.mark.asyncio

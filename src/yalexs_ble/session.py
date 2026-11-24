@@ -612,7 +612,9 @@ class Session:
         try:
             await self.client.stop_notify(self.read_characteristic)
         except EOFError as err:
-            _LOGGER.debug("%s: D-Bus stopping notify: %s", self.name, err)
+            _LOGGER.debug(
+                "%s: D-Bus stopping notify: %s", self.name, util._exc_cause(err)
+            )
         except BleakError as err:
             _LOGGER.debug("%s: Bleak error stopping notify: %s", self.name, err)
 
