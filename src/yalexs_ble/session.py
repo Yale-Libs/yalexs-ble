@@ -63,6 +63,14 @@ class KeycodeError(YaleXSBLEError):
         super().__init__(f"{command} failed: {name} (0x{error:02X})")
 
 
+class NotRunningError(YaleXSBLEError):
+    """The PushLock was not running, so nothing was sent."""
+
+
+class ResultUnknownError(YaleXSBLEError):
+    """The PushLock stopped during a command that may have reached the lock."""
+
+
 class DisconnectedError(YaleXSBLEError):
     """Disconnected during response."""
 

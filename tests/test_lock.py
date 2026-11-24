@@ -51,10 +51,12 @@ from yalexs_ble.session import (
     COOLDOWN_TIME,
     DisconnectedError,
     KeycodeError,
+    NotRunningError,
     OperationFailedError,
     OperationIncompleteError,
     OperationProgress,
     ResponseError,
+    ResultUnknownError,
     Session,
 )
 from yalexs_ble.util import _simple_checksum
@@ -1978,7 +1980,9 @@ async def test_force_unlatch_does_not_retry_a_raising_write() -> None:
     ("name", "value"),
     [
         ("ExchangeTimes", ExchangeTimes),
+        ("NotRunningError", NotRunningError),
         ("OperationFailedError", OperationFailedError),
+        ("ResultUnknownError", ResultUnknownError),
         ("StatusReply", StatusReply),
         ("StatusType", StatusType),
     ],

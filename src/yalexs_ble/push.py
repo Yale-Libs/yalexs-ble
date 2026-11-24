@@ -54,9 +54,11 @@ from .session import (
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    NotRunningError,
     OperationFailedError,
     OperationIncompleteError,
     ResponseError,
+    ResultUnknownError,
     YaleXSBLEError,
 )
 from .util import (
@@ -1364,7 +1366,9 @@ class PushLock:
     ) -> _T:
         """Run a command that moves no motor; a failure is logged once at warning."""
         if not self._running:
-            raise RuntimeError(f"{self.name}: {name} not possible because not running")
+            raise NotRunningError(
+                f"{self.name}: {name} not possible because not running"
+            )
         try:
             outcome = await self._attempt_on_lock(name, operation)
             if isinstance(outcome, TimeoutError):
@@ -1387,7 +1391,7 @@ class PushLock:
         """Run one attempt; a TimeoutError from the command's wait is returned."""
         # Not reconnected to resend after a stop.
         if not self._running:
-            raise RuntimeError(
+            raise ResultUnknownError(
                 f"{self.name}: stopped during {name}; its result is unknown"
             )
         lock = await self._ensure_connected()

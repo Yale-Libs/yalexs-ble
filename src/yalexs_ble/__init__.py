@@ -75,8 +75,10 @@ from .session import (
     AuthError,
     DisconnectedError,
     KeycodeError,
+    NotRunningError,
     OperationFailedError,
     OperationIncompleteError,
+    ResultUnknownError,
     YaleXSBLEError,
 )
 from .util import (
@@ -148,6 +150,7 @@ __all__ = [
     "MatterEventType",
     "MatterMessage",
     "MatterRegistrationStatus",
+    "NotRunningError",
     "OpCode",
     "OperatingMode",
     "OperationError",
@@ -157,6 +160,7 @@ __all__ = [
     "OutOfScheduleType",
     "ProductMessage",
     "PushLock",
+    "ResultUnknownError",
     "StatusReply",
     "StatusType",
     "Tamper",

@@ -78,10 +78,13 @@ from yalexs_ble.session import (
     AuthError,
     DisconnectedError,
     KeycodeError,
+    NotRunningError,
     OperationFailedError,
     OperationIncompleteError,
     ResponseError,
+    ResultUnknownError,
     Session,
+    YaleXSBLEError,
 )
 from yalexs_ble.util import _simple_checksum
 
@@ -3592,7 +3595,18 @@ async def test_push_lock_keycode_error_propagates_without_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_push_lock_keycode_requires_running(
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("get_keycode", (1,)),
+        ("set_keycode", (1, "135790")),
+        ("clear_keycode", (1,)),
+        ("get_status", (StatusType.RTC,)),
+    ],
+)
+async def test_push_lock_commands_require_running(
+    method: str,
+    args: tuple[object, ...],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     push_lock, _ = _keycode_push_lock()
@@ -3602,9 +3616,10 @@ async def test_push_lock_keycode_requires_running(
         patch.object(
             push_lock, "_ensure_connected", new_callable=AsyncMock
         ) as ensure_connected,
-        pytest.raises(RuntimeError, match="not running"),
+        pytest.raises(NotRunningError, match="not running") as raised,
     ):
-        await push_lock.get_keycode(1)
+        await getattr(push_lock, method)(*args)
+    assert isinstance(raised.value, YaleXSBLEError)
     ensure_connected.assert_not_awaited()
     assert not caplog.records
 
@@ -3625,15 +3640,18 @@ async def test_push_lock_keycode_stopped_in_flight_is_not_sent_again(
         caplog.at_level(logging.WARNING, logger="yalexs_ble.push"),
         patch.object(push_lock, "_ensure_connected", ensure_connected),
         patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
-        pytest.raises(RuntimeError, match="stopped during clear_keycode"),
+        pytest.raises(
+            ResultUnknownError, match="stopped during clear_keycode"
+        ) as raised,
     ):
         await push_lock.clear_keycode(1)
 
+    assert isinstance(raised.value, YaleXSBLEError)
     ensure_connected.assert_awaited_once()
     lock.clear_keycode.assert_awaited_once_with(1)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "clear_keycode failed: RuntimeError" in warnings[0].getMessage()
+    assert "clear_keycode failed: ResultUnknownError" in warnings[0].getMessage()
 
 
 def _timeout_of(seconds: float) -> Callable[[float], Any]:
