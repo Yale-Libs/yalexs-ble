@@ -8506,9 +8506,8 @@ async def test_an_op_response_the_lock_parses_holds_the_next_read_off():
     assert push_lock._earliest_update_time >= before + LOCK_STALE_STATE_DEBOUNCE_DELAY
 
 
-# The answers a cycle's status polls and auto-lock setting read take, keyed by the
-# opcode and byte 4 of each; the battery answer clears the 3.0 V floor in
-# _update_any_state, and the setting answer keeps the next cycle from reading again.
+# The battery answer holds 5.241 V, above the 3.0 V floor in _update_any_state, and
+# the setting answer keeps the next cycle from reading the setting again.
 _STATUS_ANSWERS = {
     **{
         (Commands.GETSTATUS.value, subtype.value): bb_frame(
