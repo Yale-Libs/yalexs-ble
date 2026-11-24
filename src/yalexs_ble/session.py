@@ -616,7 +616,9 @@ class Session:
                 "%s: D-Bus stopping notify: %s", self.name, util._exc_cause(err)
             )
         except BleakError as err:
-            _LOGGER.debug("%s: Bleak error stopping notify: %s", self.name, err)
+            _LOGGER.debug(
+                "%s: Bleak error stopping notify: %s", self.name, util._exc_cause(err)
+            )
 
     def _cooldown_remaining(self) -> float:
         """Return the seconds of cooldown left, 0 or less when none is running."""

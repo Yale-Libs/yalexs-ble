@@ -1047,18 +1047,13 @@ class Lock:
         except (AuthError, DisconnectedError):
             # Lock already disconnected us
             return
-        except (TimeoutError, BleakError, EOFError) as err:
+        except (TimeoutError, BleakError, EOFError, YaleXSBLEError) as err:
             if not util.is_disconnected_error(err):
                 _LOGGER.debug(
                     "%s: Failed to cleanly disconnect from lock: %s",
                     self.name,
                     util._exc_cause(err),
                 )
-            return
-        except YaleXSBLEError as err:
-            _LOGGER.debug(
-                "%s: Failed to cleanly disconnect from lock: %s", self.name, err
-            )
             return
         if response and response[0] != 0x8B:
             _LOGGER.debug(

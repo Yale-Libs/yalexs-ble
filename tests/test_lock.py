@@ -2116,25 +2116,39 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
             None,
             "yalexs_ble.session",
             "mylock: D-Bus stopping notify: EOFError",
-            id="stop-notify",
+            id="stop-notify-eof",
+        ),
+        pytest.param(
+            BleakError(),
+            None,
+            "yalexs_ble.session",
+            "mylock: Bleak error stopping notify: BleakError",
+            id="stop-notify-bleak",
         ),
         pytest.param(
             None,
             TimeoutError(),
             "yalexs_ble.lock",
             "mylock: Failed to cleanly disconnect from lock: TimeoutError",
-            id="shutdown-command",
+            id="shutdown-command-timeout",
+        ),
+        pytest.param(
+            None,
+            ResponseError("bad frame"),
+            "yalexs_ble.lock",
+            "mylock: Failed to cleanly disconnect from lock: bad frame",
+            id="shutdown-command-library-error-with-message",
         ),
     ],
 )
-async def test_a_shutdown_step_that_fails_with_no_message_logs_its_type_as_the_cause(
+async def test_a_shutdown_step_that_fails_logs_its_cause(
     stop_notify_error: Exception | None,
     shutdown_error: Exception | None,
     logger: str,
     logged: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A disconnect logs a shutdown step's failure with the exception's type name."""
+    """A disconnect logs a shutdown step's failure with its message or type name."""
     lock, session = _connected_lock()
     client = lock.client
     assert isinstance(client, MagicMock)
