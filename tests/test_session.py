@@ -34,9 +34,7 @@ from yalexs_ble.session import (
     Session,
 )
 
-# Captured READSETTING acknowledgment and, about 40 ms later, the 0xBB response,
-# whose bytes 8 to 11 hold the setting's value; byte 4 of each frame is the setting
-# id the command asked for.
+# A captured READSETTING acknowledgment and the 0xBB response that follows it.
 READ_ACK = bytes.fromhex("aa0400282800000000000000000000000200")
 READ_ANSWER = bytes.fromhex("bb0400fb2800000008070807000000000000")
 SETTING_ID = READ_ANSWER[0x04]

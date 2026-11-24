@@ -254,8 +254,7 @@ _AUTH_FAILURE_HISTORY = AuthFailureHistory()
 def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
     """Retry a PushLock method on an AuthError or one of RETRYABLE_EXCEPTIONS.
 
-    A BleakNotFoundError is raised without a retry. The lock may drop the
-    connection at any time.
+    A BleakNotFoundError is raised without a retry.
     """
     return _retry_on_connection_error(func, None)
 
@@ -276,11 +275,7 @@ def _retry_on_connection_error(
     func: WrapFuncType,
     before_retry: Callable[[PushLock, Exception | None], None] | None,
 ) -> WrapFuncType:
-    """Wrap func in a loop of up to DEFAULT_ATTEMPTS attempts.
-
-    before_retry, when given, is called with the instance and the last error
-    before each retry.
-    """
+    """Wrap func in a loop of up to DEFAULT_ATTEMPTS attempts."""
 
     async def _async_wrap_retry_bluetooth_connection_error(
         self: PushLock, *args: Any, **kwargs: Any

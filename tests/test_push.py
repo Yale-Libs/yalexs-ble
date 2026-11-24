@@ -450,16 +450,7 @@ async def test_background_task_done_callback_is_idempotent():
 
 @pytest.mark.asyncio
 async def test_update_continues_after_battery_timeout():
-    """
-    Test that _update() continues and completes successfully
-    even when battery() times out.
-
-    Requirements:
-    - battery() timeout does not fail entire update
-    - lock_status/door_status still get called
-    - the display has valid lock/door values (not UNKNOWN)
-    - no forced disconnect due to battery timeout
-    """
+    """_update polls the door and lock status after a battery poll timeout."""
 
     push_lock = PushLock(
         address="aa:bb:cc:dd:ee:ff",
@@ -695,7 +686,7 @@ async def test_a_value_delivered_mid_cycle_survives_the_cycle(
     push_lock._lock_state = _known_state(*start)
     mock_lock = MagicMock()
 
-    # Every reading is already seen, so the cycle polls nothing of its own.
+    # _seen_this_session holds all three types, so the cycle polls nothing of its own.
     push_lock._seen_this_session.update({LockStatus, DoorStatus, BatteryState})
 
     # Gate the connect step so the change can be delivered mid-cycle.
@@ -7468,8 +7459,7 @@ def _parameter_answer(opcode: int, parameter: int, value: int) -> bytes:
     return _answer_frame(opcode, parameter, value.to_bytes(4, "little"))
 
 
-# The answers a cycle's status polls take, keyed by the opcode and subtype each
-# asks for; the battery answer clears the 3.0 V floor in _update_any_state.
+# The battery answer holds 5.241 V, above the 3.0 V floor in _update_any_state.
 _STATUS_ANSWERS = {
     (Commands.GETSTATUS.value, subtype.value): _answer_frame(
         Commands.GETSTATUS.value, subtype.value, payload
