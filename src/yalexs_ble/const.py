@@ -60,11 +60,13 @@ class Commands(IntEnum):
     READSETTING = 0x04
     UNLOCK = 0x0A
     LOCK = 0x0B
+    SETRTC = 0x10
     KEYCODE_SET = 0x27
     KEYCODE_CLEAR = 0x28
     KEYCODE_ACCESS = 0x2B
     KEYCODE_COMMIT = 0x2C
     GETLOG = 0x2D
+    TIMEZONE_INFO = 0x30
     KEYCODE_GET = 0x39
 
 
@@ -150,6 +152,8 @@ class StatusType(IntEnum):
     BATTERY = 0x0F
     # The activity log's unread count: records no client has read yet.
     LOCK_EVENTS_UNREAD = 0x09
+    # The lock's clock, in seconds since 1970 UTC.
+    RTC = 0x0A
 
 
 class SettingType(IntEnum):
@@ -216,6 +220,30 @@ class BatteryState:
 class AutoLockState:
     mode: AutoLockMode
     duration: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeTimes:
+    """When one exchange with the lock took place, in host seconds since 1970 UTC."""
+
+    request_written: float
+    reply_received: float
+
+
+@dataclass(frozen=True, slots=True)
+class StatusReply:
+    """The value of a status poll, with the times of the poll's exchange."""
+
+    value: int
+    times: ExchangeTimes
+
+
+@dataclass(frozen=True, slots=True)
+class RtcWrite:
+    """The second written to the lock's clock, with the times of the write."""
+
+    second: int
+    times: ExchangeTimes
 
 
 @dataclass

@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from time import monotonic
+from time import monotonic, time
 
 from async_interrupt import interrupt
 from bleak import BleakClient
@@ -22,6 +22,7 @@ from .const import (
     READ_CHARACTERISTIC,
     RESPONSE_FRAME_LEN,
     WRITE_CHARACTERISTIC,
+    ExchangeTimes,
     OperationError,
 )
 
@@ -218,7 +219,7 @@ class Session:
         command: bytearray,
         command_name: str,
         response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
+    ) -> tuple[bytes, ExchangeTimes]:
         """Write under the lock."""
         async with self._lock:
             return await self._locked_write(command, command_name, response_matcher)
@@ -399,7 +400,7 @@ class Session:
         command: bytearray,
         command_name: str,
         response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
+    ) -> tuple[bytes, ExchangeTimes]:
         if not self.client.is_connected:
             raise BleakError("disconnected")
         self._encrypt_command(command, command_name)
@@ -421,10 +422,12 @@ class Session:
                 _LOGGER.debug("%s: Waiting for response", self.name)
                 async with util.asyncio_timeout(RESPONSE_TIMEOUT):
                     try:
+                        request_written = time()
                         await self.client.write_gatt_char(
                             self.write_characteristic, command, True
                         )
                         result = await future
+                        reply_received = time()
                     except ResponseError:
                         if attempt == 2:
                             raise
@@ -453,7 +456,7 @@ class Session:
                 ):
                     future.exception()
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
-        return result
+        return result, ExchangeTimes(request_written, reply_received)
 
     async def _locked_write_operation(
         self,
@@ -604,19 +607,23 @@ class Session:
         except BleakError as err:
             _LOGGER.debug("%s: Bleak error stopping notify: %s", self.name, err)
 
+    def cooling_down(self) -> bool:
+        """Whether the cooldown after the last notification is still running."""
+        return self._cooldown_remaining() > 0
+
+    def _cooldown_remaining(self) -> float:
+        """Return the seconds of cooldown left, 0 or less when none is running."""
+        if not self._enable_cooldown:
+            return 0.0
+        return COOLDOWN_TIME - (monotonic() - self._last_callback_time)
+
     async def _wait_for_cooldown(self) -> None:
-        while (
-            self._enable_cooldown
-            and (cooldown_remain := monotonic() - self._last_callback_time)
-            < COOLDOWN_TIME
-        ):
-            _LOGGER.debug(
-                "%s: Waiting %s for lock to settle", self.name, cooldown_remain
-            )
+        while (remaining := self._cooldown_remaining()) > 0:
+            _LOGGER.debug("%s: Waiting %s for lock to settle", self.name, remaining)
             # If we send commands to fast the lock may crash and stop
             # advertising. This is a workaround to avoid that since
             # it means a battery pull is required to recover.
-            await asyncio.sleep(COOLDOWN_TIME - cooldown_remain)
+            await asyncio.sleep(remaining)
 
     def _raise_for_bleak_error(self, err: BleakError) -> None:
         """Raise AuthError or DisconnectedError for a BleakError that means one."""
@@ -628,9 +635,19 @@ class Session:
             raise DisconnectedError(f"{self.name}: {err}") from err
 
     @contextlib.asynccontextmanager
-    async def _command_scope(self, command: bytearray) -> AsyncIterator[None]:
-        """Prepare a command and guard its exchange against a disconnect."""
+    async def _command_scope(
+        self,
+        command: bytearray,
+        *,
+        prepare: Callable[[bytearray], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[None]:
+        """Wait out the cooldown, run prepare, and write the checksum.
+
+        The exchange that follows is guarded against a disconnect.
+        """
         await self._wait_for_cooldown()
+        if prepare is not None:
+            await prepare(command)
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
         self._write_checksum(command)
         disconnected_future = asyncio.get_running_loop().create_future()
@@ -658,8 +675,27 @@ class Session:
         write times out). Without a matcher the first valid frame answers, as
         before.
         """
+        reply, _ = await self.execute_timed(command, command_name, response_matcher)
+        return reply
+
+    async def execute_timed(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+        *,
+        prepare: Callable[[bytearray], Awaitable[None]] | None = None,
+    ) -> tuple[bytes, ExchangeTimes]:
+        """Execute command as execute() does; also return the times of its exchange.
+
+        prepare, when given, is awaited with the command after the cooldown and
+        before its checksum is written. prepare runs before the session's write
+        lock is taken, so a command holding the write lock at that moment delays
+        the frame past the moment prepare chose. For a command written more than
+        once, request_written is of the last write before the reply.
+        """
         try:
-            async with self._command_scope(command):
+            async with self._command_scope(command, prepare=prepare):
                 return await self._write(command, command_name, response_matcher)
         except BleakError as err:
             self._raise_for_bleak_error(err)
