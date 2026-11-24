@@ -860,11 +860,7 @@ class Lock:
 
     @raise_if_not_connected
     async def get_parameter(self, parameter: int) -> int:
-        """Read one parameter and return the value the lock reports.
-
-        Raises ValueError for an id outside one byte, before any frame is built,
-        and TimeoutError when the lock does not answer within the session's wait.
-        """
+        """Read one parameter and return the value the lock reports."""
         validate_parameter_id(parameter)
         _LOGGER.debug("%s: Reading parameter 0x%02X", self.name, parameter)
         response = await self._execute_command(
@@ -880,11 +876,7 @@ class Lock:
 
     @raise_if_not_connected
     async def set_parameter(self, parameter: int, value: int) -> int:
-        """Write one parameter and return the value field of the lock's reply.
-
-        Raises ValueError for an id outside one byte or a value outside four bytes,
-        before any frame is built, and TimeoutError as get_parameter does.
-        """
+        """Write one parameter and return the value field of the lock's reply."""
         validate_parameter_id(parameter)
         validate_parameter_value(value)
         _LOGGER.debug(

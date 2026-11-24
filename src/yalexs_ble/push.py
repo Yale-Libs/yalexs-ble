@@ -1191,11 +1191,7 @@ class PushLock:
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
 
     async def get_parameter(self, parameter: int) -> int:
-        """Read one parameter from the lock and return the value it reports.
-
-        Raises ValueError before connecting, RuntimeError when not running, and
-        TimeoutError when the lock does not answer, with the connection kept.
-        """
+        """Read one parameter from the lock and return the value it reports."""
         validate_parameter_id(parameter)
         return await self._run_on_lock(
             f"get_parameter 0x{parameter:02X}",
@@ -1203,10 +1199,7 @@ class PushLock:
         )
 
     async def set_parameter(self, parameter: int, value: int) -> int:
-        """Write one parameter and return the value field of the lock's reply.
-
-        Raises as get_parameter, plus ValueError for a value outside four bytes.
-        """
+        """Write one parameter and return the value field of the lock's reply."""
         validate_parameter_id(parameter)
         validate_parameter_value(value)
         return await self._run_on_lock(

@@ -1822,7 +1822,6 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
             "get_parameter",
             (0xB2,),
             [
-                # Status push reporting UNLOCKED.
                 LOCK_FRAME,
                 _settings_frame(Commands.READSETTING.value, 0xB2, value=30),
             ],
