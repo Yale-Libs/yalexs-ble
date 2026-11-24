@@ -165,7 +165,6 @@ def _poll_response_matcher(
             # so this length check is unreachable through it. It is the
             # matcher's own floor, for a caller with no session behind it, and
             # it covers the highest byte the match reads, the subtype at 0x04.
-            # _parameter_response_matcher above has a floor of its own.
             len(data) > 0x04
             and data[0x00] == 0xBB
             and data[0x01] == opcode
@@ -925,8 +924,7 @@ class Lock:
     async def get_unity_parameter(self, parameter: int) -> int:
         """Read one Unity parameter and return the value the lock reports.
 
-        Raises as get_parameter does, plus UnityParameterError when the lock reports
-        an error for the parameter.
+        Raises UnityParameterError when the lock reports an error for the parameter.
         """
         validate_parameter_id(parameter)
         _LOGGER.debug("%s: Reading Unity parameter 0x%02X", self.name, parameter)
@@ -942,8 +940,7 @@ class Lock:
     async def set_unity_parameter(self, parameter: int, value: int) -> int:
         """Write one Unity parameter and return the value in the lock's reply.
 
-        Raises ValueError for an id or a value outside one byte, before any frame
-        is built, and otherwise as get_unity_parameter does.
+        Raises UnityParameterError when the lock reports an error for the parameter.
         """
         validate_parameter_id(parameter)
         validate_unity_parameter_value(value)
@@ -963,11 +960,7 @@ class Lock:
         return answered
 
     async def _send_unity_command(self, command: bytearray, command_name: str) -> int:
-        """Send a GetUnity or SetUnity command for entry 0; return the reply's value.
-
-        Raises UnityParameterError when the reply's error byte for the entry is
-        not zero.
-        """
+        """Send a GetUnity or SetUnity command for entry 0; return the reply's value."""
         assert self.session is not None  # nosec
         parameter = command[0x04]
         response = await self.session.execute(

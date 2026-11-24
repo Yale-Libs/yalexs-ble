@@ -1218,8 +1218,7 @@ class PushLock:
     async def get_unity_parameter(self, parameter: int) -> int:
         """Read one Unity parameter from the lock and return the value it reports.
 
-        Raises as get_parameter, plus UnityParameterError when the lock reports
-        an error for the parameter.
+        Raises UnityParameterError when the lock reports an error for the parameter.
         """
         validate_parameter_id(parameter)
         return await self._run_on_lock(
@@ -1230,7 +1229,7 @@ class PushLock:
     async def set_unity_parameter(self, parameter: int, value: int) -> int:
         """Write one Unity parameter and return the value in the lock's reply.
 
-        Raises as get_unity_parameter, plus ValueError for a value outside one byte.
+        Raises UnityParameterError when the lock reports an error for the parameter.
         """
         validate_parameter_id(parameter)
         validate_unity_parameter_value(value)

@@ -1198,8 +1198,8 @@ def test_keycode_get_matcher_requires_the_echoed_slot() -> None:
 @pytest.mark.parametrize(
     "frame",
     [
-        # Constructed keycode and activity log frames on either flag, and the
-        # captured settings frames.
+        # Constructed keycode and activity log frames on either flag, and the captured
+        # settings frames and Unity acknowledgments.
         *(
             bytes([flag]) + _result(opcode, 0x06, 200)[1:]
             for opcode in (0x27, 0x28, 0x2B, 0x2C, 0x39, 0x2D)
