@@ -1370,6 +1370,10 @@ class PushLock:
         validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
 
+    async def clear_log(self) -> None:
+        """Discard every unread record in the lock's activity log."""
+        await self._run_on_lock("clear_log", lambda lock: lock.clear_log())
+
     @operation_lock
     async def _run_on_lock(
         self, name: str, operation: Callable[[Lock], Awaitable[_T]]

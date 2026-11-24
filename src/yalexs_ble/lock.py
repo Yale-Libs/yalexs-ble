@@ -187,6 +187,7 @@ NO_STATE_OPCODES = frozenset(
         Commands.KEYCODE_COMMIT.value,
         Commands.KEYCODE_GET.value,
         Commands.GETLOG.value,
+        Commands.CLEARLOG.value,
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
@@ -242,6 +243,15 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
 
     def _matches(data: bytes) -> bool:
         return len(data) > RESULT_BYTE and data[0x00] == 0xBB and data[0x01] == opcode
+
+    return _matches
+
+
+def _first_reply_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match an 0xAA or 0xBB frame whose byte 1 is opcode, whatever byte 4 holds."""
+
+    def _matches(data: bytes) -> bool:
+        return len(data) > 0x01 and data[0x00] in (0xAA, 0xBB) and data[0x01] == opcode
 
     return _matches
 
@@ -948,6 +958,16 @@ class Lock:
             self.session.build_command(Commands.GETLOG.value),
             "get_log",
             _GETLOG_MATCHER,
+        )
+
+    @raise_if_not_connected
+    async def clear_log(self) -> None:
+        """Discard every unread record in the lock's activity log."""
+        assert self.session is not None  # nosec
+        await self.session.execute(
+            self.session.build_command(Commands.CLEARLOG),
+            "clear_log",
+            _first_reply_matcher(Commands.CLEARLOG.value),
         )
 
     async def disconnect(self) -> None:

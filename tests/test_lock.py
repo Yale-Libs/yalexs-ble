@@ -16,6 +16,7 @@ from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
     MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
+    RESPONSE_FRAME_LEN,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
@@ -1002,7 +1003,7 @@ def _connected_lock(
     between a poll and its matcher needs a real session rather than a mock.
     """
     lock = _make_lock(state_callback)
-    client = MagicMock(is_connected=True)
+    client = MagicMock(is_connected=True, disconnect=AsyncMock())
     session = Session(
         client, "mylock", asyncio.Lock(), set(), lock._internal_state_callback
     )
@@ -1432,7 +1433,7 @@ def test_keycode_get_matcher_requires_the_echoed_slot() -> None:
     assert not matches(bytes.fromhex("aa39004ec800000000000000000000000200"))
 
 
-@pytest.mark.parametrize("opcode", [0x27, 0x28, 0x2B, 0x2C, 0x39, 0x2D])
+@pytest.mark.parametrize("opcode", [0x27, 0x28, 0x2B, 0x2C, 0x39, 0x2D, 0x06])
 @pytest.mark.parametrize("flag", [0xBB, 0xAA])
 def test_keycode_frames_produce_no_state(opcode: int, flag: int) -> None:
     received: list[object] = []
@@ -1518,6 +1519,83 @@ async def test_get_log_requires_a_connection() -> None:
     """Reading a record from a disconnected lock raises."""
     with pytest.raises(DisconnectedError):
         await _make_lock().get_log()
+
+
+def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
+    """Deliver frames on the notify path when the command is written."""
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        for frame in frames:
+            session._notify(0, bytearray(frame))
+
+    return AsyncMock(side_effect=deliver)
+
+
+# A ClearLog acknowledgment captured on 2026-11-19 from a Yale lock.
+CLEAR_LOG_ACK = bytes.fromhex("aa06004e0000000000000000000000000200")
+# A constructed ClearLog 0xBB reply.
+CLEAR_LOG_RESPONSE = _with_checksum("bb0600000000000000000000000000000000")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param(CLEAR_LOG_ACK, id="aa-frame"),
+        pytest.param(CLEAR_LOG_RESPONSE, id="bb-frame"),
+    ],
+)
+async def test_clear_log_writes_one_clear_log_frame_and_returns_on_its_reply(
+    reply: bytes,
+) -> None:
+    """The ClearLog frame holds 0x06 at byte 1 and zero from byte 4 to 15."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = _answered_by(session, reply)
+
+    await lock.clear_log()
+
+    (written,) = (
+        call.args[1] for call in session.client.write_gatt_char.await_args_list
+    )
+    assert written[0x00] == 0xEE
+    assert written[0x01] == 0x06
+    assert written[0x04:0x10] == bytes(12)
+    assert written[0x10] == 0x02
+    assert len(written) == RESPONSE_FRAME_LEN
+    assert _simple_checksum(written) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "frames",
+    [
+        pytest.param([], id="no-frame"),
+        pytest.param(
+            [
+                # Constructed status push reporting UNLOCKED.
+                _with_checksum("bb0200000200000003000000000000000000"),
+                LOCK_ACK,
+            ],
+            id="frames-of-other-opcodes",
+        ),
+    ],
+)
+async def test_clear_log_unanswered_raises_timeout_error_and_keeps_the_connection(
+    frames: list[bytes],
+) -> None:
+    """Without a ClearLog reply, the frame is written once and the link is kept."""
+    lock, session = _connected_lock()
+    session.client.write_gatt_char = _answered_by(session, *frames)
+
+    with (
+        patch("yalexs_ble.util.asyncio_timeout", lambda _: asyncio.timeout(0.01)),
+        pytest.raises(TimeoutError),
+    ):
+        await lock.clear_log()
+
+    session.client.write_gatt_char.assert_awaited_once()
+    session.client.disconnect.assert_not_awaited()
+    assert lock.is_connected
 
 
 def test_ack_matcher_matches_only_the_written_operation() -> None:

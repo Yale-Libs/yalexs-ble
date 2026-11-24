@@ -58,6 +58,7 @@ class Commands(IntEnum):
     GETSTATUS = 0x02
     WRITESETTING = 0x03
     READSETTING = 0x04
+    CLEARLOG = 0x06
     UNLOCK = 0x0A
     LOCK = 0x0B
     KEYCODE_SET = 0x27

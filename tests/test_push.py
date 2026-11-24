@@ -3633,7 +3633,16 @@ async def test_push_lock_keycode_error_propagates_without_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_push_lock_keycode_requires_running(
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("get_keycode", (1,)),
+        ("clear_log", ()),
+    ],
+)
+async def test_push_lock_commands_require_running(
+    method: str,
+    args: tuple[int, ...],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     push_lock, _ = _keycode_push_lock()
@@ -3645,7 +3654,7 @@ async def test_push_lock_keycode_requires_running(
         ) as ensure_connected,
         pytest.raises(RuntimeError, match="not running"),
     ):
-        await push_lock.get_keycode(1)
+        await getattr(push_lock, method)(*args)
     ensure_connected.assert_not_awaited()
     assert not caplog.records
 
@@ -3700,7 +3709,16 @@ def _latch_reauth(address: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_push_lock_keycode_timeout_keeps_the_connection(
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("set_keycode", (1, "135790")),
+        ("clear_log", ()),
+    ],
+)
+async def test_push_lock_command_timeout_keeps_the_connection(
+    method: str,
+    args: tuple[object, ...],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     push_lock, lock, _session, client = _keycode_real_session(
@@ -3723,10 +3741,10 @@ async def test_push_lock_keycode_timeout_keeps_the_connection(
             wraps=push_lock._disconnect_with_timer,
         ) as idle_timer,
         patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.3)),
-        pytest.raises(TimeoutError, match="did not answer set_keycode") as raised,
+        pytest.raises(TimeoutError, match=f"did not answer {method}$") as raised,
     ):
         push_lock._reset_disconnect_timer()
-        await push_lock.set_keycode(1, "135790")
+        await getattr(push_lock, method)(*args)
 
     assert isinstance(raised.value.__cause__, TimeoutError)
     assert push_lock.auth is None
@@ -3737,10 +3755,41 @@ async def test_push_lock_keycode_timeout_keeps_the_connection(
     assert client.write_gatt_char.await_count == 1
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert (
-        "set_keycode failed: TimeoutError: Test Lock: lock did not answer"
-        in warnings[0].getMessage()
+    assert warnings[0].getMessage() == (
+        f"Test Lock: {method} failed: TimeoutError: Test Lock: lock did not answer"
+        f" {method}"
     )
+
+
+# A ClearLog acknowledgment captured on 2026-11-19 from a Yale lock.
+CLEAR_LOG_ACK = bytes.fromhex("aa06004e0000000000000000000000000200")
+
+
+@pytest.mark.asyncio
+async def test_push_lock_clear_log_publishes_no_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The ClearLog answer publishes nothing and keeps lock_state."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:39")
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    before = replace(_known_state(LockStatus.LOCKED), auth=AuthState(successful=True))
+    push_lock._lock_state = before
+    published: list[LockState] = []
+    push_lock.register_callback(lambda state, info, conn: published.append(state))
+    client.write_gatt_char = AsyncMock(
+        side_effect=_write_delivering(session, [bytearray(CLEAR_LOG_ACK)])
+    )
+
+    with (
+        caplog.at_level(logging.INFO, logger="yalexs_ble.lock"),
+        patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)),
+    ):
+        await push_lock.clear_log()
+
+    client.write_gatt_char.assert_awaited_once()
+    assert published == []
+    assert push_lock.lock_state == before
+    assert "Unknown state" not in caplog.text
 
 
 @pytest.mark.asyncio
