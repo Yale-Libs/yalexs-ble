@@ -5,7 +5,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from time import monotonic
+from time import monotonic, time
 
 from async_interrupt import interrupt
 from bleak import BleakClient
@@ -22,6 +22,7 @@ from .const import (
     READ_CHARACTERISTIC,
     RESPONSE_FRAME_LEN,
     WRITE_CHARACTERISTIC,
+    ExchangeTimes,
     OperationError,
 )
 
@@ -218,7 +219,7 @@ class Session:
         command: bytearray,
         command_name: str,
         response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
+    ) -> tuple[bytes, ExchangeTimes]:
         """Write under the lock."""
         async with self._lock:
             return await self._locked_write(command, command_name, response_matcher)
@@ -399,7 +400,7 @@ class Session:
         command: bytearray,
         command_name: str,
         response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
+    ) -> tuple[bytes, ExchangeTimes]:
         if not self.client.is_connected:
             raise BleakError("disconnected")
         self._encrypt_command(command, command_name)
@@ -421,10 +422,12 @@ class Session:
                 _LOGGER.debug("%s: Waiting for response", self.name)
                 async with util.asyncio_timeout(RESPONSE_TIMEOUT):
                     try:
+                        request_written = time()
                         await self.client.write_gatt_char(
                             self.write_characteristic, command, True
                         )
                         result = await future
+                        reply_received = time()
                     except ResponseError:
                         if attempt == 2:
                             raise
@@ -453,7 +456,7 @@ class Session:
                 ):
                     future.exception()
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
-        return result
+        return result, ExchangeTimes(request_written, reply_received)
 
     async def _locked_write_operation(
         self,
@@ -657,6 +660,20 @@ class Session:
         solicited wait stays armed until a matching frame arrives (or the
         write times out). Without a matcher the first valid frame answers, as
         before.
+        """
+        reply, _ = await self.execute_timed(command, command_name, response_matcher)
+        return reply
+
+    async def execute_timed(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+    ) -> tuple[bytes, ExchangeTimes]:
+        """Execute command as execute() does; also return the times of its exchange.
+
+        For a command written more than once, request_written is of the last write
+        before the reply.
         """
         try:
             async with self._command_scope(command):

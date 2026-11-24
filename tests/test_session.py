@@ -200,7 +200,7 @@ async def test_locked_write_clears_slot_on_success() -> None:
         session._notify(0, bytearray(READ_ANSWER))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session._locked_write(bytearray(18), "auto_lock_status")
+    result, _ = await session._locked_write(bytearray(18), "auto_lock_status")
 
     assert result == READ_ANSWER
     assert session._notify_future is None
@@ -267,7 +267,7 @@ async def test_fresh_command_rearms_slot_after_timeout() -> None:
         session._notify(0, bytearray(READ_ANSWER))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session._locked_write(bytearray(18), "auto_lock_status")
+    result, _ = await session._locked_write(bytearray(18), "auto_lock_status")
 
     assert result == READ_ANSWER
     assert session._notify_future is None
