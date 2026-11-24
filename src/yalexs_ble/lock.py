@@ -946,11 +946,7 @@ class Lock:
 
     @raise_if_not_connected
     async def get_status(self, status_type: int) -> StatusReply:
-        """Send a status poll and return its unsigned 32-bit value and its times.
-
-        Raises ValueError for a status type outside one byte, before any frame is
-        built, and TimeoutError when the lock does not answer within the session's wait.
-        """
+        """Send a status poll and return its unsigned 32-bit value and its times."""
         validate_status_type(status_type)
         _LOGGER.debug(
             "%s: Sending a status poll for status type 0x%02X", self.name, status_type

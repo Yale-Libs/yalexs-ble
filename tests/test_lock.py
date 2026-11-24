@@ -1516,7 +1516,6 @@ def test_keycode_frames_produce_no_state(opcode: int, flag: int) -> None:
 @pytest.mark.parametrize(
     "frame",
     [
-        # Status types the library does not decode.
         RTC_FRAME,
         LOCK_EVENTS_FRAME,
     ],

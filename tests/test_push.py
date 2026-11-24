@@ -8497,9 +8497,8 @@ def _answer_frame(opcode: int, byte_4: int, payload: bytes) -> bytes:
     return bytes(frame)
 
 
-# The answers a cycle's status polls and auto-lock setting read take, keyed by the
-# opcode and byte 4 of each; the battery answer clears the 3.0 V floor in
-# _update_any_state, and the setting answer keeps the next cycle from reading again.
+# The battery answer holds 5.241 V, above the 3.0 V floor in _update_any_state, and
+# the setting answer keeps the next cycle from reading the setting again.
 _STATUS_ANSWERS = {
     **{
         (Commands.GETSTATUS.value, subtype.value): _answer_frame(
