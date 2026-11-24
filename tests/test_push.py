@@ -78,6 +78,7 @@ from yalexs_ble.session import (
     AuthError,
     DisconnectedError,
     KeycodeError,
+    NoAdvertisementError,
     NotRunningError,
     OperationFailedError,
     OperationIncompleteError,
@@ -3056,6 +3057,237 @@ async def test_a_lock_the_host_stack_does_not_know_starts_from_its_advertisement
     await asyncio.sleep(0)
 
 
+@pytest.mark.asyncio
+async def test_a_wait_for_first_update_while_not_running_raises_not_running() -> None:
+    """A wait for the first update on a PushLock that is not running raises."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:EB", always_connected=False)
+
+    with pytest.raises(NotRunningError, match="Not running") as raised:
+        await push_lock.wait_for_first_update(1)
+
+    assert isinstance(raised.value, YaleXSBLEError)
+
+
+@pytest.mark.asyncio
+async def test_a_second_wait_for_first_update_raises_already_waited() -> None:
+    """A second wait for the first update raises RuntimeError."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:ED", always_connected=False)
+    with patch("yalexs_ble.push.get_device", AsyncMock(return_value=None)):
+        cancel = await push_lock.start()
+    with pytest.raises(NoAdvertisementError):
+        await push_lock.wait_for_first_update(0)
+
+    with pytest.raises(RuntimeError, match="Already waited for first update"):
+        await push_lock.wait_for_first_update(1)
+
+    cancel()
+    await asyncio.gather(*push_lock._background_tasks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "restarted_wait_first", [True, False], ids=["waiting", "after"]
+)
+async def test_a_first_wait_ending_after_a_restart_leaves_the_restart_its_update(
+    restarted_wait_first: bool,
+) -> None:
+    """A first wait ending after a restart leaves the restarted wait its own update."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E7", always_connected=False)
+    device = BLEDevice(push_lock.address, "Test Lock", None)
+    update = AsyncMock(return_value=None)
+
+    with (
+        patch("yalexs_ble.push.get_device", AsyncMock(return_value=device)),
+        patch.object(push_lock, "_locked_update", update),
+    ):
+        await push_lock.start()
+        first_wait = asyncio.create_task(push_lock.wait_for_first_update(1))
+        await asyncio.sleep(0)  # the first wait awaits its future
+        push_lock._cancel()  # before ADV_UPDATE_COALESCE_SECONDS, so no update ran
+        cancel = await push_lock.start()
+        if restarted_wait_first:
+            restarted_wait = asyncio.create_task(push_lock.wait_for_first_update(1))
+            await asyncio.sleep(0)  # the restarted wait awaits its future
+        await asyncio.wait({first_wait})
+        if not restarted_wait_first:
+            restarted_wait = asyncio.create_task(push_lock.wait_for_first_update(1))
+        await restarted_wait
+
+    update.assert_awaited_once()
+    with pytest.raises(NotRunningError):
+        await first_wait
+    cancel()
+    await asyncio.gather(*push_lock._background_tasks)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_ends_a_waiting_first_update_with_not_running() -> None:
+    """A stop with no update running ends a wait for the first update at the stop."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:EA", always_connected=False)
+    with patch("yalexs_ble.push.get_device", AsyncMock(return_value=None)):
+        await push_lock.start()
+    waiting = asyncio.create_task(push_lock.wait_for_first_update(30))
+    await asyncio.sleep(0)  # the wait awaits its future
+
+    push_lock._cancel()
+    with pytest.raises(
+        NotRunningError, match="stopped before the first update"
+    ) as raised:
+        await asyncio.wait_for(waiting, 1)
+
+    assert isinstance(raised.value, YaleXSBLEError)
+    await asyncio.gather(*push_lock._background_tasks)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_before_any_first_wait_logs_no_unretrieved_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stop before any first wait logs no unretrieved exception after a restart."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:EF", always_connected=False)
+    device = BLEDevice(push_lock.address, "Test Lock", None)
+    update = AsyncMock(return_value=None)
+
+    with (
+        patch("yalexs_ble.push.get_device", AsyncMock(return_value=device)),
+        patch.object(push_lock, "_locked_update", update),
+    ):
+        await push_lock.start()
+        push_lock._cancel()  # before ADV_UPDATE_COALESCE_SECONDS, so no update ran
+        cancel = await push_lock.start()
+        await push_lock.wait_for_first_update(1)
+
+    update.assert_awaited_once()
+    assert "never retrieved" not in caplog.text
+    cancel()
+    await asyncio.gather(*push_lock._background_tasks)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_first_update_on_a_running_lock_ends_the_wait() -> None:
+    """A first update cancelled on a running lock ends the wait with RuntimeError."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:EE", always_connected=False)
+    device = BLEDevice(push_lock.address, "Test Lock", None)
+    update = AsyncMock(side_effect=asyncio.CancelledError)
+
+    with (
+        patch("yalexs_ble.push.get_device", AsyncMock(return_value=device)),
+        patch.object(push_lock, "_locked_update", update),
+    ):
+        await push_lock.start()
+        with pytest.raises(RuntimeError, match="Update was canceled"):
+            await push_lock.wait_for_first_update(1)
+
+    update.assert_awaited_once()
+    push_lock._cancel()
+    await asyncio.gather(*push_lock._background_tasks)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_first_wait_ends_cancelled_and_clears_the_future() -> None:
+    """A cancelled first wait raises CancelledError and clears _first_update_future."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E8", always_connected=False)
+    with patch("yalexs_ble.push.get_device", AsyncMock(return_value=None)):
+        await push_lock.start()
+    waiting = asyncio.create_task(push_lock.wait_for_first_update(5))
+    await asyncio.sleep(0)  # the wait awaits its future
+
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    with pytest.raises(RuntimeError, match="Already waited for first update"):
+        await push_lock.wait_for_first_update(1)
+
+
+@pytest.mark.asyncio
+async def test_a_second_update_leaves_a_resolved_first_update_future_alone() -> None:
+    """A second update raises nothing and leaves the resolved future as it was."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:E9", always_connected=False)
+    push_lock.set_ble_device(BLEDevice(push_lock.address, "Test Lock", None))
+    with patch("yalexs_ble.push.get_device", AsyncMock(return_value=None)):
+        await push_lock.start()
+    link = _auto_lock_update_lock(push_lock, AsyncMock())
+    link.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
+
+    with patch.object(push_lock, "_get_lock_instance", return_value=link):
+        await push_lock._execute_deferred_update()
+        await push_lock._execute_deferred_update()
+
+    await asyncio.wait_for(push_lock.wait_for_first_update(1), 1)
+
+
+@pytest.mark.asyncio
+async def test_two_waits_for_one_first_update_both_return() -> None:
+    """Two waits for one first update both return once it has run."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:EA", always_connected=False)
+    link = _auto_lock_update_lock(push_lock, AsyncMock())
+    link.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
+    device = BLEDevice(push_lock.address, "Test Lock", None)
+
+    with patch.object(push_lock, "_get_lock_instance", return_value=link):
+        with patch("yalexs_ble.push.get_device", AsyncMock(return_value=device)):
+            await push_lock.start()
+        await asyncio.wait_for(
+            asyncio.gather(
+                push_lock.wait_for_first_update(1),
+                push_lock.wait_for_first_update(1),
+            ),
+            2,
+        )
+
+    link.connect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [None, AuthError("Authentication error: key or slot (key index) is incorrect")],
+    ids=["succeeded", "failed"],
+)
+async def test_a_stop_after_an_unawaited_first_update_disconnects_the_link(
+    error: Exception | None,
+) -> None:
+    """A stop after a first update no wait awaited raises nothing and disconnects."""
+    address = "AA:BB:CC:DD:EE:F0"
+    push_lock = _named_push_lock(address, always_connected=False)
+    link = _auto_lock_update_lock(push_lock, AsyncMock())
+    link.lock_info = AsyncMock(return_value=TEST_LOCK_INFO)
+    link.disconnect = AsyncMock()
+    if error is not None:
+        # The first read after the handshake is the lock info probe.
+        link.lock_info = AsyncMock(side_effect=error)
+
+    with (
+        patch.object(push_lock, "_get_lock_instance", return_value=link),
+        patch("yalexs_ble.push.asyncio.sleep", AsyncMock()),
+    ):
+        with patch("yalexs_ble.push.get_device", AsyncMock(return_value=None)):
+            await push_lock.start()
+        push_lock.set_ble_device(BLEDevice(address, "Test Lock", None))
+        await push_lock._execute_deferred_update()
+        push_lock._cancel()
+        await asyncio.gather(*push_lock._background_tasks)
+
+    link.connect.assert_awaited_once()
+    link.disconnect.assert_awaited_once()
+    _AUTH_FAILURE_HISTORY.auth_success(address)
+
+
+@pytest.mark.asyncio
+async def test_a_second_start_raises_already_running() -> None:
+    """A start() on a PushLock that is running raises RuntimeError."""
+    push_lock = _named_push_lock("AA:BB:CC:DD:EE:EC", always_connected=False)
+    with patch("yalexs_ble.push.get_device", AsyncMock(return_value=None)):
+        cancel = await push_lock.start()
+
+        with pytest.raises(RuntimeError, match="Already running"):
+            await push_lock.start()
+
+    cancel()
+    await asyncio.gather(*push_lock._background_tasks)
+
+
 @pytest.mark.parametrize("mfr_id", [YALE_MFR_ID, ASSA_ABLOY_MFR_ID])
 @pytest.mark.asyncio
 async def test_only_an_empty_payload_is_logged_as_empty(
@@ -4753,6 +4985,58 @@ async def test_execute_lock_operation_success_stamps_complete_state(
 
     getattr(mock_lock, op_attr).assert_awaited_once()
     assert push_lock.lock_status == complete_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["lock", "unlock", "securemode", "unlatch"])
+async def test_a_lock_operation_while_not_running_raises_not_running_unsent(
+    method: str,
+) -> None:
+    """A lock operation on a PushLock that is not running connects to nothing."""
+    push_lock = _operational_push_lock()
+    push_lock._running = False
+
+    with (
+        patch.object(
+            push_lock, "_ensure_connected", new_callable=AsyncMock
+        ) as ensure_connected,
+        pytest.raises(
+            NotRunningError, match="Lock operation not possible because not running"
+        ) as raised,
+    ):
+        await getattr(push_lock, method)()
+
+    assert isinstance(raised.value, YaleXSBLEError)
+    ensure_connected.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_lock_operation_stopped_between_attempts_is_not_sent_again() -> None:
+    """A stop before the retry ends the operation with its result unknown."""
+    push_lock = _operational_push_lock()
+    push_lock._lock_state = _known_state(LockStatus.UNLOCKED)
+
+    async def _stopped_in_flight(write_success_callback, result_callback):
+        write_success_callback()
+        push_lock._running = False
+        raise BleakError("the link dropped")
+
+    mock_lock = MagicMock()
+    mock_lock.force_lock = AsyncMock(side_effect=_stopped_in_flight)
+    ensure_connected = AsyncMock(return_value=mock_lock)
+    with (
+        patch.object(push_lock, "_ensure_connected", ensure_connected),
+        patch.object(push_lock, "_async_handle_disconnected", new_callable=AsyncMock),
+        pytest.raises(
+            ResultUnknownError, match="Lock operation not retried because not running"
+        ) as raised,
+    ):
+        await push_lock.lock()
+
+    assert isinstance(raised.value, YaleXSBLEError)
+    ensure_connected.assert_awaited_once()
+    mock_lock.force_lock.assert_awaited_once()
+    assert push_lock.lock_status == LockStatus.LOCKING
 
 
 @pytest.mark.asyncio

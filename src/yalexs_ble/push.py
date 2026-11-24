@@ -1198,8 +1198,13 @@ class PushLock:
     async def _execute_lock_operation(self, operation: _LockOperation) -> None:
         """Execute a lock operation."""
         if not self._running:
-            raise RuntimeError(
-                f"{self.name}: Lock operation not possible because not running"
+            if self._operation_failure is None:
+                raise NotRunningError(
+                    f"{self.name}: Lock operation not possible because not running"
+                )
+            raise ResultUnknownError(
+                f"{self.name}: Lock operation not retried because not running; "
+                "its result is unknown"
             )
         op_attr = operation.op_attr
         _LOGGER.debug("%s: Starting %s", self.name, op_attr)
@@ -2117,6 +2122,13 @@ class PushLock:
 
     def _cancel(self) -> None:
         self._running = False
+        if (future := self._first_update_future) is not None and not future.done():
+            future.set_exception(
+                NotRunningError(f"{self.name}: stopped before the first update")
+            )
+            # Retrieved so asyncio does not log it as never retrieved when no wait
+            # awaits the future.
+            future.exception()
         self._cancel_future_update()
         if not self._operation_in_flight:
             # Kept while a command is in flight so a jam reported during it
@@ -2141,21 +2153,20 @@ class PushLock:
     async def wait_for_first_update(self, timeout: float) -> None:
         """Wait for the first update."""
         if not self._running:
-            raise RuntimeError("Not running")
-        if not self._first_update_future:
+            raise NotRunningError("Not running")
+        if (future := self._first_update_future) is None:
             raise RuntimeError("Already waited for first update")
         try:
             async with asyncio_timeout(timeout):
-                await self._first_update_future
-        except (TimeoutError, asyncio.CancelledError) as ex:
-            self._first_update_future.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._first_update_future
+                await future
+        except TimeoutError as ex:
             raise NoAdvertisementError(
                 "No advertisement received before timeout"
             ) from ex
         finally:
-            self._first_update_future = None
+            # A start() after a stop can replace _first_update_future while this waits.
+            if self._first_update_future is future:
+                self._first_update_future = None
 
     def _hold_update(self) -> None:
         """Hold update cycles off for the stale-state debounce from now."""
@@ -2243,13 +2254,14 @@ class PushLock:
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 
     def _set_update_state(self, exception: Exception | None) -> None:
-        """Set the update state."""
-        if not self._first_update_future:
+        """Resolve _first_update_future with the outcome while it is pending."""
+        future = self._first_update_future
+        if future is None or future.done():
             return
         if exception:
-            self._first_update_future.set_exception(exception)
+            future.set_exception(exception)
         else:
-            self._first_update_future.set_result(None)
+            future.set_result(None)
 
     async def _execute_deferred_update(self) -> None:  # noqa: PLR0915
         """Execute deferred update."""
