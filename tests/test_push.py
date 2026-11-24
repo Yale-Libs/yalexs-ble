@@ -8526,7 +8526,6 @@ _STATUS_ANSWERS = {
 }
 
 
-# Byte 4 of the SetRTC frame that writes CLOCK_WRITE_TIME.
 _CLOCK_TIME_BYTE_4 = CLOCK_WRITE_TIME & 0xFF
 # A host time for _patched_host_clock to start at, from which a clock write at host
 # time writes CLOCK_WRITE_TIME.

@@ -612,10 +612,7 @@ class Session:
         return self._cooldown_remaining() > 0
 
     def _cooldown_remaining(self) -> float:
-        """Return the seconds of cooldown left, 0 or less when none is running.
-
-        The cooldown runs for COOLDOWN_TIME after each notification, once enabled.
-        """
+        """Return the seconds of cooldown left, 0 or less when none is running."""
         if not self._enable_cooldown:
             return 0.0
         return COOLDOWN_TIME - (monotonic() - self._last_callback_time)

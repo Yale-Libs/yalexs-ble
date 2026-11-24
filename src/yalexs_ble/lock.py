@@ -1052,12 +1052,8 @@ class Lock:
         """Set the lock's clock to the host's time plus offset seconds.
 
         The lock takes whole seconds, so the write is sent at the moment that gives
-        the fraction. Returns the second written and the times of the write; the
-        lock applied the write between request_written and reply_received. Raises
-        TypeError for an offset that is not an int or a float, and ValueError for
-        one that is not finite or gives a second that does not fit four unsigned
-        bytes, before any frame is written, and TimeoutError when the lock does not
-        answer within the session's wait.
+        the fraction. times holds when the request was written and when the reply
+        that completed the call was received.
         """
         validate_rtc_offset(offset)
         assert self.session is not None  # nosec
@@ -1091,10 +1087,8 @@ class Lock:
     async def set_rtc(self, timestamp: int) -> RtcWrite:
         """Set the lock's clock to timestamp, in seconds since 1970 UTC, as given.
 
-        Returns the second written and the times of the write; the lock applied the
-        write between request_written and reply_received. Raises TypeError or
-        ValueError for a bad timestamp before any frame is written, and TimeoutError
-        when the lock does not answer within the session's wait.
+        times holds when the request was written and when the reply that completed
+        the call was received.
         """
         validate_rtc_timestamp(timestamp)
         assert self.session is not None  # nosec
@@ -1128,10 +1122,7 @@ class Lock:
         """Send the lock's time zone and return the lock's reply.
 
         payload is bytes 4 to 15 of the TimeZone_Info frame, sent as given; the
-        return is bytes 4 to 15 of the lock's reply, unchanged. Raises TypeError for
-        a payload that is not bytes or a bytearray and ValueError for one that is
-        not 12 bytes, before any frame is built, and TimeoutError when the lock does
-        not answer within the session's wait.
+        return is bytes 4 to 15 of the lock's reply, unchanged.
         """
         validate_timezone_info(payload)
         _LOGGER.debug("%s: Setting the time zone to %s", self.name, payload.hex())

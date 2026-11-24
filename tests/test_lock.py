@@ -688,7 +688,7 @@ def test_first_reply_matcher_takes_the_aa_or_bb_frame_of_its_opcode() -> None:
     assert not matches(LOCK_ACK)
     assert not matches(status_push)
     assert not matches(command)
-    assert not matches(bytes.fromhex("aa"))  # truncated below byte 1
+    assert not matches(bytes.fromhex("aa"))
 
 
 _CHAR_DATA: dict[str, bytes] = {
@@ -2741,7 +2741,6 @@ async def test_a_clock_write_names_its_call_in_the_session_log(
             "Clock timestamp has type bool, not int: True",
             id="a-bool",
         ),
-        # A timestamp just outside four unsigned bytes.
         (
             "set_rtc",
             {"timestamp": -1},

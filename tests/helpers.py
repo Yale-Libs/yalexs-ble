@@ -37,14 +37,14 @@ def call_method(
     return getattr(target, method)(*args)
 
 
-# A SetRTC acknowledgment captured on 2026-11-04 from a Yale lock, answering 1793750707.
+# A SetRTC acknowledgment captured on 2026-11-04 from a Yale lock.
 CLOCK_WRITE_ACK = bytes.fromhex("aa1000c7b376ea6a00000000000000000200")
 # The time CLOCK_WRITE_ACK answers.
 CLOCK_WRITE_TIME = 1793750707
 # Constructed TimeZone_Info frames. Every payload byte is distinct, so a payload
 # written at the wrong offset fails, and the reply holds 0x01 at byte 7 where the
 # payload and the acknowledgment hold 0xF7, so a return taken from the acknowledgment
-# fails. Byte 4 of each is the payload's first byte.
+# fails.
 ZONE_PAYLOAD = bytes(range(0xF4, 0x100))
 ZONE_ACK = with_checksum(f"aa300000{ZONE_PAYLOAD.hex()}0200")
 ZONE_REPLY = with_checksum(
