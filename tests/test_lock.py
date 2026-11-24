@@ -49,6 +49,7 @@ from yalexs_ble.lock import (
 )
 from yalexs_ble.session import (
     COOLDOWN_TIME,
+    AuthError,
     DisconnectedError,
     KeycodeError,
     NotRunningError,
@@ -2151,6 +2152,53 @@ async def test_a_shutdown_step_that_fails_with_no_message_logs_its_type_as_the_c
         await lock.disconnect()
 
     assert (logger, logging.DEBUG, logged) in caplog.record_tuples
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_reply_to_the_key_exchange_raises_auth_error_naming_the_command(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A key exchange answered by a frame other than 0x02 raises AuthError."""
+    key = bytes(range(16))
+    lock = Lock(
+        lambda: BLEDevice("aa:bb:cc:dd:ee:ff", "lock", details=None),
+        key.hex(),
+        1,
+        "mylock",
+        lambda _: None,
+    )
+    # A constructed SEC_INITIALIZATION_RESPONSE, valid but not the key exchange reply.
+    reply = bytearray(RESPONSE_FRAME_LEN)
+    reply[0x00] = 0x04
+    reply[0x0C:0x10] = util._security_checksum(reply).to_bytes(4, "little")
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()  # nosec
+    on_air = encryptor.update(bytes(reply[0x00:0x10])) + bytes(reply[0x10:])
+    client = MagicMock(is_connected=True, start_notify=AsyncMock())
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        notify = client.start_notify.call_args.args[1]
+        notify(0, bytearray(on_air))
+
+    client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    with (
+        patch("yalexs_ble.lock.establish_connection", AsyncMock(return_value=client)),
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"),
+        pytest.raises(AuthError) as excinfo,
+    ):
+        await lock.connect()
+
+    assert str(excinfo.value) == (
+        "Authentication error: key or slot (key index) is incorrect: "
+        f"unexpected response to SEC_MOBILE_TO_LOCK_KEY_EXCHANGE: {reply.hex()}"
+    )
+    assert any(
+        record.levelno == logging.DEBUG
+        and record.getMessage().startswith(
+            "mylock: Writing command SEC_MOBILE_TO_LOCK_KEY_EXCHANGE to "
+        )
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

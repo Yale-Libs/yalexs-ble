@@ -468,16 +468,15 @@ class Lock:
         self.secure_session.set_key(self.key)
         handshake_keys = os.urandom(16)
 
-        # Send SEC_LOCK_TO_MOBILE_KEY_EXCHANGE
         cmd = self.secure_session.build_command(0x01)
         util._copy(cmd, handshake_keys[0x00:0x08], destLocation=0x04)
         response = await self.secure_session.execute(
-            cmd, "SEC_LOCK_TO_MOBILE_KEY_EXCHANGE"
+            cmd, "SEC_MOBILE_TO_LOCK_KEY_EXCHANGE"
         )
         if response[0x00] != 0x02:
             raise AuthError(
                 "Authentication error: key or slot (key index) is incorrect: "
-                "unexpected response to SEC_LOCK_TO_MOBILE_KEY_EXCHANGE: "
+                "unexpected response to SEC_MOBILE_TO_LOCK_KEY_EXCHANGE: "
                 + response.hex()
             )
 
