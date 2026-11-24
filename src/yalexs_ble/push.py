@@ -256,6 +256,13 @@ async def _get_log(lock: Lock) -> bytes:
     return await lock.get_log()
 
 
+def _drainable_count(count: int) -> int:
+    """Return count, or raise ResponseError for a count the drain does not read."""
+    if count < 0 or count >= UNREAD_COUNT_LIMIT:
+        raise ResponseError(f"Unread count {count} is not a depth")
+    return count
+
+
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
     """Define a wrapper to only allow a single operation at a time."""
 
@@ -1907,11 +1914,19 @@ class PushLock:
             # covered, and a backlog armed while this drain waited is counted.
             self._activity_drain_pending = False
             if self._backlog_remaining is None:
-                count = await lock.unread_event_count()
-                if count < 0 or count >= UNREAD_COUNT_LIMIT:
-                    # A future PR sends ClearLog here for a count refused as too large,
-                    # with the same failure handling.
-                    raise ResponseError(f"Unread count {count} is not a depth")
+                first = await lock.unread_event_count()
+                if first < UNREAD_COUNT_LIMIT:
+                    return _drainable_count(first)
+                await lock.clear_log()
+                count = _drainable_count(await lock.unread_event_count())
+                _LOGGER.warning(
+                    "%s: Activity log unread count %d is too large to read, so"
+                    " those records are not read; the lock answered ClearLog"
+                    " and reports %d",
+                    self.name,
+                    first,
+                    count,
+                )
                 return count
             return await lock.get_log()
 

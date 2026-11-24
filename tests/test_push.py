@@ -4082,6 +4082,7 @@ def _mock_link(
     mock_lock = MagicMock(is_connected=True)
     mock_lock.get_log = AsyncMock(side_effect=replies)
     mock_lock.unread_event_count = AsyncMock(return_value=count or 0)
+    mock_lock.clear_log = AsyncMock()
     mock_lock.disconnect = AsyncMock()
     if count is None:
         push_lock._backlog_remaining = 0
@@ -4139,6 +4140,7 @@ def _commands(written: list[bytes]) -> list[tuple[int, int]]:
 
 _COUNT_READ = (Commands.GETSTATUS.value, StatusType.LOCK_EVENTS_UNREAD.value)
 _GET_LOG = (Commands.GETLOG.value, 0x00)
+_CLEAR_LOG = (Commands.CLEARLOG.value, 0x00)
 _LOCK_STATUS_POLL = (Commands.GETSTATUS.value, StatusType.LOCK_ONLY.value)
 
 
@@ -4598,17 +4600,125 @@ async def test_the_largest_readable_count_is_read() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "count", [UNREAD_COUNT_LIMIT, 1500, -1], ids=["limit", "above", "negative"]
+    ("count", "count_after_the_clear", "records"),
+    [
+        pytest.param(UNREAD_COUNT_LIMIT, 0, [], id="empty-after-the-clear"),
+        pytest.param(
+            UNREAD_COUNT_LIMIT, 0, [_RECORDS[0]], id="one-record-after-the-clear"
+        ),
+        pytest.param(1500, 0, [], id="above-the-limit"),
+        pytest.param(0x7FFFFFFF, 0, [], id="largest-signed-count"),
+        pytest.param(
+            UNREAD_COUNT_LIMIT,
+            2,
+            _RECORDS[:2],
+            id="two-records-counted-after-the-clear",
+        ),
+    ],
 )
-async def test_a_count_that_is_not_a_depth_ends_the_drain_as_a_failure(
-    caplog: pytest.LogCaptureFixture, count: int
+async def test_a_count_too_large_to_read_clears_the_log_and_the_drain_reads_on(
+    count: int,
+    count_after_the_clear: int,
+    records: list[bytes],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A refused count sends no GetLog, stays owed and counts as a failed drain."""
-    push_lock, mock_lock, received = _activity_push_lock([], count=count)
+    """A count too large to read sends ClearLog, is polled again, and warns once."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:d5", always_connected=False)
+    _, written = _drain_on_a_real_session(
+        push_lock,
+        [
+            _count_reply(count),
+            CLEAR_LOG_ACK,
+            _count_reply(count_after_the_clear),
+            *records,
+            _GET_LOG_ERROR,
+        ],
+    )
+    received: list[list[tuple[bytes, bool]]] = [[], []]
+
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
-        for _ in range(ACTIVITY_DRAIN_FAILURE_THRESHOLD):
+        for kept in received:
+            push_lock.register_log_record_callback(_recorder(kept))
+        await _drained(push_lock)
+
+    assert _commands(written) == [
+        _COUNT_READ,
+        _CLEAR_LOG,
+        _COUNT_READ,
+        *[_GET_LOG] * (len(records) + 1),
+    ]
+    delivered = [
+        *((record, True) for record in records[:count_after_the_clear]),
+        *((record, False) for record in records[count_after_the_clear:]),
+        (_GET_LOG_ERROR, False),
+    ]
+    assert received == [delivered, delivered]
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+        f"Test Lock: Activity log unread count {count} is too large to read, so those"
+        " records are not read; the lock answered ClearLog and reports"
+        f" {count_after_the_clear}"
+    ]
+    assert "Reading lock activity" not in caplog.text
+    assert push_lock._activity_drain_pending is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("count", "reread", "clear_log_failure", "reads_per_drain", "clears"),
+    [
+        pytest.param(-1, None, None, 1, 0, id="below-zero"),
+        pytest.param(-559038737, None, None, 1, 0, id="top-bit-set"),
+        pytest.param(
+            UNREAD_COUNT_LIMIT,
+            None,
+            TimeoutError(),
+            1,
+            ACTIVITY_DRAIN_FAILURE_THRESHOLD,
+            id="too-large-clear-log-unanswered",
+        ),
+        pytest.param(
+            UNREAD_COUNT_LIMIT,
+            UNREAD_COUNT_LIMIT,
+            None,
+            2,
+            ACTIVITY_DRAIN_FAILURE_THRESHOLD,
+            id="too-large-after-the-clear",
+        ),
+        pytest.param(
+            UNREAD_COUNT_LIMIT,
+            -1,
+            None,
+            2,
+            ACTIVITY_DRAIN_FAILURE_THRESHOLD,
+            id="below-zero-after-the-clear",
+        ),
+    ],
+)
+async def test_a_refused_count_or_an_unanswered_clear_log_fails_the_drain(
+    count: int,
+    reread: int | None,
+    clear_log_failure: Exception | None,
+    reads_per_drain: int,
+    clears: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No GetLog is sent, the drain stays pending, and the third failure backs off."""
+    push_lock, mock_lock, received = _activity_push_lock([], count=count)
+    if reread is not None:
+        mock_lock.unread_event_count = AsyncMock(
+            side_effect=[count, reread] * ACTIVITY_DRAIN_FAILURE_THRESHOLD
+        )
+    mock_lock.clear_log = AsyncMock(side_effect=clear_log_failure)
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
+        # The cycle after the third failure is held off by the backoff.
+        for _ in range(ACTIVITY_DRAIN_FAILURE_THRESHOLD + 1):
             await _update_and_drain(push_lock, mock_lock)
 
+    assert (
+        mock_lock.unread_event_count.await_count
+        == reads_per_drain * ACTIVITY_DRAIN_FAILURE_THRESHOLD
+    )
+    assert mock_lock.clear_log.await_count == clears
     mock_lock.get_log.assert_not_awaited()
     assert received == []
     assert push_lock._activity_drain_pending is True
@@ -4616,7 +4726,20 @@ async def test_a_count_that_is_not_a_depth_ends_the_drain_as_a_failure(
     assert [r.levelno for r in lines] == [logging.DEBUG] * (
         ACTIVITY_DRAIN_FAILURE_THRESHOLD - 1
     ) + [logging.WARNING]
-    assert all(f"Unread count {count} is not a depth" in r.getMessage() for r in lines)
+    warning = lines[-1]
+    assert warning.exc_info is not None
+    failure = warning.exc_info[1]
+    if clear_log_failure:
+        assert failure is clear_log_failure
+    else:
+        assert isinstance(failure, ResponseError)
+        refused = count if reread is None else reread
+        assert str(failure) == f"Unread count {refused} is not a depth"
+    assert all(f"({failure})" in r.getMessage() for r in lines)
+    assert (
+        f"not trying again for {ACTIVITY_DRAIN_FAILURE_BACKOFF} seconds"
+        in warning.getMessage()
+    )
     assert not [r for r in caplog.records if "unread count" in r.getMessage()]
 
 
