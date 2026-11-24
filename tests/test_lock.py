@@ -430,7 +430,7 @@ def test_parameter_response_matcher_takes_value_frame_not_ack() -> None:
     assert not write_matcher(SETTINGS_WRITE_ACK)
     assert not write_matcher(SETTINGS_READ_RESPONSE)  # wrong opcode for the write
     assert not write_matcher(battery_answer)
-    assert not write_matcher(SETTINGS_WRITE_RESPONSE[:4])  # truncated below byte 4
+    assert not write_matcher(SETTINGS_WRITE_RESPONSE[:4])
     assert not other_id_matcher(SETTINGS_WRITE_RESPONSE)
 
 
@@ -999,10 +999,7 @@ def _result(opcode: int, error: int = 0, slot: int = 0) -> bytes:
 
 
 class _KeycodeSession:
-    """Session stand-in that records commands and replays canned frames.
-
-    Each replayed frame is asserted to pass the command's matcher.
-    """
+    """Session stand-in that records commands and replays canned frames."""
 
     def __init__(self, responses: list[bytes]) -> None:
         self.sent: list[bytearray] = []
@@ -1842,7 +1839,6 @@ def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
             "get_parameter",
             (0xB2,),
             [
-                # Status push reporting UNLOCKED.
                 LOCK_FRAME,
                 _settings_frame(Commands.READSETTING.value, 0xB2, value=30),
             ],

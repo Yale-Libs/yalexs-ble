@@ -255,8 +255,7 @@ _AUTH_FAILURE_HISTORY = AuthFailureHistory()
 def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
     """Retry a PushLock method on an AuthError or one of RETRYABLE_EXCEPTIONS.
 
-    A BleakNotFoundError is raised without a retry. The lock may drop the
-    connection at any time.
+    A BleakNotFoundError is raised without a retry.
     """
     return _retry_on_connection_error(func, None)
 
@@ -277,11 +276,7 @@ def _retry_on_connection_error(
     func: WrapFuncType,
     before_retry: Callable[[PushLock, Exception | None], None] | None,
 ) -> WrapFuncType:
-    """Wrap func in a loop of up to DEFAULT_ATTEMPTS attempts.
-
-    before_retry, when given, is called with the instance and the last error
-    before each retry.
-    """
+    """Wrap func in a loop of up to DEFAULT_ATTEMPTS attempts."""
 
     async def _async_wrap_retry_bluetooth_connection_error(
         self: PushLock, *args: Any, **kwargs: Any
@@ -1192,11 +1187,7 @@ class PushLock:
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
 
     async def get_parameter(self, parameter: int) -> int:
-        """Read one parameter from the lock and return the value it reports.
-
-        Raises ValueError before connecting, RuntimeError when not running, and
-        TimeoutError when the lock does not answer, with the connection kept.
-        """
+        """Read one parameter from the lock and return the value it reports."""
         validate_parameter_id(parameter)
         return await self._run_on_lock(
             f"get_parameter 0x{parameter:02X}",
@@ -1204,10 +1195,7 @@ class PushLock:
         )
 
     async def set_parameter(self, parameter: int, value: int) -> int:
-        """Write one parameter and return the value field of the lock's reply.
-
-        Raises as get_parameter, plus ValueError for a value outside four bytes.
-        """
+        """Write one parameter and return the value field of the lock's reply."""
         validate_parameter_id(parameter)
         validate_parameter_value(value)
         return await self._run_on_lock(
