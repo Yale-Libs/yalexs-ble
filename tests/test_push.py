@@ -4082,7 +4082,6 @@ def _mock_link(
     mock_lock = MagicMock(is_connected=True)
     mock_lock.get_log = AsyncMock(side_effect=replies)
     mock_lock.unread_event_count = AsyncMock(return_value=count or 0)
-    mock_lock.clear_log = AsyncMock()
     mock_lock.disconnect = AsyncMock()
     if count is None:
         push_lock._backlog_remaining = 0

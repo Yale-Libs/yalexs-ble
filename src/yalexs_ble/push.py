@@ -1913,22 +1913,21 @@ class PushLock:
             # Under the lock: a change staged while another task held it is
             # covered, and a backlog armed while this drain waited is counted.
             self._activity_drain_pending = False
-            if self._backlog_remaining is None:
-                first = await lock.unread_event_count()
-                if first < UNREAD_COUNT_LIMIT:
-                    return _drainable_count(first)
-                await lock.clear_log()
-                count = _drainable_count(await lock.unread_event_count())
-                _LOGGER.warning(
-                    "%s: Activity log unread count %d is too large to read, so"
-                    " those records are not read; the lock answered ClearLog"
-                    " and reports %d",
-                    self.name,
-                    first,
-                    count,
-                )
-                return count
-            return await lock.get_log()
+            if self._backlog_remaining is not None:
+                return await lock.get_log()
+            first = await lock.unread_event_count()
+            if first < UNREAD_COUNT_LIMIT:
+                return _drainable_count(first)
+            await lock.clear_log()
+            count = _drainable_count(await lock.unread_event_count())
+            _LOGGER.warning(
+                "%s: Activity log unread count %d is too large to read, so those"
+                " records are not read; the lock answered ClearLog and reports %d",
+                self.name,
+                first,
+                count,
+            )
+            return count
 
         ended = False
         try:

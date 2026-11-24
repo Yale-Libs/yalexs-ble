@@ -16,7 +16,6 @@ from yalexs_ble.const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
     MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
-    RESPONSE_FRAME_LEN,
     SERIAL_NUMBER_CHARACTERISTIC,
     VALUE_TO_LOCK_STATUS,
     AutoLockMode,
@@ -1015,6 +1014,16 @@ def _connected_lock(
     return lock, session
 
 
+def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
+    """Deliver frames on the notify path when the command is written."""
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        for frame in frames:
+            session._notify(0, bytearray(frame))
+
+    return AsyncMock(side_effect=deliver)
+
+
 def test_poll_response_matcher_takes_only_the_requested_subtype() -> None:
     """0xBB plus the polled opcode plus the byte[4] status type."""
     matches = _poll_response_matcher(Commands.GETSTATUS.value, StatusType.BATTERY.value)
@@ -1134,11 +1143,7 @@ async def test_unread_event_count_returns_the_signed_four_byte_count(
 ) -> None:
     """The LOCK_EVENTS_UNREAD poll returns [8:12] signed, as read, from one request."""
     lock, session = _connected_lock()
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        session._notify(0, bytearray(frame))
-
-    write = AsyncMock(side_effect=deliver)
+    write = _answered_by(session, frame)
     session.client.write_gatt_char = write
 
     assert await lock.unread_event_count() == unread
@@ -1435,7 +1440,7 @@ def test_keycode_get_matcher_requires_the_echoed_slot() -> None:
 
 @pytest.mark.parametrize("opcode", [0x27, 0x28, 0x2B, 0x2C, 0x39, 0x2D, 0x06])
 @pytest.mark.parametrize("flag", [0xBB, 0xAA])
-def test_keycode_frames_produce_no_state(opcode: int, flag: int) -> None:
+def test_no_state_frames_produce_no_state(opcode: int, flag: int) -> None:
     received: list[object] = []
     lock = _make_lock(received.append)
     frame = bytearray(_result(opcode, 0x06, 200))
@@ -1521,16 +1526,6 @@ async def test_get_log_requires_a_connection() -> None:
         await _make_lock().get_log()
 
 
-def _answered_by(session: Session, *frames: bytes) -> AsyncMock:
-    """Deliver frames on the notify path when the command is written."""
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        for frame in frames:
-            session._notify(0, bytearray(frame))
-
-    return AsyncMock(side_effect=deliver)
-
-
 # A ClearLog acknowledgment captured on 2026-11-19 from a Yale lock.
 CLEAR_LOG_ACK = bytes.fromhex("aa06004e0000000000000000000000000200")
 # A constructed ClearLog 0xBB reply.
@@ -1557,12 +1552,8 @@ async def test_clear_log_writes_one_clear_log_frame_and_returns_on_its_reply(
     (written,) = (
         call.args[1] for call in session.client.write_gatt_char.await_args_list
     )
-    assert written[0x00] == 0xEE
-    assert written[0x01] == 0x06
-    assert written[0x04:0x10] == bytes(12)
-    assert written[0x10] == 0x02
-    assert len(written) == RESPONSE_FRAME_LEN
-    assert _simple_checksum(written) == 0
+    # A constructed ClearLog frame.
+    assert written == _with_checksum("ee0600000000000000000000000000000200")
 
 
 @pytest.mark.asyncio
