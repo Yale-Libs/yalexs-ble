@@ -913,11 +913,7 @@ class Lock:
 
     @raise_if_not_connected
     async def unread_event_count(self) -> int:
-        """Return the activity log's unread count, read signed from bytes 8 to 11.
-
-        The status poll removes no record. A count below 0, or of UNREAD_COUNT_LIMIT
-        or more, raises ResponseError.
-        """
+        """Return the activity log's unread count."""
         response = await self._poll_status(
             StatusType.LOCK_EVENTS_UNREAD, "unread_event_count"
         )

@@ -683,9 +683,7 @@ class PushLock:
     ) -> Callable[[], None]:
         """Register an async callback for every log record and its backlog flag.
 
-        Returns the remover. A drain starts on each new connection, on each
-        change of the displayed lock status to a settled one, and on each change
-        of the door status.
+        Returns the remover.
         """
         arms_backlog = not self._activity_callbacks
         self._activity_callbacks.append(callback)
@@ -1867,13 +1865,7 @@ class PushLock:
     async def _read_for_activity_drain(
         self, read: Callable[[Lock], Awaitable[_T]]
     ) -> tuple[_T, float] | None:
-        """Send one read on the link under the operation lock, never connecting.
-
-        Returns the reply and the time the read started, or None, having sent
-        nothing, when no log record callback is left. Raises _ActivityDrainReadError
-        when the link is down or the read raises another retryable error; only the
-        second counts as a failed drain.
-        """
+        """Run read on the link under the operation lock, never connecting."""
         # This yield lets a task created in the loop turn in which the last reply
         # arrived ask for the operation lock before the drain does.
         await asyncio.sleep(0)
@@ -1901,9 +1893,7 @@ class PushLock:
     async def _drain_activity(self) -> bool:
         """Read the activity log to its end and deliver every record to every callback.
 
-        Returns False, with the log still owed, when a read fails or the log does
-        not end within the read budget; the records read until then have been
-        delivered.
+        Returns False when a read fails or the log does not end within the read budget.
         """
 
         async def clear_pending_and_read(lock: Lock) -> int | bytes:

@@ -4028,11 +4028,7 @@ def _ready_to_drain(push_lock: PushLock) -> None:
 def _mock_link(
     push_lock: PushLock, replies: list[Any], count: int | None = None
 ) -> MagicMock:
-    """Connect push_lock to a mock Lock whose GetLog answers replies; return the Lock.
-
-    With count, the count read answers count and the backlog stays armed; without,
-    no backlog is left.
-    """
+    """Connect push_lock to a mock Lock whose GetLog answers replies; return it."""
     mock_lock = MagicMock(is_connected=True)
     mock_lock.get_log = AsyncMock(side_effect=replies)
     mock_lock.unread_event_count = AsyncMock(return_value=count or 0)
@@ -4132,10 +4128,7 @@ _Entry = TypeVar("_Entry")
 def _due_on_a_clock(
     clock: list[float], log: list[tuple[float, _Entry]]
 ) -> _Entry | bytes:
-    """Move clock on by _READ_TIME, then take the first entry log holds by then.
-
-    Each entry is held from its time on clock; with none held, the GetLogError.
-    """
+    """Move clock on by _READ_TIME, then take the first entry log holds by then."""
     clock[0] += _READ_TIME
     if not log or log[0][0] > clock[0]:
         return _GET_LOG_ERROR
@@ -4145,10 +4138,7 @@ def _due_on_a_clock(
 def _log_on_a_clock(
     clock: list[float], log: list[tuple[float, bytes | Exception]]
 ) -> AsyncMock:
-    """A GetLog mock answering each read with _due_on_a_clock over log.
-
-    An exception entry is raised.
-    """
+    """A GetLog mock answering each read with _due_on_a_clock over log."""
 
     async def get_log() -> bytes:
         entry = _due_on_a_clock(clock, log)
@@ -4177,12 +4167,7 @@ def _drain_on_a_clock(
     *,
     always_connected: bool = False,
 ) -> tuple[PushLock, list[bytes], list[tuple[bytes, bool]]]:
-    """A running PushLock on a real Lock and Session over log, with one recorder.
-
-    Each GetLog answers as _replies_on_a_clock does. Returns the push lock, the
-    commands written, and the replies the recorder receives. No backlog is armed
-    and no drain has started.
-    """
+    """A running PushLock on a real Lock and Session over log, with one recorder."""
     push_lock = _named_push_lock("aa:bb:cc:dd:ee:d3", always_connected=always_connected)
     received: list[tuple[bytes, bool]] = []
     # Registered before the lock is up, so no drain starts here.
@@ -4432,12 +4417,7 @@ def _held_on_the_first_record(
     push_lock: PushLock,
     wrap: Callable[[LogRecordCallback], LogRecordCallback] = lambda held: held,
 ) -> tuple[asyncio.Event, asyncio.Event, list[str], LogRecordCallback]:
-    """Register a log record callback whose first call returns only once released.
-
-    The callback is registered as wrap returns it. Returns the event set when that
-    call starts, the event that releases it, how that call ended, "returned" or
-    "cancelled", and the registered callback.
-    """
+    """Register a log record callback whose first call returns only once released."""
     started = asyncio.Event()
     release = asyncio.Event()
     ended: list[str] = []

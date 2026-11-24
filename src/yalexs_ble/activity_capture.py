@@ -32,9 +32,7 @@ def log_record(
 ) -> None:
     """Log reply's timing, lock and door status, flag, and both decodes as one line.
 
-    The line goes to the capture logger of the lock at address, when that logger is
-    enabled for debug. since_change is the seconds since the last settled lock
-    change, or None.
+    since_change is the seconds since the last settled lock change, or None.
     """
     logger = _LOGGER.getChild(address.replace(":", "").lower())
     if not logger.isEnabledFor(logging.DEBUG):
