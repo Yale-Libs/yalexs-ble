@@ -65,6 +65,8 @@ class Commands(IntEnum):
     KEYCODE_ACCESS = 0x2B
     KEYCODE_COMMIT = 0x2C
     GETLOG = 0x2D
+    SETUNITY = 0x34
+    GETUNITY = 0x35
     KEYCODE_GET = 0x39
 
 
@@ -152,10 +154,6 @@ class StatusType(IntEnum):
     LOCK_EVENTS_UNREAD = 0x09
 
 
-class SettingType(IntEnum):
-    AUTOLOCK = 0x28
-
-
 class LockStatus(Enum):
     UNKNOWN = 0x00
     UNKNOWN_01 = 0x01  # Calibrating
@@ -197,25 +195,10 @@ class DoorStatus(Enum):
 VALUE_TO_DOOR_STATUS = {status.value: status for status in DoorStatus}
 
 
-class AutoLockMode(IntEnum):
-    # The values are arbitrary; the mode never crosses the wire. It is derived
-    # from the stored value's shape on read (see Lock._parse_auto_lock_state)
-    # and implied by that shape on write (see Lock.set_auto_lock).
-    INSTANT = 0
-    TIMER = 1
-    OFF = 2
-
-
 @dataclass
 class BatteryState:
     voltage: float
     percentage: int
-
-
-@dataclass
-class AutoLockState:
-    mode: AutoLockMode
-    duration: int
 
 
 @dataclass
@@ -224,16 +207,12 @@ class LockState:
     door: DoorStatus
     battery: BatteryState | None
     auth: AuthState | None
-    auto_lock: AutoLockState | None
-    # Hold the previous auto lock state so that it can be restored if auto lock
-    # is enabled
-    auto_lock_prev: AutoLockState | None
     # Status of the secure lock: LOCKED when the lock is in securemode, so
     # SECUREMODE itself never appears here.
     secure: LockStatus = LockStatus.UNKNOWN
 
 
-LockStateValue = LockStatus | DoorStatus | BatteryState | AutoLockState
+LockStateValue = LockStatus | DoorStatus | BatteryState
 
 
 _EnumT = TypeVar("_EnumT", bound=Enum)

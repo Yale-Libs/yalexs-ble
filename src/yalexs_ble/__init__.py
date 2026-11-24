@@ -42,7 +42,6 @@ from .const import (
     MANUAL_INTERVENTION_STATUSES,
     AugustLockOperationSource,
     AugustLogType,
-    AutoLockMode,
     Brand,
     BulkOperationType,
     ConnectionInfo,
@@ -74,6 +73,7 @@ from .session import (
     KeycodeError,
     OperationFailedError,
     OperationIncompleteError,
+    UnityParameterError,
     YaleXSBLEError,
 )
 from .util import (
@@ -94,7 +94,6 @@ __all__ = [
     "AugustLockOperationSource",
     "AugustLogType",
     "AuthError",
-    "AutoLockMode",
     "BCMTest",
     "BatteryInfo",
     "Brand",
@@ -155,6 +154,7 @@ __all__ = [
     "PushLock",
     "Tamper",
     "TamperType",
+    "UnityParameterError",
     "ValidatedLockConfig",
     "YaleXSBLEDiscovery",
     "YaleXSBLEError",
