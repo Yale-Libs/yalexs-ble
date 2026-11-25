@@ -307,11 +307,11 @@ def test_lock_operation_lock_state_decodes_to_its_lock_status(
 
 def test_get_log_error_bit_fields() -> None:
     """Built frame: log_count crosses the byte boundary of the two bytes at 5."""
-    record = parse_log_event_packet(_built(0x80, {5: "1a2b"}))
+    record = parse_log_event_packet(_built(0x80, {5: "ea2b"}))
     assert isinstance(record, GetLogError)
     assert record.error == 2
     assert record.dirty_bit == 1
-    assert record.log_count == 0x2B1
+    assert record.log_count == 0x2BE
 
 
 @pytest.mark.parametrize("log_type", [0x00, 0x80], ids=["LockOperation", "GetLogError"])
