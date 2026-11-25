@@ -41,19 +41,28 @@ from .const import (
     LockState,
     LockStateValue,
     LockStatus,
+    StatusReply,
 )
-from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
+from .lock import (
+    ActivityLogOverrunError,
+    Lock,
+    validate_keycode_slot,
+    validate_status_type,
+)
 from .session import (
     AuthError,
     BluetoothError,
     DisconnectedError,
     NoAdvertisementError,
+    NotRunningError,
     OperationFailedError,
     OperationIncompleteError,
     ResponseError,
+    ResultUnknownError,
     YaleXSBLEError,
 )
 from .util import (
+    _exc_cause,
     asyncio_timeout,
     encode_keycode_pin,
     is_disconnected_error,
@@ -769,7 +778,9 @@ class PushLock:
                     asked = True
             except (TimeoutError, *RETRYABLE_EXCEPTIONS) as ex:
                 # The cycle at the floor's end retries and reports the link.
-                _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
+                _LOGGER.debug(
+                    "%s: Keep-alive read failed: %s", self.name, _exc_cause(ex)
+                )
                 return
             if asked:
                 # A request, so the floor check and the keep-alive count from it.
@@ -883,7 +894,9 @@ class PushLock:
 
     async def _async_handle_disconnected(self, exc: Exception) -> None:
         """Clean up after a disconnect."""
-        _LOGGER.debug("%s: Disconnected due to %s, cleaning up", self.name, exc)
+        _LOGGER.debug(
+            "%s: Disconnected due to %s, cleaning up", self.name, _exc_cause(exc)
+        )
         if self._connect_lock.locked():
             _LOGGER.error(
                 "%s: Disconnected while connection was in progress, ignoring",
@@ -931,7 +944,9 @@ class PushLock:
                 await self._client.connect(max_attempts)
             except BaseException as ex:  # Might be cancelled
                 _LOGGER.debug(
-                    "%s: Failed to connect due to %s, forcing disconnect", self.name, ex
+                    "%s: Failed to connect due to %s, forcing disconnect",
+                    self.name,
+                    _exc_cause(ex),
                 )
                 try:
                     await self._client.disconnect()
@@ -1190,8 +1205,13 @@ class PushLock:
     async def _execute_lock_operation(self, operation: _LockOperation) -> None:
         """Execute a lock operation."""
         if not self._running:
-            raise RuntimeError(
-                f"{self.name}: Lock operation not possible because not running"
+            if self._operation_failure is None:
+                raise NotRunningError(
+                    f"{self.name}: Lock operation not possible because not running"
+                )
+            raise ResultUnknownError(
+                f"{self.name}: Lock operation not retried because not running; "
+                "its result is unknown"
             )
         op_attr = operation.op_attr
         _LOGGER.debug("%s: Starting %s", self.name, op_attr)
@@ -1220,7 +1240,7 @@ class PushLock:
             _LOGGER.debug(
                 "%s: Failed to execute lock operation due to %s",
                 self.name,
-                ex,
+                _exc_cause(ex),
             )
             raise
         _LOGGER.debug("%s: Finished %s", self.name, op_attr)
@@ -1318,7 +1338,7 @@ class PushLock:
             _LOGGER.debug(
                 "%s: Failed to execute set auto lock operation due to %s",
                 self.name,
-                ex,
+                _exc_cause(ex),
             )
             raise
         self._complete_operation(time.monotonic())
@@ -1344,13 +1364,23 @@ class PushLock:
         validate_keycode_slot(slot)
         await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
 
+    async def get_status(self, status_type: int) -> StatusReply:
+        """Send a status poll for one status type and return its value and times."""
+        validate_status_type(status_type)
+        return await self._run_on_lock(
+            f"get_status 0x{status_type:02X}",
+            lambda lock: lock.get_status(status_type),
+        )
+
     @operation_lock
     async def _run_on_lock(
         self, name: str, operation: Callable[[Lock], Awaitable[_T]]
     ) -> _T:
         """Run a command that moves no motor; a failure is logged once at warning."""
         if not self._running:
-            raise RuntimeError(f"{self.name}: {name} not possible because not running")
+            raise NotRunningError(
+                f"{self.name}: {name} not possible because not running"
+            )
         try:
             outcome = await self._attempt_on_lock(name, operation)
             if isinstance(outcome, TimeoutError):
@@ -1359,7 +1389,8 @@ class PushLock:
                 ) from outcome
         except Exception as err:
             # A ResponseError's message can hold the rejected frame's hex.
-            detail = "" if isinstance(err, ResponseError) else f": {err}"
+            message = "" if isinstance(err, ResponseError) else str(err)
+            detail = f": {message}" if message else ""
             _LOGGER.warning(
                 "%s: %s failed: %s%s", self.name, name, type(err).__name__, detail
             )
@@ -1373,7 +1404,7 @@ class PushLock:
         """Run one attempt; a TimeoutError from the command's wait is returned."""
         # Not reconnected to resend after a stop.
         if not self._running:
-            raise RuntimeError(
+            raise ResultUnknownError(
                 f"{self.name}: stopped during {name}; its result is unknown"
             )
         lock = await self._ensure_connected()
@@ -1579,7 +1610,7 @@ class PushLock:
                 "%s: Battery request timed out (%s), will retry in %d "
                 "seconds. Continuing with other updates.",
                 self.name,
-                err,
+                _exc_cause(err),
                 BATTERY_TIMEOUT_COOLDOWN,
             )
             # Set cooldown to prevent repeated timeouts.
@@ -1688,10 +1719,8 @@ class PushLock:
         try:
             await lock.auto_lock_status()
         except TimeoutError:
-            # Handle the timeout here, as _poll_battery does. A timeout that
-            # reaches _update's retry decorator is read as a lost connection and
-            # forces a reconnect; catching it locally keeps the connection up
-            # and the read on its backoff.
+            # The retry decorator treats a timeout as a lost link, so it is caught
+            # here and counted toward the read's backoff.
             self._auto_lock_read_ack_failures += 1
             self._arm_auto_lock_read_backoff_if_exhausted(now)
             return False
@@ -1898,7 +1927,7 @@ class PushLock:
             _LOGGER.debug(
                 "%s: Reading lock activity failed (%s), will retry on next update.",
                 self.name,
-                err,
+                _exc_cause(err),
             )
             return
         self._activity_drain_failures = 0
@@ -1909,7 +1938,7 @@ class PushLock:
             "%s: Reading lock activity keeps failing (%s); "
             "not trying again for %d seconds",
             self.name,
-            err,
+            _exc_cause(err),
             ACTIVITY_DRAIN_FAILURE_BACKOFF,
         )
 
@@ -2101,6 +2130,13 @@ class PushLock:
 
     def _cancel(self) -> None:
         self._running = False
+        if (future := self._first_update_future) is not None and not future.done():
+            future.set_exception(
+                NotRunningError(f"{self.name}: stopped before the first update")
+            )
+            # Retrieved so asyncio does not log it as never retrieved when no wait
+            # awaits the future.
+            future.exception()
         self._cancel_future_update()
         if not self._operation_in_flight:
             # Kept while a command is in flight so a jam reported during it
@@ -2119,27 +2155,29 @@ class PushLock:
         self._background_tasks.discard(task)
         if not task.cancelled() and (exc := task.exception()) is not None:
             _LOGGER.error(
-                "%s: Background task failed: %s", self.name, exc, exc_info=exc
+                "%s: Background task failed: %s",
+                self.name,
+                _exc_cause(exc),
+                exc_info=exc,
             )
 
     async def wait_for_first_update(self, timeout: float) -> None:
         """Wait for the first update."""
         if not self._running:
-            raise RuntimeError("Not running")
-        if not self._first_update_future:
+            raise NotRunningError("Not running")
+        if (future := self._first_update_future) is None:
             raise RuntimeError("Already waited for first update")
         try:
             async with asyncio_timeout(timeout):
-                await self._first_update_future
-        except (TimeoutError, asyncio.CancelledError) as ex:
-            self._first_update_future.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._first_update_future
+                await future
+        except TimeoutError as ex:
             raise NoAdvertisementError(
                 "No advertisement received before timeout"
             ) from ex
         finally:
-            self._first_update_future = None
+            # A start() after a stop can replace _first_update_future while this waits.
+            if self._first_update_future is future:
+                self._first_update_future = None
 
     def _hold_update(self) -> None:
         """Hold update cycles off for the stale-state debounce from now."""
@@ -2227,13 +2265,14 @@ class PushLock:
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 
     def _set_update_state(self, exception: Exception | None) -> None:
-        """Set the update state."""
-        if not self._first_update_future:
+        """Resolve _first_update_future with the outcome while it is pending."""
+        future = self._first_update_future
+        if future is None or future.done():
             return
         if exception:
-            self._first_update_future.set_exception(exception)
+            future.set_exception(exception)
         else:
-            self._first_update_future.set_result(None)
+            future.set_result(None)
 
     async def _execute_deferred_update(self) -> None:  # noqa: PLR0915
         """Execute deferred update."""

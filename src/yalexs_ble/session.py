@@ -5,7 +5,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from time import monotonic
+from time import monotonic, time
 
 from async_interrupt import interrupt
 from bleak import BleakClient
@@ -22,6 +22,7 @@ from .const import (
     READ_CHARACTERISTIC,
     RESPONSE_FRAME_LEN,
     WRITE_CHARACTERISTIC,
+    ExchangeTimes,
     OperationError,
 )
 
@@ -60,6 +61,14 @@ class KeycodeError(YaleXSBLEError):
         self.error = error
         name = error.name if isinstance(error, OperationError) else "unknown error"
         super().__init__(f"{command} failed: {name} (0x{error:02X})")
+
+
+class NotRunningError(YaleXSBLEError):
+    """The PushLock was not running, so nothing was sent."""
+
+
+class ResultUnknownError(YaleXSBLEError):
+    """The PushLock stopped during a command that may have reached the lock."""
 
 
 class DisconnectedError(YaleXSBLEError):
@@ -154,6 +163,7 @@ class Session:
         self._first_request = True
         self._last_callback_time = -86400.0
         self._enable_cooldown = False
+        self._disconnect_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
 
     def set_key(self, key: bytes | bytearray) -> None:
@@ -218,7 +228,7 @@ class Session:
         command: bytearray,
         command_name: str,
         response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
+    ) -> tuple[bytes, ExchangeTimes]:
         """Write under the lock."""
         async with self._lock:
             return await self._locked_write(command, command_name, response_matcher)
@@ -381,79 +391,91 @@ class Session:
         if (future := self._disarm_wait()) is not None and not future.done():
             future.set_result(decrypted_data)
 
-    def _encrypt_command(self, command: bytearray, command_name: str) -> None:
-        # NOTE: The last two bytes are not encrypted
-        # General idea seems to be that if the last byte
-        # of the command indicates an offline key offset (is non-zero),
-        # the command is "secure" and encrypted with the offline key
+    async def _write_command(self, command: bytearray, command_name: str) -> None:
+        """Encrypt the command and write it; a write that fails ends the link."""
         assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
-        plainText = command[0x00:0x10]
-        cipherText = self.cipher_encrypt.update(plainText)
-        util._copy(command, cipherText)
+        # Each write is encrypted afresh, a retry included, because on the plain
+        # session the lock's CBC context advances with each frame it decrypts.
+        frame = self.cipher_encrypt.update(command[0x00:0x10]) + command[0x10:]
         _LOGGER.debug(
-            "%s: Encrypted command %s: %s", self.name, command_name, command.hex()
+            "%s: Writing command %s to %s: %s",
+            self.name,
+            command_name,
+            self.write_characteristic,
+            frame.hex(),
         )
+        try:
+            await self.client.write_gatt_char(self.write_characteristic, frame, True)
+        except BaseException:
+            # The lock may not have received this frame, and on the plain session
+            # the next frame would then decrypt at the lock to other bytes.
+            if self.client.is_connected:
+                self._disconnect_task = self.loop.create_task(
+                    self._disconnect_after_failed_write()
+                )
+            raise
+
+    async def _disconnect_after_failed_write(self) -> None:
+        """Disconnect the client so the next connection starts a fresh cipher."""
+        _LOGGER.debug("%s: Disconnecting after a failed write", self.name)
+        try:
+            await self.client.disconnect()
+        except BleakError:
+            _LOGGER.debug(
+                "%s: Disconnect after a failed write raised", self.name, exc_info=True
+            )
+        except Exception:
+            _LOGGER.exception("%s: Disconnect after a failed write raised", self.name)
+
+    def _check_link_for_write(self) -> None:
+        """Raise if the link is down or a write on this session has failed."""
+        if not self.client.is_connected:
+            raise DisconnectedError(f"{self.name}: disconnected")
+        if self._disconnect_task is not None:
+            raise DisconnectedError(f"{self.name}: a write on this session failed")
 
     async def _locked_write(
         self,
         command: bytearray,
         command_name: str,
         response_matcher: Callable[[bytes], bool] | None = None,
-    ) -> bytes:
-        if not self.client.is_connected:
-            raise BleakError("disconnected")
-        self._encrypt_command(command, command_name)
+    ) -> tuple[bytes, ExchangeTimes]:
+        self._check_link_for_write()
 
-        future: asyncio.Future[bytes] | None = None
-        try:
-            # The loop never exhausts: the last attempt re-raises, so the only
-            # ways out are break and raise.
-            for attempt in range(3):  # pragma: no branch
-                future = self.loop.create_future()
-                self._notify_future = future
-                self._notify_matcher = response_matcher
-                _LOGGER.debug(
-                    "%s: Writing command to %s: %s",
-                    self.name,
-                    self.write_characteristic,
-                    command.hex(),
-                )
-                _LOGGER.debug("%s: Waiting for response", self.name)
+        # The loop never exhausts: the last attempt re-raises, so the only
+        # ways out are break and raise.
+        for attempt in range(3):  # pragma: no branch
+            future = self.loop.create_future()
+            self._notify_future = future
+            self._notify_matcher = response_matcher
+            try:
                 async with util.asyncio_timeout(RESPONSE_TIMEOUT):
-                    try:
-                        await self.client.write_gatt_char(
-                            self.write_characteristic, command, True
-                        )
-                        result = await future
-                    except ResponseError:
-                        if attempt == 2:
-                            raise
-                        _LOGGER.debug("%s: Invalid response, retrying", self.name)
-                        continue
-                    else:
-                        break
-        finally:
-            # A timeout or a disconnect interrupt leaves the wait armed with a
-            # future the waiter has abandoned. Disarm it so a late frame
-            # cannot leak this command's matcher into a later wait. (On the
-            # paths that resolved the wait this is a no-op.)
-            self._disarm_wait()
-            # A frame can fail the wait while the GATT write itself is still
-            # in flight; if the write then raises, the ResponseError set on
-            # the future is never awaited. Retrieve it so asyncio does not
-            # log "exception was never retrieved" with no context. suppress
-            # covers the pending and cancelled states, where there is
-            # nothing to retrieve. The None check guards only create_future
-            # itself raising on the first attempt, which would otherwise turn
-            # into a NameError here that masks the real error; no test can
-            # reach it.
-            if future is not None:  # pragma: no branch
+                    if attempt:
+                        await self._wait_for_cooldown_or_answer(future)
+                    if not future.done():
+                        request_written = time()
+                        await self._write_command(command, command_name)
+                        _LOGGER.debug("%s: Waiting for response", self.name)
+                    result = await future
+                    reply_received = time()
+                break
+            except ResponseError:
+                if attempt == 2:
+                    raise
+                _LOGGER.debug("%s: Invalid response, retrying", self.name)
+            finally:
+                # Only a frame that completes the wait disarms it, so the other exits
+                # rely on this call.
+                self._disarm_wait()
+                # A frame can fail the wait while the write is in flight, and if the
+                # write then raises, asyncio would log the never-retrieved
+                # ResponseError with no context.
                 with contextlib.suppress(
                     asyncio.CancelledError, asyncio.InvalidStateError
                 ):
                     future.exception()
         _LOGGER.debug("%s: Got response: %s", self.name, result.hex())
-        return result
+        return result, ExchangeTimes(request_written, reply_received)
 
     async def _locked_write_operation(
         self,
@@ -473,9 +495,7 @@ class Session:
         The acknowledgment deadline only serves a retry, so a command that is not
         retried after its write skips it and waits on the op-response alone.
         """
-        if not self.client.is_connected:
-            raise BleakError("disconnected")
-        self._encrypt_command(command, command_name)
+        self._check_link_for_write()
 
         attempt_start = monotonic()
         ack_future: asyncio.Future[bytes] = self.loop.create_future()
@@ -488,18 +508,10 @@ class Session:
         self._operation_progress = progress
         self._result_callback = result_callback
         try:
-            _LOGGER.debug(
-                "%s: Writing command to %s: %s",
-                self.name,
-                self.write_characteristic,
-                command.hex(),
-            )
             # Set before the call: an errored write may still have delivered.
             progress.write_attempted = True
             async with util.asyncio_timeout(ACK_TIMEOUT):
-                await self.client.write_gatt_char(
-                    self.write_characteristic, command, True
-                )
+                await self._write_command(command, command_name)
             if write_success_callback is not None:
                 # Contained: the lock may already be running the operation.
                 try:
@@ -600,23 +612,32 @@ class Session:
         try:
             await self.client.stop_notify(self.read_characteristic)
         except EOFError as err:
-            _LOGGER.debug("%s: D-Bus stopping notify: %s", self.name, err)
+            _LOGGER.debug(
+                "%s: D-Bus stopping notify: %s", self.name, util._exc_cause(err)
+            )
         except BleakError as err:
-            _LOGGER.debug("%s: Bleak error stopping notify: %s", self.name, err)
+            _LOGGER.debug(
+                "%s: Bleak error stopping notify: %s", self.name, util._exc_cause(err)
+            )
+
+    def _cooldown_remaining(self) -> float:
+        """Return the seconds of cooldown left, 0 or less when none is running."""
+        if not self._enable_cooldown:
+            return 0.0
+        return COOLDOWN_TIME - (monotonic() - self._last_callback_time)
 
     async def _wait_for_cooldown(self) -> None:
-        while (
-            self._enable_cooldown
-            and (cooldown_remain := monotonic() - self._last_callback_time)
-            < COOLDOWN_TIME
-        ):
-            _LOGGER.debug(
-                "%s: Waiting %s for lock to settle", self.name, cooldown_remain
-            )
+        while (remaining := self._cooldown_remaining()) > 0:
+            _LOGGER.debug("%s: Waiting %s for lock to settle", self.name, remaining)
             # If we send commands to fast the lock may crash and stop
             # advertising. This is a workaround to avoid that since
             # it means a battery pull is required to recover.
-            await asyncio.sleep(COOLDOWN_TIME - cooldown_remain)
+            await asyncio.sleep(remaining)
+
+    async def _wait_for_cooldown_or_answer(self, answer: asyncio.Future[bytes]) -> None:
+        """Wait out the cooldown, unless answer completes first."""
+        while not answer.done() and (remaining := self._cooldown_remaining()) > 0:
+            await asyncio.wait((answer,), timeout=remaining)
 
     def _raise_for_bleak_error(self, err: BleakError) -> None:
         """Raise AuthError or DisconnectedError for a BleakError that means one."""
@@ -631,7 +652,6 @@ class Session:
     async def _command_scope(self, command: bytearray) -> AsyncIterator[None]:
         """Prepare a command and guard its exchange against a disconnect."""
         await self._wait_for_cooldown()
-        assert self.cipher_encrypt is not None, "Cipher not set"  # nosec
         self._write_checksum(command)
         disconnected_future = asyncio.get_running_loop().create_future()
         disconnected_futures = self._disconnected_futures
@@ -657,6 +677,20 @@ class Session:
         solicited wait stays armed until a matching frame arrives (or the
         write times out). Without a matcher the first valid frame answers, as
         before.
+        """
+        reply, _ = await self.execute_timed(command, command_name, response_matcher)
+        return reply
+
+    async def execute_timed(
+        self,
+        command: bytearray,
+        command_name: str,
+        response_matcher: Callable[[bytes], bool] | None = None,
+    ) -> tuple[bytes, ExchangeTimes]:
+        """Execute command as execute() does; also return the times of its exchange.
+
+        For a command written more than once, request_written is of the last write
+        before the reply.
         """
         try:
             async with self._command_scope(command):
