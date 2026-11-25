@@ -2109,21 +2109,38 @@ async def test_a_write_that_raises_or_hangs_ends_the_link_only_while_it_is_up(
 
 
 @pytest.mark.asyncio
-async def test_a_disconnect_that_raises_after_a_failed_write_is_logged_at_error(
+@pytest.mark.parametrize(
+    ("error", "level"),
+    [
+        (BleakError("disconnect refused"), logging.DEBUG),
+        (TimeoutError(), logging.ERROR),
+    ],
+    ids=["bleak_error", "timeout"],
+)
+async def test_a_raised_disconnect_after_a_failed_write_logs_debug_only_for_bleak_error(
+    error: Exception,
+    level: int,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The disconnect runs as a task, so its own failure is logged there."""
+    """A BleakError from the disconnect is logged at DEBUG and other errors at ERROR."""
     session = _make_session([])
     session.client.write_gatt_char = AsyncMock(side_effect=BleakError("write failed"))
-    session.client.disconnect = AsyncMock(side_effect=TimeoutError())
+    session.client.disconnect = AsyncMock(side_effect=error)
 
-    with pytest.raises(BleakError, match="write failed"):
-        await _poll(session)
-    await asyncio.sleep(0)
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
+        with pytest.raises(BleakError, match="write failed"):
+            await _poll(session)
+        await asyncio.sleep(0)
 
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert [r.getMessage() for r in errors] == [
-        "testlock: Disconnect after a failed write raised"
+    [record] = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "testlock: Disconnect after a failed write raised"
+    ]
+    assert record.levelno == level
+    assert record.exc_info[1] is error
+    assert not [
+        r for r in caplog.records if r.levelno == logging.ERROR and r is not record
     ]
 
 

@@ -411,6 +411,10 @@ class Session:
         _LOGGER.debug("%s: Disconnecting after a failed write", self.name)
         try:
             await self.client.disconnect()
+        except BleakError:
+            _LOGGER.debug(
+                "%s: Disconnect after a failed write raised", self.name, exc_info=True
+            )
         except Exception:
             _LOGGER.exception("%s: Disconnect after a failed write raised", self.name)
 
