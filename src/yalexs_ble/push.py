@@ -426,6 +426,11 @@ def _securing_display(state: LockState) -> _Display:
     return _Display(LockStatus.LOCKING, LockStatus.LOCKING)
 
 
+def _session_write_failed(lock: Lock) -> bool:
+    """Return whether a write on the lock's session has failed."""
+    return lock.session is not None and lock.session.write_failed
+
+
 @dataclass(frozen=True)
 class _LockOperation:
     """A mechanical command with its transitional display and settled status."""
@@ -1591,7 +1596,7 @@ class PushLock:
         except TimeoutError:
             # The hold is for a request the lock received and did not answer, and a
             # write that did not return ends the link, so its timeout is raised.
-            if lock.session is not None and lock.session.write_failed:
+            if _session_write_failed(lock):
                 raise
             _LOGGER.info(
                 "%s: Battery request timed out; not asking again for %d seconds",
@@ -1650,7 +1655,7 @@ class PushLock:
         except TimeoutError:
             # The hold is for a request the lock received and did not answer, and a
             # write that did not return ends the link, so its timeout is raised.
-            if lock.session is not None and lock.session.write_failed:
+            if _session_write_failed(lock):
                 raise
             _LOGGER.info(
                 "%s: Door status request timed out; not asking again for %d seconds",
@@ -1809,15 +1814,11 @@ class PushLock:
             await lock.lock_status()
             self._record_auth_success()
             return
-        link_was_up = (
-            lock.is_connected
-            and lock.session is not None
-            and not lock.session.write_failed
-        )
+        link_was_up = lock.is_connected and not _session_write_failed(lock)
         try:
             await lock.lock_and_door_status()
         except TimeoutError:
-            if lock.session is not None and lock.session.write_failed:
+            if _session_write_failed(lock):
                 # A write that does not return ends the link, so the poll counts as
                 # a drop, with no lock-only poll.
                 self._count_unanswered_combined_status_poll()
