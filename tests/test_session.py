@@ -149,7 +149,7 @@ async def test_locked_write_clears_slot_on_success() -> None:
         session._notify(0, bytearray(READ_ANSWER))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session._locked_write(bytearray(18), "auto_lock_status")
+    result, _ = await session._locked_write(bytearray(18), "auto_lock_status")
 
     assert result == READ_ANSWER
     assert session._notify_future is None
@@ -216,7 +216,7 @@ async def test_fresh_command_rearms_slot_after_timeout() -> None:
         session._notify(0, bytearray(READ_ANSWER))
 
     session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session._locked_write(bytearray(18), "auto_lock_status")
+    result, _ = await session._locked_write(bytearray(18), "auto_lock_status")
 
     assert result == READ_ANSWER
     assert session._notify_future is None
@@ -1648,7 +1648,7 @@ async def test_a_frame_after_the_cooldown_cannot_answer_a_command_before_its_wri
     # A valid frame that a wait with no matcher would take arrives on the next turn.
     session.loop.call_soon(session._notify, 0, bytearray(READ_ACK))
     async with asyncio.timeout(COOLDOWN_TIME / 2):
-        result = await session._locked_write(bytearray(18), "get_parameter")
+        result, _ = await session._locked_write(bytearray(18), "get_parameter")
 
     assert result == READ_ANSWER
     assert session.client.write_gatt_char.await_count == 1
