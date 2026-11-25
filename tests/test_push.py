@@ -69,6 +69,7 @@ from yalexs_ble.push import (
     SLOW_MAX_INTERVAL,
     SLOW_MIN_INTERVAL,
     SLOW_TIMEOUT,
+    UNREAD_COUNT_LIMIT,
     LogRecordCallback,
     PushLock,
     operation_lock,
@@ -4531,14 +4532,30 @@ async def test_a_drain_that_stops_early_leaves_the_rest_of_the_backlog() -> None
 
 
 @pytest.mark.asyncio
+async def test_the_largest_readable_count_is_read() -> None:
+    """A count of UNREAD_COUNT_LIMIT - 1 is read and counts its records as backlog."""
+    push_lock = _named_push_lock("aa:bb:cc:dd:ee:d6", always_connected=False)
+    _, written = _drain_on_a_real_session(
+        push_lock, [_count_reply(UNREAD_COUNT_LIMIT - 1), _RECORDS[0], _GET_LOG_ERROR]
+    )
+    received: list[tuple[bytes, bool]] = []
+
+    push_lock.register_log_record_callback(_recorder(received))
+    await _drained(push_lock)
+
+    assert _commands(written) == [_COUNT_READ, _GET_LOG, _GET_LOG]
+    assert received == [(_RECORDS[0], True), (_GET_LOG_ERROR, False)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "count", [UNREAD_COUNT_LIMIT, 1500, -1], ids=["limit", "above", "negative"]
+)
 async def test_a_count_that_is_not_a_depth_ends_the_drain_as_a_failure(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, count: int
 ) -> None:
     """A refused count sends no GetLog, stays owed and counts as a failed drain."""
-    push_lock, mock_lock, received = _activity_push_lock([], count=0)
-    mock_lock.unread_event_count = AsyncMock(
-        side_effect=ResponseError("Unread count -559038737 is not a depth")
-    )
+    push_lock, mock_lock, received = _activity_push_lock([], count=count)
     with caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"):
         for _ in range(ACTIVITY_DRAIN_FAILURE_THRESHOLD):
             await _update_and_drain(push_lock, mock_lock)
@@ -4550,7 +4567,7 @@ async def test_a_count_that_is_not_a_depth_ends_the_drain_as_a_failure(
     assert [r.levelno for r in lines] == [logging.DEBUG] * (
         ACTIVITY_DRAIN_FAILURE_THRESHOLD - 1
     ) + [logging.WARNING]
-    assert all("-559038737 is not a depth" in r.getMessage() for r in lines)
+    assert all(f"Unread count {count} is not a depth" in r.getMessage() for r in lines)
     assert not [r for r in caplog.records if "unread count" in r.getMessage()]
 
 

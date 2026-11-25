@@ -44,7 +44,6 @@ from .session import (
     KeycodeError,
     OperationFailedError,
     OperationProgress,
-    ResponseError,
     Session,
     YaleXSBLEError,
 )
@@ -248,8 +247,6 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
 
 
 _GETLOG_MATCHER = _poll_response_matcher(Commands.GETLOG.value)
-# Twice the 512 records the activity log was seen to hold.
-UNREAD_COUNT_LIMIT = 1024
 
 
 class Lock:
@@ -913,14 +910,11 @@ class Lock:
 
     @raise_if_not_connected
     async def unread_event_count(self) -> int:
-        """Return the activity log's unread count."""
+        """Return the activity log's unread count as read."""
         response = await self._poll_status(
             StatusType.LOCK_EVENTS_UNREAD, "unread_event_count"
         )
-        count = util._bytes_to_int(response[0x08:0x0C], signed=True)
-        if count < 0 or count >= UNREAD_COUNT_LIMIT:
-            raise ResponseError(f"Unread count {count} is not a depth")
-        return count
+        return util._bytes_to_int(response[0x08:0x0C], signed=True)
 
     @raise_if_not_connected
     async def battery(self) -> BatteryState:

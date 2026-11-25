@@ -48,7 +48,6 @@ from yalexs_ble.session import (
     OperationFailedError,
     OperationIncompleteError,
     OperationProgress,
-    ResponseError,
     Session,
 )
 from yalexs_ble.util import _simple_checksum
@@ -1107,23 +1106,32 @@ async def test_a_poll_is_not_answered_by_a_frame_of_another_subtype(
     assert [stray_state] in emitted
 
 
+def _built_depth_frame(count: int) -> bytes:
+    """Build a LOCK_EVENTS_UNREAD reply to DEPTH_FRAME's layout, count at [8:12]."""
+    return _with_checksum(
+        "bb02000009000000"
+        + count.to_bytes(4, "little", signed=True).hex()
+        + "000000000200"
+    )
+
+
+_BUILT_COUNTS = (0, 1023, 1024, 1025, 1500, 0x7FFFFFFF, -1)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("frame", "unread", "raises"),
+    ("frame", "unread"),
     [
-        (DEPTH_FRAME, 242, False),
-        # Built to DEPTH_FRAME's layout with 1023 in the count.
-        (_with_checksum("bb02000009000000ff030000000000000200"), 1023, False),
-        # Built to DEPTH_FRAME's layout with 1024 in the count.
-        (_with_checksum("bb0200000900000000040000000000000200"), 1024, True),
-        (NEGATIVE_DEPTH_FRAME, -559038737, True),
+        (DEPTH_FRAME, 242),
+        *((_built_depth_frame(count), count) for count in _BUILT_COUNTS),
+        (NEGATIVE_DEPTH_FRAME, -559038737),
     ],
-    ids=["captured", "largest-accepted", "too-large", "top-bit-set"],
+    ids=["captured", *(str(count) for count in _BUILT_COUNTS), "top-bit-set"],
 )
 async def test_unread_event_count_returns_the_signed_four_byte_count(
-    frame: bytes, unread: int, raises: bool
+    frame: bytes, unread: int
 ) -> None:
-    """The LOCK_EVENTS_UNREAD poll returns [8:12] signed, raising outside 0 to 1023."""
+    """The LOCK_EVENTS_UNREAD poll returns [8:12] signed, as read, from one request."""
     lock, session = _connected_lock()
 
     async def deliver(*_args: object, **_kwargs: object) -> None:
@@ -1132,11 +1140,7 @@ async def test_unread_event_count_returns_the_signed_four_byte_count(
     write = AsyncMock(side_effect=deliver)
     session.client.write_gatt_char = write
 
-    if raises:
-        with pytest.raises(ResponseError, match=f"{unread} is not a depth"):
-            await lock.unread_event_count()
-    else:
-        assert await lock.unread_event_count() == unread
+    assert await lock.unread_event_count() == unread
     (write_call,) = write.await_args_list
     written = write_call.args[1]
     assert (written[0x01], written[0x04]) == (

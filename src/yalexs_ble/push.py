@@ -201,6 +201,8 @@ ACTIVITY_DRAIN_FAILURE_BACKOFF = 3600
 # GetLog reads allowed without a clean GetLogError, counted from the last one;
 # a backlog drain also gets its unread count.
 ACTIVITY_DRAIN_MARGIN = 128
+# Twice the 512 records the activity log was seen to hold.
+UNREAD_COUNT_LIMIT = 1024
 # Seconds we allow the lock to write its first record of a settled change of the
 # displayed lock status.
 ACTIVITY_DRAIN_WINDOW = 2.0
@@ -1901,9 +1903,12 @@ class PushLock:
             # covered, and a backlog armed while this drain waited is counted.
             self._activity_drain_pending = False
             if self._backlog_remaining is None:
-                # A future PR sends ClearLog here for a count refused as too large,
-                # with the same failure handling.
-                return await lock.unread_event_count()
+                count = await lock.unread_event_count()
+                if count < 0 or count >= UNREAD_COUNT_LIMIT:
+                    # A future PR sends ClearLog here for a count refused as too large,
+                    # with the same failure handling.
+                    raise ResponseError(f"Unread count {count} is not a depth")
+                return count
             return await lock.get_log()
 
         ended = False
