@@ -1292,6 +1292,13 @@ async def test_get_keycode_empty_slot_is_none() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_keycode_zero_filled_slot_is_none() -> None:
+    """The Smart Code Handle answers an empty slot with 0x00, not 0xFF."""
+    lock, _ = _keycode_lock([bytes.fromhex("bb39000a0200000000000000000000000000")])
+    assert await lock.get_keycode(2) is None
+
+
+@pytest.mark.asyncio
 async def test_get_keycode_reports_the_lock_error() -> None:
     lock, _ = _keycode_lock([GET_1_NOSPACE])
     with pytest.raises(KeycodeError) as exc_info:
@@ -1335,6 +1342,27 @@ async def test_set_keycode_runs_clear_set_access_commit_in_order() -> None:
     assert access[0x0D] == 0x00
     assert commit[0x04:0x0B] == bytes.fromhex("135790ffffffff")
     assert (commit[0x0B], commit[0x0C], commit[0x0D]) == (200, 0x00, 0x00)
+
+
+@pytest.mark.asyncio
+async def test_set_keycode_writes_the_credential_type_into_every_frame() -> None:
+    """Frames as the Yale Home app sends them to a Smart Code Handle (type 0x05)."""
+    lock, session = _keycode_lock([_result(op) for op in SET_KEYCODE_STEPS])
+    await lock.set_keycode(3, "112233", credential_type=0x05)
+    clear, set_, access, commit = session.sent
+    assert (clear[0x0B], clear[0x0C], clear[0x0D]) == (3, 0x05, 0x00)
+    assert set_[0x04:0x0B] == bytes.fromhex("112233ffffffff")
+    assert set_[0x0C] == 0x05
+    assert (access[0x0C], access[0x0D]) == (0x80, 0x05)
+    assert commit[0x04:0x0B] == bytes.fromhex("112233ffffffff")
+    assert (commit[0x0B], commit[0x0C], commit[0x0D]) == (3, 0x05, 0x00)
+
+
+@pytest.mark.asyncio
+async def test_clear_keycode_with_a_credential_type() -> None:
+    lock, session = _keycode_lock([_result(Commands.KEYCODE_CLEAR.value)])
+    await lock.clear_keycode(3, credential_type=0x05)
+    assert session.sent[0][0x0C] == 0x05
 
 
 @pytest.mark.asyncio
@@ -1403,7 +1431,9 @@ def test_encode_decode_keycode_pin() -> None:
     assert util.decode_keycode_pin(bytes.fromhex("135790ffffffff")) == "135790"
     assert util.decode_keycode_pin(bytes.fromhex("12345fffffffff")) == "12345"
     assert util.decode_keycode_pin(b"\xff" * 7) is None
-    assert util.decode_keycode_pin(bytes(7)) == "0" * 14
+    # All 0x00 is how the Smart Code Handle answers an empty slot; 14 zero
+    # digits is no keypad's PIN.
+    assert util.decode_keycode_pin(bytes(7)) is None
     for malformed in ("1a23ffffffffff", "12f4ffffffffff", "aaaaaaaaaaaaaa"):
         with pytest.raises(ValueError, match="Malformed PIN"):
             util.decode_keycode_pin(bytes.fromhex(malformed))

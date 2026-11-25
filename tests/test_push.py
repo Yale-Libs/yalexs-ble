@@ -281,6 +281,23 @@ def test_battery_reporting(model: str, reporting: bool) -> None:
 
 
 @pytest.mark.parametrize(
+    ("model", "credential_type"),
+    [
+        ("CERES", 0x05),
+        # A suffixed variant of the handle is still the handle.
+        ("CERES-EU", 0x05),
+        # A longer model number is a different model.
+        ("CERES2", 0x00),
+        ("MD-02", 0x00),
+        ("SL-103", 0x00),
+        ("", 0x00),
+    ],
+)
+def test_keypad_credential_type(model: str, credential_type: int) -> None:
+    assert _lock_info(model).keypad_credential_type == credential_type
+
+
+@pytest.mark.parametrize(
     ("model", "door_sense"),
     [
         ("ASL-02", False),
@@ -3570,9 +3587,21 @@ async def test_push_lock_keycode_round_trip() -> None:
         await push_lock.set_keycode(200, "135790")
         await push_lock.clear_keycode(200)
     lock.get_keycode.assert_awaited_once_with(200)
-    lock.set_keycode.assert_awaited_once_with(200, "135790")
-    lock.clear_keycode.assert_awaited_once_with(200)
+    lock.set_keycode.assert_awaited_once_with(200, "135790", credential_type=0x00)
+    lock.clear_keycode.assert_awaited_once_with(200, credential_type=0x00)
     assert push_lock._last_operation_complete_time != NEVER_TIME
+
+
+@pytest.mark.asyncio
+async def test_push_lock_keycode_uses_the_models_credential_type() -> None:
+    """A Smart Code Handle is programmed with the credential type its keypad accepts."""
+    push_lock, lock = _keycode_push_lock()
+    push_lock._lock_info = _lock_info("CERES")
+    with patch.object(push_lock, "_ensure_connected", AsyncMock(return_value=lock)):
+        await push_lock.set_keycode(3, "123412")
+        await push_lock.clear_keycode(3)
+    lock.set_keycode.assert_awaited_once_with(3, "123412", credential_type=0x05)
+    lock.clear_keycode.assert_awaited_once_with(3, credential_type=0x05)
 
 
 @pytest.mark.asyncio
@@ -3611,7 +3640,7 @@ async def test_push_lock_keycode_stopped_in_flight_is_not_sent_again(
 ) -> None:
     push_lock, lock = _keycode_push_lock()
 
-    async def _stopped_in_flight(_slot: int) -> None:
+    async def _stopped_in_flight(_slot: int, **_kwargs: int) -> None:
         push_lock._running = False
         raise DisconnectedError("stopping")
 
@@ -3626,7 +3655,7 @@ async def test_push_lock_keycode_stopped_in_flight_is_not_sent_again(
         await push_lock.clear_keycode(1)
 
     ensure_connected.assert_awaited_once()
-    lock.clear_keycode.assert_awaited_once_with(1)
+    lock.clear_keycode.assert_awaited_once_with(1, credential_type=0x00)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "clear_keycode failed: RuntimeError" in warnings[0].getMessage()

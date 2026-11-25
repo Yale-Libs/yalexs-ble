@@ -730,13 +730,19 @@ class Lock:
             )
         return response
 
-    def _keycode_slot_command(self, opcode: int, pin: bytes, slot: int) -> bytearray:
+    def _keycode_slot_command(
+        self,
+        opcode: int,
+        pin: bytes,
+        slot: int,
+        credential_type: int = KEYCODE_CREDENTIAL_PIN,
+    ) -> bytearray:
         """Build the CLEAR or COMMIT frame: PIN, slot and credential type."""
         assert self.session is not None  # nosec
         cmd = self.session.build_command(opcode)
         util._copy(cmd, pin, destLocation=0x04)
         cmd[0x0B] = slot & 0xFF
-        cmd[0x0C] = KEYCODE_CREDENTIAL_PIN
+        cmd[0x0C] = credential_type
         cmd[0x0D] = slot >> 8
         return cmd
 
@@ -751,36 +757,46 @@ class Lock:
         return util.decode_keycode_pin(response[0x06:0x0D])
 
     @raise_if_not_connected
-    async def clear_keycode(self, slot: int) -> None:
+    async def clear_keycode(
+        self, slot: int, *, credential_type: int = KEYCODE_CREDENTIAL_PIN
+    ) -> None:
         """Clear a keypad slot without needing to know its PIN."""
         validate_keycode_slot(slot)
         blank = b"\xff" * util.KEYCODE_PIN_BYTES
-        cmd = self._keycode_slot_command(Commands.KEYCODE_CLEAR, blank, slot)
+        cmd = self._keycode_slot_command(
+            Commands.KEYCODE_CLEAR, blank, slot, credential_type
+        )
         await self._send_keycode(cmd, "clear_keycode")
 
     @raise_if_not_connected
-    async def set_keycode(self, slot: int, pin: str) -> None:
+    async def set_keycode(
+        self, slot: int, pin: str, *, credential_type: int = KEYCODE_CREDENTIAL_PIN
+    ) -> None:
         """Program a PIN into a keypad slot with an always-valid schedule.
 
         The slot is cleared first, so a KeycodeError from a later step
         leaves the slot empty; the error names the step that failed.
+        ``credential_type`` goes into all four frames; see
+        ``LockInfo.keypad_credential_type`` for the type a model needs.
         """
         validate_keycode_slot(slot)
         encoded = util.encode_keycode_pin(pin)
         assert self.session is not None  # nosec
-        await self.clear_keycode(slot)
+        await self.clear_keycode(slot, credential_type=credential_type)
 
         cmd = self.session.build_command(Commands.KEYCODE_SET)
         util._copy(cmd, encoded, destLocation=0x04)
-        cmd[0x0C] = KEYCODE_CREDENTIAL_PIN
+        cmd[0x0C] = credential_type
         await self._send_keycode(cmd, "set_keycode")
 
         cmd = self.session.build_command(Commands.KEYCODE_ACCESS)
         cmd[0x0C] = KEYCODE_ACCESS_ALWAYS
-        cmd[0x0D] = KEYCODE_CREDENTIAL_PIN
+        cmd[0x0D] = credential_type
         await self._send_keycode(cmd, "set_keycode_access")
 
-        cmd = self._keycode_slot_command(Commands.KEYCODE_COMMIT, encoded, slot)
+        cmd = self._keycode_slot_command(
+            Commands.KEYCODE_COMMIT, encoded, slot, credential_type
+        )
         await self._send_keycode(cmd, "commit_keycode")
 
     async def securemode(self) -> None:

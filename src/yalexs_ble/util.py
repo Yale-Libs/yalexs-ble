@@ -64,8 +64,13 @@ def encode_keycode_pin(pin: str) -> bytes:
 def decode_keycode_pin(data: bytes | bytearray) -> str | None:
     """Unpack a BCD keypad PIN padded with 0xF; None for an empty slot.
 
-    Raises ValueError for a field that is not digits followed by padding.
+    An empty slot is all 0xFF on most locks; the Yale Smart Code Handle
+    (CERES) answers an empty slot with all 0x00 instead, which would otherwise
+    read as the PIN "00000000000000". Raises ValueError for a field that is
+    not digits followed by padding.
     """
+    if not any(data[:KEYCODE_PIN_BYTES]):
+        return None
     field = data[:KEYCODE_PIN_BYTES].hex()
     pin = field.rstrip("f")
     if pin and not pin.isdigit():

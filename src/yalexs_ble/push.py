@@ -26,6 +26,7 @@ from .const import (
     APPLE_MFR_ID,
     HAP_ENCRYPTED_FIRST_BYTE,
     HAP_FIRST_BYTE,
+    KEYPAD_CREDENTIAL_TYPE_PIN,
     LOG_TYPE_GET_LOG_ERROR,
     MANUAL_INTERVENTION_STATUSES,
     SETUP_CONDITION_STATUSES,
@@ -1337,12 +1338,26 @@ class PushLock:
         """
         validate_keycode_slot(slot)
         encode_keycode_pin(pin)
-        await self._run_on_lock("set_keycode", lambda lock: lock.set_keycode(slot, pin))
+        credential_type = self._keypad_credential_type()
+        await self._run_on_lock(
+            "set_keycode",
+            lambda lock: lock.set_keycode(slot, pin, credential_type=credential_type),
+        )
 
     async def clear_keycode(self, slot: int) -> None:
         """Clear a keypad slot."""
         validate_keycode_slot(slot)
-        await self._run_on_lock("clear_keycode", lambda lock: lock.clear_keycode(slot))
+        credential_type = self._keypad_credential_type()
+        await self._run_on_lock(
+            "clear_keycode",
+            lambda lock: lock.clear_keycode(slot, credential_type=credential_type),
+        )
+
+    def _keypad_credential_type(self) -> int:
+        """The keypad credential type of this lock's model, PIN until it is known."""
+        if self._lock_info is None:
+            return KEYPAD_CREDENTIAL_TYPE_PIN
+        return self._lock_info.keypad_credential_type
 
     @operation_lock
     async def _run_on_lock(
