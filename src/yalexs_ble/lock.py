@@ -317,7 +317,9 @@ class Lock:
                 max_attempts=max_attempts,
             )
         except (TimeoutError, BleakError) as err:
-            _LOGGER.error("%s: Failed to connect to the lock: %s", self.name, err)
+            # The caller gets the failure and decides whether to retry, so it
+            # is logged at debug.
+            _LOGGER.debug("%s: Failed to connect to the lock: %s", self.name, err)
             raise
         _LOGGER.debug("%s: Connected", self.name)
 

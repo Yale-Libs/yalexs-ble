@@ -882,14 +882,11 @@ class PushLock:
         await self._execute_disconnect()
 
     async def _async_handle_disconnected(self, exc: Exception) -> None:
-        """Clean up after a disconnect."""
-        _LOGGER.debug("%s: Disconnected due to %s, cleaning up", self.name, exc)
+        """Disconnect after a failed attempt of a retried call."""
         if self._connect_lock.locked():
-            _LOGGER.error(
-                "%s: Disconnected while connection was in progress, ignoring",
-                self.name,
-            )
+            _LOGGER.debug("%s: Connect lock held, skipping cleanup", self.name)
             return
+        _LOGGER.debug("%s: Cleaning up after %s", self.name, exc)
         self._cancel_disconnect_timer()
         await self._execute_disconnect()
 
@@ -911,10 +908,7 @@ class PushLock:
         """Ensure connection to device is established."""
         if self._connect_lock.locked():
             self._reset_disconnect_timer()
-            _LOGGER.debug(
-                "%s: Connection already in progress, waiting for it to complete",
-                self.name,
-            )
+            _LOGGER.debug("%s: Connect lock held", self.name)
         if self.is_connected:
             assert self._client is not None  # nosec
             self._reset_disconnect_timer()
@@ -2272,7 +2266,7 @@ class PushLock:
             wrapped_bleak_exc = BluetoothError(str(ex))
             wrapped_bleak_exc.__cause__ = ex
             self._set_update_state(wrapped_bleak_exc)
-            _LOGGER.debug("%s: not found error updating", self.name, exc_info=True)
+            _LOGGER.error("%s: Failed to connect to the lock: %s", self.name, ex)
         except BleakError as ex:
             wrapped_bleak_exc = BluetoothError(str(ex))
             wrapped_bleak_exc.__cause__ = ex
