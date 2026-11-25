@@ -46,6 +46,16 @@ YALE_MODELS = {
 }
 YALE_MODEL_PREFIXES = ("YUR/",)  # Unity
 
+# The credential type a model's keypad PINs are programmed with in the
+# KEYCODE_CLEAR, KEYCODE_SET, KEYCODE_ACCESS and KEYCODE_COMMIT frames. The
+# Yale Smart Code Handle stores a PIN programmed with the default type 0x00 and
+# reads it back with KEYCODE_GET, but its keypad only accepts PINs programmed
+# with 0x05, the type the Yale Home app sends to it.
+KEYPAD_CREDENTIAL_TYPE_PIN = 0x00
+KEYPAD_CREDENTIAL_TYPES: dict[str, int] = {
+    "CERES": 0x05,  # Smart code handle
+}
+
 # With BATTERY_TIMEOUT_COOLDOWN it may be possible to remove these exclusions
 NO_BATTERY_SUPPORT_MODELS = {
     "SL-103",  # Linus L2
@@ -534,6 +544,14 @@ class LockInfo:
     def battery_reporting(self) -> bool:
         """Check if the lock answers battery status requests."""
         return not self._model_in(NO_BATTERY_SUPPORT_MODELS)
+
+    @property
+    def keypad_credential_type(self) -> int:
+        """The credential type this model's keypad PINs are programmed with."""
+        for model, credential_type in KEYPAD_CREDENTIAL_TYPES.items():
+            if self._model_in({model}):
+                return credential_type
+        return KEYPAD_CREDENTIAL_TYPE_PIN
 
     @property
     def brand(self) -> Brand | None:
