@@ -993,6 +993,10 @@ NEGATIVE_DEPTH_FRAME = _with_checksum("bb02000009000000efbeadde000000000200")
 # state change.
 ACTIVITY_FRAME = _with_checksum("bb2d00008000000000000000000000000000")
 DOOR_ACTIVITY_FRAME = _with_checksum("bb2d00002000000000010000000000000000")
+# Built to the DOOR_AND_LOCK answer layout: subtype at byte[4], lock status
+# at byte[8], door status at byte[9].
+LOCK_AND_DOOR_FRAME = _with_checksum("bb0200002f00000005030000000000000000")
+LOCK_AND_DOOR_INIT_FRAME = _with_checksum("bb0200002f00000005000000000000000000")
 
 
 def _connected_lock(
@@ -1004,7 +1008,7 @@ def _connected_lock(
     between a poll and its matcher needs a real session rather than a mock.
     """
     lock = _make_lock(state_callback)
-    client = MagicMock(is_connected=True)
+    client = MagicMock(is_connected=True, disconnect=AsyncMock())
     session = Session(
         client, "mylock", asyncio.Lock(), set(), lock._internal_state_callback
     )
@@ -1073,6 +1077,13 @@ def test_poll_response_matcher_without_a_subtype_ignores_byte_four() -> None:
             LockStatus.UNLOCKED,
             DEPTH_FRAME,
             242,
+        ),
+        (
+            "lock_and_door_status",
+            LOCK_FRAME,
+            LockStatus.UNLOCKED,
+            LOCK_AND_DOOR_FRAME,
+            (LockStatus.LOCKED, DoorStatus.OPENED),
         ),
     ],
 )
@@ -1640,6 +1651,7 @@ def _make_connected_lock_with_session(
     client = MagicMock()
     client.is_connected = True
     client.write_gatt_char = AsyncMock()
+    client.disconnect = AsyncMock()
     lock.client = client
     lock.secure_session = MagicMock()
     session = Session(
@@ -1977,3 +1989,38 @@ def test_op_response_callback_fires_on_op_responses_not_acks() -> None:
     lock._parse_state(_op_response_frame(Commands.UNLOCK, OperationError.MECH_POSITION))
 
     assert op_calls == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("frame", "emitted", "logged"),
+    [
+        pytest.param(
+            LOCK_AND_DOOR_INIT_FRAME,
+            [LockStatus.LOCKED, DoorStatus.UNKNOWN],
+            [],
+            id="U",
+        ),
+        # A built DOOR_ONLY answer whose door byte is outside the enum.
+        pytest.param(
+            _with_checksum("bb0200122e0000007f000000000000000000"),
+            [DoorStatus.UNKNOWN],
+            ["mylock: Unrecognized door_status_str code: 0x7f"],
+            id="outside-the-enum",
+        ),
+    ],
+)
+def test_only_a_door_byte_outside_the_enum_is_logged(
+    caplog: pytest.LogCaptureFixture,
+    frame: bytes,
+    emitted: list[LockStateValue],
+    logged: list[str],
+) -> None:
+    """Row U: 0x00 publishes UNKNOWN; only a door byte outside the enum is logged."""
+    states: list[list[LockStateValue]] = []
+    lock = _make_lock(lambda values: states.append(list(values)))
+
+    with caplog.at_level(logging.INFO, logger="yalexs_ble.lock"):
+        lock._internal_state_callback(frame)
+
+    assert states == [emitted]
+    assert [line for line in caplog.messages if "Unrecognized" in line] == logged

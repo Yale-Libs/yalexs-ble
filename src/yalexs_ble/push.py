@@ -175,8 +175,18 @@ AUTH_FAILURE_TO_START_REAUTH = 5
 # How long to wait before retrying battery after a timeout (5 minutes)
 BATTERY_TIMEOUT_COOLDOWN = 300
 
+# How long to wait before requesting door status again after a timeout (5 minutes).
+DOOR_STATUS_TIMEOUT_COOLDOWN = 300
+
 # How often to re-poll battery state in always_connected mode (10 minutes)
 BATTERY_REFRESH_INTERVAL = 600
+
+# How long the status poll asks for the lock status alone once the combined
+# poll stands down (24 hours).
+COMBINED_STATUS_POLL_FAILURE_BACKOFF = 86400
+
+# Unanswered combined polls in a row that stand the combined poll down.
+COMBINED_STATUS_POLL_FAILURE_THRESHOLD = 3
 
 # How often to re-read the auto lock setting after a successful read (1 hour).
 # Auto lock is configuration state that changes rarely, so an hourly refresh
@@ -416,6 +426,11 @@ def _securing_display(state: LockState) -> _Display:
     return _Display(LockStatus.LOCKING, LockStatus.LOCKING)
 
 
+def _session_write_failed(lock: Lock) -> bool:
+    """Return whether a write on the lock's session has failed."""
+    return lock.session is not None and lock.session.write_failed
+
+
 @dataclass(frozen=True)
 class _LockOperation:
     """A mechanical command with its transitional display and settled status."""
@@ -528,8 +543,15 @@ class PushLock:
         self._slow_params_set = False
         # Earliest next battery poll attempt (cooldown)
         self._earliest_battery_attempt_time = NEVER_TIME
+        # Earliest next door status request after a timeout (cooldown).
+        self._earliest_door_status_attempt_time = NEVER_TIME
         # Scheduled battery refresh time (in always_connected mode)
         self._next_battery_refresh_time = NEVER_TIME
+        # Earliest next combined lock and door status poll.
+        self._earliest_combined_status_poll_time = float("-inf")
+        # Unanswered combined polls in a row (see
+        # COMBINED_STATUS_POLL_FAILURE_THRESHOLD).
+        self._unanswered_combined_status_polls = 0
         # Auto lock read backoff, mirroring the battery timers above. They
         # persist across reconnects, so a lock that does not answer the read is
         # left alone until its backoff lapses.
@@ -759,20 +781,18 @@ class PushLock:
                 return
             # Connected, so this hands back the link without a connect.
             lock = await self._ensure_connected()
-            info = self._lock_info
-            if info is None:
+            if self._lock_info is None:
                 return
             try:
-                asked = await self._poll_battery(lock, force=True)
-                if not asked and info.door_sense:
-                    await lock.door_status()
-                    asked = True
+                answered = await self._poll_battery(lock, force=True)
+                if not answered:
+                    answered = await self._poll_door_status(lock, force=True)
             except (TimeoutError, *RETRYABLE_EXCEPTIONS) as ex:
                 # The cycle at the floor's end retries and reports the link.
                 _LOGGER.debug("%s: Keep-alive read failed: %s", self.name, ex)
                 return
-            if asked:
-                # A request, so the floor check and the keep-alive count from it.
+            if answered:
+                # Only an answer is known to have restarted the lock's idle window.
                 self._last_operation_complete_time = time.monotonic()
                 self._reschedule_next_keep_alive()
 
@@ -946,6 +966,9 @@ class PushLock:
             # None of the auto lock read state is reset here: the backoff timers,
             # both failure counts, and the pending-response flag all persist
             # across reconnects, so the hold outlives the connection.
+            # The request cooldowns and the combined poll's stand-down survive
+            # the reconnect, so a lock that does not answer is not asked again on
+            # each new connection.
             self._slow_params_set = False
             return self._client
 
@@ -1480,6 +1503,10 @@ class PushLock:
                     lock_state, _project_lock_status(admitted, lock_state), changes
                 )
             elif isinstance(state, DoorStatus):
+                if state is DoorStatus.UNKNOWN:
+                    # An unknown door reading leaves _seen_this_session, so the next
+                    # cycle can ask for the door again.
+                    self._seen_this_session.discard(DoorStatus)
                 if lock_state.door != state:
                     changes["door"] = state
                     self._activity_drain_pending = True
@@ -1531,15 +1558,7 @@ class PushLock:
         _LOGGER.debug("%s: Finished validate", self.name)
 
     async def _poll_battery(self, lock: Lock, *, force: bool = False) -> bool:
-        """Poll battery if needed: periodic refresh, cooldown, errors.
-
-        Battery state requires a poll of the lock to update. In always_connected mode
-        _seen_this_session never clears, so once the refresh deadline passes
-        BatteryState is evicted to force a re-poll -- but only after the cooldown gate.
-        force asks even when the reading is current.
-
-        Returns True if the lock was asked, whether or not it answered.
-        """
+        """Poll the battery if needed; return True only if the lock answered."""
         assert self._lock_info is not None  # nosec
         if not self._lock_info.battery_reporting:
             _LOGGER.debug(
@@ -1574,22 +1593,25 @@ class PushLock:
             await lock.battery()
             self._record_auth_success()
             self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
-        except TimeoutError as err:
+        except TimeoutError:
+            # The hold is for a request the lock received and did not answer, and a
+            # write that did not return ends the link, so its timeout is raised.
+            if _session_write_failed(lock):
+                raise
             _LOGGER.info(
-                "%s: Battery request timed out (%s), will retry in %d "
-                "seconds. Continuing with other updates.",
+                "%s: Battery request timed out; not asking again for %d seconds",
                 self.name,
-                err,
                 BATTERY_TIMEOUT_COOLDOWN,
             )
-            # Set cooldown to prevent repeated timeouts.
             self._earliest_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
+            return False
         except BleakError as err:
             _LOGGER.debug(
-                "%s: Battery request failed (%s), continuing with other updates.",
+                "%s: Battery request failed (%s)",
                 self.name,
                 err,
             )
+            return False
 
         return True
 
@@ -1611,6 +1633,43 @@ class PushLock:
             )
         _LOGGER.debug("Obtained lock info: %s", lock_info)
         return lock_info
+
+    async def _poll_door_status(self, lock: Lock, *, force: bool = False) -> bool:
+        """Request the door status if needed; return True only if the lock answered."""
+        if not self._door_sense_resolved():
+            return False
+        if not force and (
+            DoorStatus in self._seen_this_session or self._combined_status_poll_in_use()
+        ):
+            return False
+        now = time.monotonic()
+        if now < self._earliest_door_status_attempt_time:
+            _LOGGER.debug(
+                "%s: Skipping door status request; not asking again for %d seconds",
+                self.name,
+                self._earliest_door_status_attempt_time - now,
+            )
+            return False
+        try:
+            await lock.door_status()
+        except TimeoutError:
+            # The hold is for a request the lock received and did not answer, and a
+            # write that did not return ends the link, so its timeout is raised.
+            if _session_write_failed(lock):
+                raise
+            _LOGGER.info(
+                "%s: Door status request timed out; not asking again for %d seconds",
+                self.name,
+                DOOR_STATUS_TIMEOUT_COOLDOWN,
+            )
+            self._earliest_door_status_attempt_time = now + DOOR_STATUS_TIMEOUT_COOLDOWN
+            return False
+        self._record_auth_success()
+        return True
+
+    def _door_sense_resolved(self) -> bool:
+        """Return whether the lock is treated as having a door sensor."""
+        return bool(self._lock_info and self._lock_info.door_sense)
 
     def _arm_auto_lock_read_backoff_if_exhausted(self, now: float) -> bool:
         """Arm the read backoff once the failure count hits the limit.
@@ -1688,10 +1747,8 @@ class PushLock:
         try:
             await lock.auto_lock_status()
         except TimeoutError:
-            # Handle the timeout here, as _poll_battery does. A timeout that
-            # reaches _update's retry decorator is read as a lost connection and
-            # forces a reconnect; catching it locally keeps the connection up
-            # and the read on its backoff.
+            # The retry decorator treats a timeout as a lost link, so it is caught
+            # here and counted toward the read's backoff.
             self._auto_lock_read_ack_failures += 1
             self._arm_auto_lock_read_backoff_if_exhausted(now)
             return False
@@ -1714,6 +1771,81 @@ class PushLock:
             self._awaiting_auto_lock_response = True
             self._auto_lock_response_deadline = now + AUTO_LOCK_READ_RESPONSE_TIMEOUT
         return True
+
+    def _combined_status_poll_in_use(self) -> bool:
+        """Return whether the status poll asks for the door status as well."""
+        return (
+            self._running
+            and self._door_sense_resolved()
+            and time.monotonic() >= self._earliest_combined_status_poll_time
+        )
+
+    def _count_unanswered_combined_status_poll(self) -> None:
+        """Count an unanswered combined poll; at the threshold, stand it down."""
+        self._unanswered_combined_status_polls += 1
+        _LOGGER.debug(
+            "%s: Combined status poll unanswered, %d in a row",
+            self.name,
+            self._unanswered_combined_status_polls,
+        )
+        if (
+            self._unanswered_combined_status_polls
+            < COMBINED_STATUS_POLL_FAILURE_THRESHOLD
+        ):
+            return
+        # A door reading from before the stand-down must not hold the
+        # standalone door request off for the rest of the connection.
+        self._seen_this_session.discard(DoorStatus)
+        self._earliest_combined_status_poll_time = (
+            time.monotonic() + COMBINED_STATUS_POLL_FAILURE_BACKOFF
+        )
+        _LOGGER.warning(
+            "%s: The lock has not answered the combined lock and door status "
+            "poll %d times; polling the lock status alone for %d seconds and "
+            "the door status on its own request",
+            self.name,
+            self._unanswered_combined_status_polls,
+            COMBINED_STATUS_POLL_FAILURE_BACKOFF,
+        )
+
+    async def _poll_status(self, lock: Lock) -> None:
+        """Poll the lock status, and the door too while the combined poll is in use."""
+        if not self._combined_status_poll_in_use():
+            await lock.lock_status()
+            self._record_auth_success()
+            return
+        link_was_up = lock.is_connected and not _session_write_failed(lock)
+        try:
+            await lock.lock_and_door_status()
+        except TimeoutError:
+            if _session_write_failed(lock):
+                # A write that does not return ends the link, so the poll counts as
+                # a drop, with no lock-only poll.
+                self._count_unanswered_combined_status_poll()
+                raise
+            # A lock that answers neither poll has shown nothing about the subtype,
+            # so this combined poll is counted only after the lock-only poll answers.
+            await lock.lock_status()
+            self._record_auth_success()
+            self._count_unanswered_combined_status_poll()
+        except RETRYABLE_EXCEPTIONS as err:
+            # TimeoutError is a member of RETRYABLE_EXCEPTIONS, so its clause
+            # stays above this one or the fallback above is never reached.
+            _LOGGER.debug(
+                "%s: Combined status poll failed with %s",
+                self.name,
+                type(err).__name__,
+            )
+            # A poll on a link already down, or one the session refuses after a
+            # failed write, says nothing about the combined subtype.
+            if link_was_up and (
+                isinstance(err, DisconnectedError) or is_disconnected_error(err)
+            ):
+                self._count_unanswered_combined_status_poll()
+            raise
+        else:
+            self._unanswered_combined_status_polls = 0
+            self._record_auth_success()
 
     @operation_lock
     async def _update(self) -> None:
@@ -1744,14 +1876,8 @@ class PushLock:
         # getting into a bad state.
         made_request = await self._poll_battery(lock)
 
-        if (
-            DoorStatus not in self._seen_this_session
-            and self._lock_info
-            and self._lock_info.door_sense
-        ):
+        if await self._poll_door_status(lock):
             made_request = True
-            await lock.door_status()
-            self._record_auth_success()
 
         if await self._read_auto_lock_setting(lock):
             made_request = True
@@ -1766,9 +1892,17 @@ class PushLock:
         # state to keep the connection alive if we are always connected.
         #
         # A post-operation poll asks regardless; the seen reading may be stale.
+        #
+        # While the combined subtype is in use the poll fetches the door status
+        # as well, so a door status not seen this session is a reason to send it
+        # too (see _poll_status).
         if (
             self._force_lock_status_poll
             or LockStatus not in self._seen_this_session
+            or (
+                DoorStatus not in self._seen_this_session
+                and self._combined_status_poll_in_use()
+            )
             or (
                 not made_request
                 and self._always_connected
@@ -1776,10 +1910,9 @@ class PushLock:
             )
         ):
             made_request = True
-            await lock.lock_status()
+            await self._poll_status(lock)
             # Cleared only once a poll answered, so a failed poll retries.
             self._force_lock_status_poll = False
-            self._record_auth_success()
 
         _LOGGER.debug("%s: Finished update", self.name)
 
