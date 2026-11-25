@@ -1688,10 +1688,8 @@ class PushLock:
         try:
             await lock.auto_lock_status()
         except TimeoutError:
-            # Handle the timeout here, as _poll_battery does. A timeout that
-            # reaches _update's retry decorator is read as a lost connection and
-            # forces a reconnect; catching it locally keeps the connection up
-            # and the read on its backoff.
+            # The retry decorator treats a timeout as a lost link, so it is caught
+            # here and counted toward the read's backoff.
             self._auto_lock_read_ack_failures += 1
             self._arm_auto_lock_read_backoff_if_exhausted(now)
             return False

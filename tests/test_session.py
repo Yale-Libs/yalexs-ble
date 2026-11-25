@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -49,7 +49,7 @@ def _make_session(received: list[bytes], key: bytes | None = None) -> Session:
 
     Pass-through crypto by default; with ``key``, the real CBC contexts.
     """
-    client = MagicMock(is_connected=True)
+    client = MagicMock(is_connected=True, disconnect=AsyncMock())
     session = Session(client, "testlock", asyncio.Lock(), set(), received.append)
     if key is None:
         session.decrypt = bytes  # type: ignore[method-assign, assignment]
@@ -132,57 +132,6 @@ async def test_the_answering_frame_reaches_the_callback_before_the_wait() -> Non
     assert result == READ_ACK
     assert received == [READ_ACK]
     assert armed_at_hand_off == [True]
-
-
-@pytest.mark.asyncio
-async def test_corrupt_frame_disarms_the_wait_and_the_command_is_retried() -> None:
-    """A frame that fails the checksum ends the wait, and the write is repeated.
-
-    The corrupt frame resolves the future with a ResponseError, so the matcher
-    must be cleared with it -- otherwise the retry re-arms the wait with the
-    previous command's matcher still in place. The staged operation wait skips
-    corrupt frames instead; this is the plain path, where re-writing a settings
-    command costs nothing.
-    """
-    received: list[bytes] = []
-    session = _make_session(received)
-    matcher = _settings_response_matcher(
-        Commands.READSETTING.value, SettingType.AUTOLOCK.value
-    )
-    frames = [CORRUPT_ANSWER, READ_ANSWER]
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        session._notify(0, bytearray(frames.pop(0)))
-
-    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-    result = await session.execute(bytearray(18), "auto_lock_status", matcher)
-
-    assert result == READ_ANSWER
-    assert session.client.write_gatt_char.await_count == 2
-    # The corrupt frame was withheld from the state callback; only the valid
-    # one reached it, and only it answered.
-    assert received == [READ_ANSWER]
-
-
-@pytest.mark.asyncio
-async def test_corrupt_frame_on_every_attempt_raises_and_leaves_the_slot_empty() -> (
-    None
-):
-    """Three corrupt frames exhaust the retries and the error reaches the caller."""
-    received: list[bytes] = []
-    session = _make_session(received)
-
-    async def deliver(*_args: object, **_kwargs: object) -> None:
-        session._notify(0, bytearray(CORRUPT_ANSWER))
-
-    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
-
-    with pytest.raises(ResponseError):
-        await session._locked_write(bytearray(18), "auto_lock_status")
-
-    assert session.client.write_gatt_char.await_count == 3
-    assert session._notify_future is None
-    assert session._notify_matcher is None
 
 
 def _short_timeout(_seconds: float) -> object:
@@ -421,14 +370,7 @@ async def test_an_unsolicited_invalid_frame_is_withheld_from_state(
 
 @pytest.mark.asyncio
 async def test_a_short_frame_ends_an_armed_wait_and_the_command_is_re_sent() -> None:
-    """A wrong-length frame reaches the waiter instead of costing it a timeout.
-
-    The checksum helper indexes 18 bytes unconditionally, so before the gate a
-    short frame raised IndexError out of the callback with the wait still
-    armed, and the caller paid the whole response timeout before it could try
-    again. The gate ends the wait with a ResponseError, so the command goes
-    out again straight away.
-    """
+    """A short frame fails the wait at once, and the command is written again."""
     received: list[bytes] = []
     session = _make_session(received)
     frames = [bytearray(9), bytearray(READ_ANSWER)]
@@ -536,6 +478,21 @@ def _secure_on_air(frame: bytes | bytearray) -> bytes:
     return encryptor.update(bytes(frame[0x00:0x10])) + bytes(frame[0x10:0x12])
 
 
+def _lock_decryptor(key: bytes, mode: modes.Mode) -> Callable[[bytes], bytes]:
+    """Return a function that decrypts written frames as the lock does."""
+    decryptor = Cipher(algorithms.AES(key), mode).decryptor()
+    return lambda frame: decryptor.update(frame[0x00:0x10]) + frame[0x10:]
+
+
+def _make_secure_session() -> SecureSession:
+    """Create a SecureSession keyed with SESSION_KEY on a mock client."""
+    session = SecureSession(
+        MagicMock(is_connected=True), "testlock", asyncio.Lock(), set(), 1
+    )
+    session.set_key(SESSION_KEY)
+    return session
+
+
 @pytest.mark.asyncio
 async def test_a_secure_session_handshake_frame_still_answers_its_wait() -> None:
     """The authentication path shares _notify, so admission runs on it too.
@@ -545,9 +502,7 @@ async def test_a_secure_session_handshake_frame_still_answers_its_wait() -> None
     callback both run on the handshake. A handshake reply has to clear them,
     and it carries no state callback to fall back on.
     """
-    client = MagicMock(is_connected=True)
-    session = SecureSession(client, "testlock", asyncio.Lock(), set(), 1)
-    session.set_key(SESSION_KEY)
+    session = _make_secure_session()
     # The lock's reply to the key exchange, checksummed as the lock stamps it.
     answer = session.build_command(0x02)
     session._write_checksum(answer)
@@ -561,6 +516,41 @@ async def test_a_secure_session_handshake_frame_still_answers_its_wait() -> None
     assert len(on_air) == RESPONSE_FRAME_LEN
     result = await session.execute(session.build_command(0x01), "KEY_EXCHANGE")
     assert result == bytes(answer)
+
+
+@pytest.mark.parametrize(
+    ("make_session", "mode"),
+    [
+        pytest.param(
+            lambda: _make_session([], SESSION_KEY), modes.CBC(bytes(0x10)), id="cbc"
+        ),
+        pytest.param(_make_secure_session, modes.ECB(), id="secure-ecb"),  # nosec
+    ],
+)
+@pytest.mark.asyncio
+async def test_every_attempt_decrypts_at_the_lock_to_the_command(
+    make_session: Callable[[], Session], mode: modes.Mode
+) -> None:
+    """A retried write decrypts at the lock to the command, as the first one does."""
+    session = make_session()
+    client = session.client
+    decrypt_at_the_lock = _lock_decryptor(SESSION_KEY, mode)
+    command = session.build_command(Commands.GETSTATUS)
+    expected = bytearray(command)
+    session._write_checksum(expected)
+    at_the_lock: list[bytes] = []
+
+    async def deliver(_char: object, frame: bytes, _response: bool) -> None:
+        at_the_lock.append(decrypt_at_the_lock(frame))
+        # A short frame fails each attempt's wait, so all three attempts are written.
+        session._notify(0, bytearray(9))
+
+    client.write_gatt_char = AsyncMock(side_effect=deliver)
+
+    with pytest.raises(ResponseError):
+        await session.execute(command, "lock_status")
+
+    assert at_the_lock == [expected] * 3
 
 
 @pytest.mark.asyncio
@@ -668,6 +658,7 @@ def _make_operation_session(
     client = MagicMock()
     client.is_connected = True
     client.write_gatt_char = AsyncMock()
+    client.disconnect = AsyncMock()
     session = Session(client, "mylock", asyncio.Lock(), set(), state_callback)
     session.cipher_encrypt = Cipher(
         algorithms.AES(bytes(16)),
@@ -726,6 +717,8 @@ async def test_execute_operation_happy_path() -> None:
 
     assert result == bytes(op_response)
     assert client.write_gatt_char.await_count == 1
+    frame = client.write_gatt_char.await_args.args[1]
+    assert _lock_decryptor(bytes(16), modes.CBC(bytes(16)))(frame) == command
     assert progress.write_attempted is True
     assert progress.acknowledged is True
     write_cb.assert_called_once()
@@ -1489,6 +1482,43 @@ async def test_cooldown_paces_a_command_behind_the_last_frame(
     assert slept == [pytest.approx(COOLDOWN_TIME - 0.2)]
 
 
+def _patch_session_clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
+    """Patch monotonic in session.py to return clock["now"], which starts at 1000.0."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: clock["now"])
+    return clock
+
+
+@pytest.mark.asyncio
+async def test_the_cooldown_debug_line_gives_the_seconds_left(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cooldown debug line gives the seconds left, and the wait sleeps for them."""
+    session, _ = _make_operation_session()
+    session.enable_cooldown()
+    clock = _patch_session_clock(monkeypatch)
+    # These values are exact in binary, and the gap differs from the seconds left,
+    # so the line shows which of the two it gives.
+    session._last_callback_time = clock["now"] - 0.0625
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+        clock["now"] += delay
+
+    monkeypatch.setattr("yalexs_ble.session.asyncio.sleep", fake_sleep)
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
+        await session._wait_for_cooldown()
+
+    remaining = COOLDOWN_TIME - 0.0625
+    assert [
+        (r.levelname, r.getMessage())
+        for r in caplog.records
+        if "for lock to settle" in r.getMessage()
+    ] == [("DEBUG", f"mylock: Waiting {remaining} for lock to settle")]
+    assert slept == [remaining]
+
+
 @pytest.mark.asyncio
 async def test_execute_operation_pays_the_cooldown_before_its_write(
     monkeypatch: pytest.MonkeyPatch,
@@ -1535,6 +1565,93 @@ async def test_execute_operation_pays_the_cooldown_before_its_write(
 
     assert result == bytes(op_response)
     assert slept == [pytest.approx(COOLDOWN_TIME - 0.2)]
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_frame_ends_the_wait_and_the_re_send_waits_out_the_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-send waits COOLDOWN_TIME after the last frame; a new frame restarts it."""
+    received: list[bytes] = []
+    session = _make_session(received)
+    session.enable_cooldown()
+    clock = _patch_session_clock(monkeypatch)
+    matcher = _settings_response_matcher(
+        Commands.READSETTING.value, SettingType.AUTOLOCK.value
+    )
+    frames = [CORRUPT_ANSWER, READ_ANSWER]
+    written_at: list[float] = []
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        written_at.append(clock["now"])
+        session._notify(0, bytearray(frames.pop(0)))
+
+    frame_during_pause = [READ_ACK]
+
+    async def fake_wait(_futures: object, timeout: float) -> None:
+        if frame_during_pause:
+            # A frame not answering the command arrives halfway through the pause.
+            clock["now"] += timeout / 2
+            session._notify(0, bytearray(frame_during_pause.pop()))
+        else:
+            clock["now"] += timeout
+
+    monkeypatch.setattr("yalexs_ble.session.asyncio.wait", fake_wait)
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    result = await session.execute(bytearray(18), "get_parameter", matcher)
+
+    assert result == READ_ANSWER
+    assert written_at == [1000.0, pytest.approx(1000.0 + 1.5 * COOLDOWN_TIME)]
+    # The corrupt frame was withheld from the state callback.
+    assert received == [READ_ACK, READ_ANSWER]
+
+
+@pytest.mark.asyncio
+async def test_an_answer_during_the_re_send_pause_is_taken_without_a_re_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The previous write's answer, arriving during the pause, ends it and is taken."""
+    received: list[bytes] = []
+    session = _make_session(received)
+    session.enable_cooldown()
+    # The clock stands still, so only the answer can end the pause.
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: 1000.0)
+
+    async def deliver(*_args: object, **_kwargs: object) -> None:
+        session._notify(0, bytearray(CORRUPT_ANSWER))
+        # The answer lands after the corrupt frame has ended the first wait.
+        session.loop.call_soon(session._notify, 0, bytearray(READ_ANSWER))
+
+    session.client.write_gatt_char = AsyncMock(side_effect=deliver)
+    async with asyncio.timeout(COOLDOWN_TIME / 2):
+        result = await session.execute(bytearray(18), "get_parameter")
+
+    assert result == READ_ANSWER
+    assert session.client.write_gatt_char.await_count == 1
+    assert received == [READ_ANSWER]
+
+
+@pytest.mark.asyncio
+async def test_a_frame_after_the_cooldown_cannot_answer_a_command_before_its_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first attempt is written without the re-send pause."""
+    session = _make_session([])
+    session.enable_cooldown()
+    monkeypatch.setattr("yalexs_ble.session.monotonic", lambda: 1000.0)
+    # A frame arrived after execute() had waited out its cooldown, while the command
+    # waited for the session lock, so the test calls _locked_write directly.
+    session._last_callback_time = 1000.0
+    session.client.write_gatt_char = AsyncMock(
+        side_effect=_write_delivering(session, [bytearray(READ_ANSWER)])
+    )
+    # A valid frame that a wait with no matcher would take arrives on the next turn.
+    session.loop.call_soon(session._notify, 0, bytearray(READ_ACK))
+    async with asyncio.timeout(COOLDOWN_TIME / 2):
+        result = await session._locked_write(bytearray(18), "get_parameter")
+
+    assert result == READ_ANSWER
+    assert session.client.write_gatt_char.await_count == 1
 
 
 # =========================================================================== #
@@ -1845,13 +1962,7 @@ async def test_execute_operation_rejects_a_used_progress_record(
 
 @pytest.mark.asyncio
 async def test_execute_operation_not_connected_raises_disconnected() -> None:
-    """The pre-write connected-guard raises, converted to DisconnectedError.
-
-    The one exit taken before the write call, so it is where write_attempted
-    stays False: a caller that must never re-send a command reads that
-    record, and every later exit has to report the command as possibly
-    delivered.
-    """
+    """An operation on a down link raises DisconnectedError with no write attempted."""
     session, client = _make_operation_session()
     client.is_connected = False
     progress = OperationProgress()
@@ -1894,6 +2005,143 @@ async def test_errored_write_still_reports_the_write_as_attempted() -> None:
 
     assert progress.write_attempted is True
     assert progress.acknowledged is False
+
+
+def _poll(session: Session) -> Awaitable[bytes]:
+    return session.execute(session.build_command(Commands.GETSTATUS), "lock_status")
+
+
+def _operation(session: Session) -> Awaitable[bytes]:
+    return session.execute_operation(
+        session.build_operation_command(Commands.LOCK, 0x04),
+        "force_securemode",
+        ack_matcher=_ack_matcher(0x0B, 0x04),
+        response_matcher=_operation_response_matcher(0x0B),
+        response_timeout=5.0,
+        progress=OperationProgress(),
+    )
+
+
+async def _never_returns(*_args: object, **_kwargs: object) -> None:
+    await asyncio.Event().wait()
+
+
+def _lose_the_link(client: MagicMock) -> Callable[..., Awaitable[None]]:
+    async def write(*_args: object, **_kwargs: object) -> None:
+        client.is_connected = False
+        raise BleakError("write failed")
+
+    return write
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run", "write", "raised", "raised_next", "writes", "disconnects"),
+    [
+        pytest.param(
+            _poll,
+            lambda _client: BleakError("write failed"),
+            BleakError,
+            DisconnectedError,
+            1,
+            1,
+            id="poll-write-raises",
+        ),
+        pytest.param(
+            _poll,
+            lambda _client: _never_returns,
+            TimeoutError,
+            DisconnectedError,
+            1,
+            1,
+            id="poll-write-hangs",
+        ),
+        pytest.param(
+            _operation,
+            lambda _client: BleakError("write failed"),
+            BleakError,
+            DisconnectedError,
+            1,
+            1,
+            id="operation-write-raises",
+        ),
+        pytest.param(
+            _poll,
+            lambda _client: None,
+            TimeoutError,
+            TimeoutError,
+            2,
+            0,
+            id="poll-answer-missing",
+        ),
+        pytest.param(
+            _poll,
+            _lose_the_link,
+            BleakError,
+            DisconnectedError,
+            1,
+            0,
+            id="poll-link-down-during-write",
+        ),
+    ],
+)
+async def test_a_write_that_raises_or_hangs_ends_the_link_only_while_it_is_up(
+    run: Callable[[Session], Awaitable[bytes]],
+    write: Callable[[MagicMock], object],
+    raised: type[BaseException],
+    raised_next: type[BaseException],
+    writes: int,
+    disconnects: int,
+) -> None:
+    """A write that raises or hangs ends a live link and the next command is refused."""
+    session = _make_session([])
+    session.client.write_gatt_char = AsyncMock(side_effect=write(session.client))
+
+    with patch.object(util, "asyncio_timeout", _short_timeout):
+        with pytest.raises(raised):
+            await run(session)
+        with pytest.raises(raised_next):
+            await run(session)
+    await asyncio.sleep(0)
+
+    assert session.client.write_gatt_char.await_count == writes
+    assert session.client.disconnect.await_count == disconnects
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "level"),
+    [
+        (BleakError("disconnect refused"), logging.DEBUG),
+        (TimeoutError(), logging.ERROR),
+    ],
+    ids=["bleak_error", "timeout"],
+)
+async def test_a_raised_disconnect_after_a_failed_write_logs_debug_only_for_bleak_error(
+    error: Exception,
+    level: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A BleakError from the disconnect is logged at DEBUG and other errors at ERROR."""
+    session = _make_session([])
+    session.client.write_gatt_char = AsyncMock(side_effect=BleakError("write failed"))
+    session.client.disconnect = AsyncMock(side_effect=error)
+
+    with caplog.at_level(logging.DEBUG, logger="yalexs_ble.session"):
+        with pytest.raises(BleakError, match="write failed"):
+            await _poll(session)
+        await asyncio.sleep(0)
+
+    [record] = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "testlock: Disconnect after a failed write raised"
+    ]
+    assert record.levelno == level
+    assert record.exc_info[1] is error
+    assert not [
+        r for r in caplog.records if r.levelno == logging.ERROR and r is not record
+    ]
 
 
 @pytest.mark.asyncio
