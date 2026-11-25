@@ -4,7 +4,7 @@ import asyncio
 import bisect
 import logging
 import os
-from collections.abc import AsyncGenerator, Callable, Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, TypeVar, cast
 
 from bleak import BleakError
@@ -18,7 +18,6 @@ from bleak_retry_connector import (
 from . import util
 from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
-    LOG_TYPE_GET_LOG_ERROR,
     MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
@@ -45,7 +44,6 @@ from .session import (
     KeycodeError,
     OperationFailedError,
     OperationProgress,
-    ResponseError,
     Session,
     YaleXSBLEError,
 )
@@ -54,9 +52,6 @@ _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
 LOCK_INFO_ATTEMPTS = 2
-
-# Upper bound on the records read in one drain of the activity log
-MAX_ACTIVITY_RECORDS = 32
 
 # Operation byte that makes an Unlock command an unlatch (retract the latch).
 UNLATCH_OPERATION_BYTE = 0x0A
@@ -251,10 +246,6 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
     return _matches
 
 
-class ActivityLogOverrunError(ResponseError):
-    """The activity log did not end within the read cap."""
-
-
 _GETLOG_MATCHER = _poll_response_matcher(Commands.GETLOG.value)
 
 
@@ -286,6 +277,9 @@ class Lock:
         self._disconnected = False
         self._disconnect_callback = disconnect_callback
         self._disconnected_futures: set[asyncio.Future[None]] = set()
+        # Both sessions add their failed-write disconnects to this set, so
+        # disconnect() still waits for one after the sessions are dropped.
+        self._failed_write_disconnects: set[asyncio.Task[None]] = set()
 
     def set_name(self, name: str) -> None:
         self.name = name
@@ -326,6 +320,7 @@ class Lock:
             self.name,
             self._lock,
             self._disconnected_futures,
+            self._failed_write_disconnects,
             self._internal_state_callback,
         )
         self.secure_session = SecureSession(
@@ -333,6 +328,7 @@ class Lock:
             self.name,
             self._lock,
             self._disconnected_futures,
+            self._failed_write_disconnects,
             self.key_index,
         )
         session = self.session
@@ -919,17 +915,11 @@ class Lock:
 
     @raise_if_not_connected
     async def unread_event_count(self) -> int:
-        """Read the activity log's unread count; the read removes no record.
-
-        A negative count, signed at bytes 8 to 11, is not a depth and raises.
-        """
+        """Return the activity log's unread count as read."""
         response = await self._poll_status(
             StatusType.LOCK_EVENTS_UNREAD, "unread_event_count"
         )
-        count = util._bytes_to_int(response[0x08:0x0C], signed=True)
-        if count < 0:
-            raise ResponseError(f"Unread count {count} is not a depth")
-        return count
+        return util._bytes_to_int(response[0x08:0x0C], signed=True)
 
     @raise_if_not_connected
     async def battery(self) -> BatteryState:
@@ -965,44 +955,47 @@ class Lock:
             _GETLOG_MATCHER,
         )
 
-    async def drain_lock_activity(self) -> AsyncGenerator[bytes]:
-        """Yield each GetLog reply unchanged, ending after the GetLogError record.
-
-        The next GetLog is sent when the caller asks for the next reply. Raises
-        ActivityLogOverrunError past the read cap.
-        """
-        if not self.is_connected:
-            raise DisconnectedError("Lock is not connected")
-        _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
-        for _ in range(MAX_ACTIVITY_RECORDS):
-            response = await self.get_log()
-            yield response
-            if response[0x04] == LOG_TYPE_GET_LOG_ERROR:
-                _LOGGER.debug("%s: Finished drain_lock_activity", self.name)
-                return
-        raise ActivityLogOverrunError(
-            f"{self.name}: Activity log did not end within {MAX_ACTIVITY_RECORDS} reads"
-        )
-
     async def disconnect(self) -> None:
-        """Disconnect from the lock."""
+        """Disconnect from the lock; wait for any disconnect a failed write started."""
         _LOGGER.debug("%s: Disconnecting from the lock", self.name)
-        if not self.client or not self.client.is_connected:
-            return
+        # While a failed write's disconnect runs, the answer to a second request can
+        # end the next client's link to the address.
+        if self._link_up and not self._running_failed_write_disconnects():
+            try:
+                await self._shutdown_connection()
+            finally:
+                # A write that fails with the link up during the shutdown starts a
+                # disconnect after the check above.
+                if not self._running_failed_write_disconnects():
+                    await self._request_disconnect()
+        await self._wait_for_disconnect_after_failed_write()
 
+    @property
+    def _link_up(self) -> bool:
+        """Return True if the BLE client's link is up."""
+        return bool(self.client and self.client.is_connected)
+
+    async def _request_disconnect(self) -> None:
+        """Send a disconnect request, logging a BleakError it raises."""
+        assert self.client is not None  # nosec
         try:
-            await self._shutdown_connection()
+            await self.client.disconnect()
         except BleakError:
             _LOGGER.debug(
-                "%s: Failed to shutdown connection to lock", self.name, exc_info=True
+                "%s: Failed to disconnect from lock", self.name, exc_info=True
             )
-        finally:
-            try:
-                await self.client.disconnect()
-            except BleakError:
-                _LOGGER.debug(
-                    "%s: Failed to disconnect from lock", self.name, exc_info=True
-                )
+
+    def _running_failed_write_disconnects(self) -> set[asyncio.Task[None]]:
+        """Return the failed-write disconnects of either session still running."""
+        return {task for task in self._failed_write_disconnects if not task.done()}
+
+    async def _wait_for_disconnect_after_failed_write(self) -> None:
+        """Wait for running failed-write disconnects, then disconnect a link left up."""
+        if pending := self._running_failed_write_disconnects():
+            await asyncio.wait(pending)
+            # A disconnect that raised can leave the link up.
+            if self._link_up:
+                await self._request_disconnect()
 
     async def _shutdown_connection(self) -> None:
         """Shutdown the connection."""

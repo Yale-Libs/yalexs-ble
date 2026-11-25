@@ -8,6 +8,7 @@ from functools import partial
 from typing import Self
 
 from .const import (
+    GET_LOG_ERROR_DIRTY_BIT,
     RESPONSE_FRAME_LEN,
     VALUE_TO_DOOR_STATUS,
     VALUE_TO_LOCK_STATUS,
@@ -505,7 +506,7 @@ class GetLogError(LogRecord):
             error=bit_fields & 0x07,
             key_slot=raw[7],
             log_count=bit_fields >> 4,
-            dirty_bit=bit_fields >> 3 & 0x01,
+            dirty_bit=int(bool(bit_fields & GET_LOG_ERROR_DIRTY_BIT)),
             dirty_bit_set_time=_u32(raw, 8),
             dirty_bit_cleared_time=_u32(raw, 12),
         )

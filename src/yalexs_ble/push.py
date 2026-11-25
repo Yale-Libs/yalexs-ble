@@ -21,12 +21,12 @@ from bleak_retry_connector import (
 )
 from lru import LRU  # pylint: disable=no-name-in-module
 
-from .activity_log import LogRecord, parse_log_event_packet
+from . import activity_capture
+from .activity_log import GetLogError, LogRecord, parse_log_event_packet
 from .const import (
     APPLE_MFR_ID,
     HAP_ENCRYPTED_FIRST_BYTE,
     HAP_FIRST_BYTE,
-    LOG_TYPE_GET_LOG_ERROR,
     MANUAL_INTERVENTION_STATUSES,
     SETUP_CONDITION_STATUSES,
     YALE_MFR_IDS,
@@ -42,7 +42,7 @@ from .const import (
     LockStateValue,
     LockStatus,
 )
-from .lock import ActivityLogOverrunError, Lock, validate_keycode_slot
+from .lock import Lock, validate_keycode_slot
 from .session import (
     AuthError,
     BluetoothError,
@@ -195,16 +195,19 @@ AUTO_LOCK_READ_FAILURE_BACKOFF = 86400
 # Ack timeouts and response timeouts both count toward this one threshold.
 AUTO_LOCK_READ_FAILURE_THRESHOLD = 3
 
-# Consecutive failed activity drains before the drain is left alone for a
-# while; a lock whose log never ends would otherwise cost 32 reads per update.
+# Failed drains in a row before the drain backs off for FAILURE_BACKOFF seconds.
 ACTIVITY_DRAIN_FAILURE_THRESHOLD = 3
 ACTIVITY_DRAIN_FAILURE_BACKOFF = 3600
-# Delay before the first drain, so the first update is not held up by the
-# backlog and has freed the adapter slot before the lock is asked again.
-ACTIVITY_PRIME_DELAY = 10.0
-# Consecutive drains that read records but never reach the end marker before
-# the log counts as one that never ends rather than a deep backlog.
-ACTIVITY_DRAIN_MAX_OVERRUNS = 8
+# GetLog reads allowed without a clean GetLogError, counted from the last one;
+# a backlog drain also gets its unread count.
+ACTIVITY_DRAIN_MARGIN = 128
+# Twice the 512 records the activity log was seen to hold.
+UNREAD_COUNT_LIMIT = 1024
+# Seconds we allow the lock to write its first record of a settled change of the
+# displayed lock status.
+ACTIVITY_DRAIN_WINDOW = 2.0
+# Seconds after which the drain warns that a log record callback has not returned.
+LOG_RECORD_CALLBACK_WARNING_TIME = 2.0
 
 # Receives each decoded activity log record and its backlog flag.
 LogRecordCallback = Callable[[LogRecord, bool], Awaitable[None]]
@@ -244,6 +247,15 @@ def _select_yale_payload(
     return min(present, key=lambda item: (len(item[1]) != 1, not item[1]))
 
 
+class _ActivityDrainReadError(Exception):
+    """Raised by a drain read that failed, once the failure is logged."""
+
+
+async def _get_log(lock: Lock) -> bytes:
+    """Read the lock's oldest activity log record."""
+    return await lock.get_log()
+
+
 def operation_lock(func: WrapFuncType) -> WrapFuncType:
     """Define a wrapper to only allow a single operation at a time."""
 
@@ -278,6 +290,34 @@ class AuthFailureHistory:
 
 
 _AUTH_FAILURE_HISTORY = AuthFailureHistory()
+
+
+class _PendingTeardowns:
+    """Hold the teardown task of the last stop for each address until it ends."""
+
+    def __init__(self) -> None:
+        """Init the record."""
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+
+    def pending(self, address: str) -> asyncio.Task[None] | None:
+        """Return the teardown held for the address, whatever its letter case."""
+        return self._tasks.get(address.upper())
+
+    def record(self, address: str, task: asyncio.Task[None]) -> None:
+        """Hold task as the address's teardown until it ends."""
+        key = address.upper()
+        self._tasks[key] = task
+        task.add_done_callback(functools.partial(self._forget, key))
+
+    def _forget(self, key: str, task: asyncio.Task[None]) -> None:
+        """Remove the key's entry if it still holds task."""
+        if self._tasks.get(key) is task:
+            del self._tasks[key]
+
+
+# Every PushLock shares it, because a stopped instance's teardown can drop another
+# instance's connection to the same address.
+_PENDING_TEARDOWNS = _PendingTeardowns()
 
 
 def retry_bluetooth_connection_error(
@@ -495,8 +535,15 @@ class PushLock:
         # the unread count.
         self._backlog_remaining: int | None = None
         self._activity_drain_pending = False
-        self._activity_drain_failures = self._activity_overruns = 0
+        self._last_settled_lock_change_time = NEVER_TIME
+        # When the drain window ends: ACTIVITY_DRAIN_WINDOW after the last settled
+        # lock change, and NEVER_TIME once a record, a GetLog reply other than a
+        # GetLogError, is read after it.
+        self._activity_drain_window_end = NEVER_TIME
+        self._activity_drain_failures = 0
         self._earliest_activity_drain_time = NEVER_TIME
+        self._activity_drain_task: asyncio.Task[None] | None = None
+        self._activity_drain_read_holds_lock = False
         self._update_task: asyncio.Task[None] | None = None
         self.loop = asyncio.get_running_loop()
         self._cancel_deferred_update: asyncio.TimerHandle | None = None
@@ -666,16 +713,13 @@ class PushLock:
     ) -> Callable[[], None]:
         """Register an async callback for every log record and its backlog flag.
 
-        Returns the remover. Callbacks run under the operation lock, so one must
-        not await a command of this PushLock.
+        Returns the remover.
         """
-        if not self._activity_callbacks:
-            self._backlog_remaining = None
-            self._activity_drain_pending = True
-            if self._running and self._lock_info is not None:
-                # Past the first update, so nothing else would drain soon.
-                self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
+        arms_backlog = not self._activity_callbacks
         self._activity_callbacks.append(callback)
+        if arms_backlog:
+            self._backlog_remaining = None
+            self._owe_activity_drain()
 
         def unregister_log_record_callback() -> None:
             self._activity_callbacks.remove(callback)
@@ -829,7 +873,7 @@ class PushLock:
         )
 
     async def _execute_forced_disconnect(self, reason: str) -> None:
-        """Execute forced disconnection."""
+        """Execute forced disconnection and wait for the canceled drain task to end."""
         self._cancel_disconnect_timer()
         _LOGGER.debug("%s: Executing forced disconnect: %s", self.name, reason)
         if (update_task := self._update_task) and not update_task.done():
@@ -838,6 +882,8 @@ class PushLock:
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await update_task
         await self._execute_disconnect()
+        if (drain := self._activity_drain_task) is not None:
+            await asyncio.wait((drain,))
 
     def _disconnect_with_timer(self, timeout: float) -> None:
         """
@@ -947,6 +993,7 @@ class PushLock:
             # both failure counts, and the pending-response flag all persist
             # across reconnects, so the hold outlives the connection.
             self._slow_params_set = False
+            self._owe_activity_drain()
             return self._client
 
     async def securemode(self) -> None:
@@ -1135,11 +1182,20 @@ class PushLock:
         self._jammed_hold_deadline = NEVER_TIME
         self._cancel_jam_hold_timer()
 
+    def _a_command_holds_the_lock(self) -> bool:
+        """True while a holder other than a drain read has the operation lock.
+
+        A lock operation's exit clears a cycle armed now, so the cycle retries;
+        a drain read hands the lock back, so the cycle queues behind it.
+        """
+        return (
+            self._operation_lock.locked() and not self._activity_drain_read_holds_lock
+        )
+
     def _jam_hold_ended(self) -> None:
         """Poll the lock now that the display hold has ended."""
         self._jam_hold_timer = None
-        if self._operation_lock.locked():
-            # The operation's exit would clear a cycle armed now, so retry.
+        if self._a_command_holds_the_lock():
             self._schedule_jam_hold_timer(OPERATION_IN_PROGRESS_DEFER_SECONDS)
             return
         # Forced: the held status already counts as this session's reading.
@@ -1390,10 +1446,6 @@ class PushLock:
         """Mark an operation as complete and reset timers."""
         self._last_operation_complete_time = now
         self._clear_reconnect_backoff()
-        if self._activity_callbacks and self._backlog_remaining is None:
-            # A lock operation cancelled any pending update, the one that reads
-            # the unread count included.
-            self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
         self._reset_disconnect_timer()
         self._reschedule_next_keep_alive()
 
@@ -1425,7 +1477,12 @@ class PushLock:
             self._seen_this_session.discard(LockStatus)
         if lock_state.lock != display.lock:
             changes["lock"] = display.lock
-            self._activity_drain_pending = True
+            if display.settled:
+                self._last_settled_lock_change_time = time.monotonic()
+                self._activity_drain_window_end = (
+                    self._last_settled_lock_change_time + ACTIVITY_DRAIN_WINDOW
+                )
+                self._owe_activity_drain()
         if lock_state.secure != display.secure:
             changes["secure"] = display.secure
 
@@ -1482,7 +1539,7 @@ class PushLock:
             elif isinstance(state, DoorStatus):
                 if lock_state.door != state:
                     changes["door"] = state
-                    self._activity_drain_pending = True
+                    self._owe_activity_drain()
             elif isinstance(state, BatteryState):
                 if lock_state.battery != state:
                     changes["battery"] = state
@@ -1524,9 +1581,15 @@ class PushLock:
         )
 
     async def validate(self) -> None:
-        """Validate lock credentials."""
+        """Validate the lock credentials by running an update."""
         _LOGGER.debug("%s: Starting validate", self.name)
-        await self._update()
+        try:
+            await self._update()
+        finally:
+            # A later disconnect of this link by the timer can drop the next
+            # connection to the address.
+            self._cancel_disconnect_timer()
+            await self._execute_disconnect()
         self._clear_reconnect_backoff()
         _LOGGER.debug("%s: Finished validate", self.name)
 
@@ -1688,10 +1751,8 @@ class PushLock:
         try:
             await lock.auto_lock_status()
         except TimeoutError:
-            # Handle the timeout here, as _poll_battery does. A timeout that
-            # reaches _update's retry decorator is read as a lost connection and
-            # forces a reconnect; catching it locally keeps the connection up
-            # and the read on its backoff.
+            # The retry decorator treats a timeout as a lost link, so it is caught
+            # here and counted toward the read's backoff.
             self._auto_lock_read_ack_failures += 1
             self._arm_auto_lock_read_backoff_if_exhausted(now)
             return False
@@ -1735,6 +1796,8 @@ class PushLock:
             "%s: Starting update (has_lock_info: %s)", self.name, has_lock_info
         )
         lock = await self._ensure_connected()
+        # A drain that failed while the link stayed up is still owed; this is its retry.
+        self._start_activity_drain()
         if not self._lock_info:
             self._lock_info = await self._probe_lock_info(lock)
 
@@ -1769,11 +1832,7 @@ class PushLock:
         if (
             self._force_lock_status_poll
             or LockStatus not in self._seen_this_session
-            or (
-                not made_request
-                and self._always_connected
-                and not self._activity_drain_due()
-            )
+            or (not made_request and self._always_connected)
         ):
             made_request = True
             await lock.lock_status()
@@ -1787,11 +1846,8 @@ class PushLock:
         # Notify consumers that the update is complete, even if nothing changed.
         self._callback_state(current)
 
-        if await self._poll_activity(lock, first_update=not has_lock_info):
-            made_request = True
-
         if not has_lock_info:
-            # On first update free up the connection
+            # On first update free up the connection once it is idle
             # so we can bring other locks online if
             # the bluetooth adapter is out of connections
             # slots. We reset the timer to a low number
@@ -1815,102 +1871,226 @@ class PushLock:
             and time.monotonic() >= self._earliest_activity_drain_time
         )
 
-    async def _poll_activity(self, lock: Lock, *, first_update: bool) -> bool:
-        """Drain the activity log if one is due; True if the lock was asked."""
-        if not self._activity_drain_due():
+    def _activity_drain_window_open(self, started: float) -> bool:
+        """True for a read started before the drain window's end."""
+        return started < self._activity_drain_window_end
+
+    def _owe_activity_drain(self) -> None:
+        """Mark the activity log for a drain and start the drain task if one is due."""
+        self._activity_drain_pending = True
+        self._start_activity_drain()
+
+    def _start_activity_drain(self) -> None:
+        """Start the drain task when a drain is due on a link that is up."""
+        task = self._activity_drain_task
+        if (
+            not self._running
+            or not self.is_connected
+            or not self._activity_drain_due()
+            or (task is not None and not task.done())
+        ):
+            return
+        self._activity_drain_task = self._logged_task(self._drain_activity_while_due())
+
+    async def _drain_activity_while_due(self) -> None:
+        """Run drains while one is due; a failed drain ends the task."""
+        while self._activity_drain_due():
+            if not await self._drain_activity():
+                return
+
+    async def _read_for_activity_drain(
+        self, read: Callable[[Lock], Awaitable[_T]]
+    ) -> tuple[_T, float] | None:
+        """Run read on the link under the operation lock, never connecting."""
+        # This yield lets a task created in the loop turn in which the last reply
+        # arrived ask for the operation lock before the drain does.
+        await asyncio.sleep(0)
+        async with self._operation_lock:
+            if not self._activity_callbacks:
+                return None
+            try:
+                if (lock := self._client) is None:
+                    raise DisconnectedError("Lock is not connected")  # noqa: TRY301
+                started = time.monotonic()
+                self._activity_drain_read_holds_lock = True
+                result = await read(lock)
+            except DisconnectedError as err:
+                # A dropped link is no drain failure; the next connection drains.
+                _LOGGER.debug("%s: Activity log drain ended: %s", self.name, err)
+                raise _ActivityDrainReadError from err
+            except (TimeoutError, *RETRYABLE_EXCEPTIONS) as err:
+                self._note_activity_drain_failure(err)
+                raise _ActivityDrainReadError from err
+            finally:
+                self._activity_drain_read_holds_lock = False
+            self._complete_operation(time.monotonic())
+        return result, started
+
+    async def _drain_activity(self) -> bool:
+        """Read the activity log to its end and deliver every record to every callback.
+
+        Returns False when a read fails or the log does not end within the read budget.
+        """
+
+        async def clear_pending_and_read(lock: Lock) -> int | bytes:
+            # Under the lock: a change staged while another task held it is
+            # covered, and a backlog armed while this drain waited is counted.
+            self._activity_drain_pending = False
+            if self._backlog_remaining is None:
+                count = await lock.unread_event_count()
+                if count < 0 or count >= UNREAD_COUNT_LIMIT:
+                    # A future PR sends ClearLog here for a count refused as too large,
+                    # with the same failure handling.
+                    raise ResponseError(f"Unread count {count} is not a depth")
+                return count
+            return await lock.get_log()
+
+        ended = False
+        try:
+            read = await self._read_for_activity_drain(clear_pending_and_read)
+            if read is None:
+                ended = True
+                return True
+            first, started = read
+            if isinstance(first, int):
+                _LOGGER.info("%s: Activity log unread count: %d", self.name, first)
+                self._backlog_remaining = first
+                ended = await self._deliver_activity_log(
+                    await self._read_for_activity_drain(_get_log),
+                    first + ACTIVITY_DRAIN_MARGIN,
+                )
+            else:
+                ended = await self._deliver_activity_log(
+                    (first, started), ACTIVITY_DRAIN_MARGIN
+                )
+        except _ActivityDrainReadError:
             return False
-        if first_update:
-            self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
-            return False
-        await self._drain_activity(lock)
+        finally:
+            if not ended:
+                self._activity_drain_pending = True
+        if ended:
+            self._activity_drain_failures = 0
+        return ended
+
+    async def _deliver_activity_log(
+        self, read: tuple[bytes, float] | None, budget: int
+    ) -> bool:
+        """Decode and deliver read and each GetLog reply after it until the drain ends.
+
+        A GetLogError whose dirty bit is clear ends the drain when its read started
+        after the drain window's end, and otherwise resets budget to
+        ACTIVITY_DRAIN_MARGIN. Returns False, after a backoff and a warning, when
+        budget replies in a row hold no GetLogError whose dirty bit is clear.
+        """
+        replies = 0
+        while read is not None:
+            reply, started = read
+            replies += 1
+            record = parse_log_event_packet(reply, self.brand)
+            end = False
+            if isinstance(record, GetLogError):
+                # A set dirty bit means a record write raced this read: read on.
+                end = not record.dirty_bit
+                backlog = False
+                if end:
+                    self._backlog_remaining = 0
+            else:
+                self._activity_drain_window_end = NEVER_TIME
+                # None means a backlog was armed mid-read; this record is in it.
+                backlog = self._backlog_remaining != 0
+                if self._backlog_remaining:
+                    self._backlog_remaining -= 1
+            self._log_activity_capture(record, backlog)
+            # The drain holds the operation lock only for each read, so a callback that
+            # does not return blocks this drain and every later one but no command or
+            # update cycle.
+            for callback in tuple(self._activity_callbacks):
+                if callback not in self._activity_callbacks:
+                    continue
+                warning = self.loop.call_later(
+                    LOG_RECORD_CALLBACK_WARNING_TIME,
+                    _LOGGER.warning,
+                    "%s: A log record callback %s has not returned within %s seconds"
+                    " (log_type 0x%02X)",
+                    self.name,
+                    getattr(callback, "__qualname__", None) or repr(callback),
+                    LOG_RECORD_CALLBACK_WARNING_TIME,
+                    record.log_type,
+                )
+                try:
+                    await callback(record, backlog)
+                except Exception:  # pylint: disable=broad-except
+                    _LOGGER.warning(
+                        "%s: Unexpected error in a log record callback"
+                        " (log_type 0x%02X)",
+                        self.name,
+                        record.log_type,
+                        exc_info=True,
+                    )
+                finally:
+                    warning.cancel()
+            if end:
+                if not self._activity_drain_window_open(started):
+                    return True
+                budget, replies = ACTIVITY_DRAIN_MARGIN, 0
+            elif replies == budget:
+                self._back_off_activity_drain()
+                _LOGGER.warning(
+                    "%s: Activity log end not reached within %d reads; "
+                    "not trying again for %d seconds",
+                    self.name,
+                    budget,
+                    ACTIVITY_DRAIN_FAILURE_BACKOFF,
+                )
+                return False
+            # The next drain reads a new backlog's unread count before any GetLog.
+            if self._backlog_remaining is None:
+                return True
+            # The session's cooldown paces each GetLog, so the drain adds no wait of
+            # its own.
+            read = await self._read_for_activity_drain(_get_log)
         return True
 
-    async def _drain_activity(self, lock: Lock) -> None:
-        """Read the lock's activity log and deliver every record to every callback.
-
-        A drain with no count reads the unread count first. A failed drain
-        stays pending; a cancellation during delivery loses that record for the
-        callbacks not yet run.
-        """
-        # Consumed before the await so a change during the drain is kept.
-        self._activity_drain_pending = False
-        records = 0
-        try:
-            if self._backlog_remaining is None:
-                self._backlog_remaining = await lock.unread_event_count()
-            async with contextlib.aclosing(lock.drain_lock_activity()) as replies:
-                # Stop when no callback is left or a new backlog was armed.
-                while self._activity_callbacks and self._backlog_remaining is not None:
-                    if (reply := await anext(replies, None)) is None:
-                        break
-                    records += 1
-                    if reply[0x04] == LOG_TYPE_GET_LOG_ERROR:
-                        # The log is empty, so no later record is backlog.
-                        backlog = False
-                        self._backlog_remaining = 0
-                    else:
-                        # None: a backlog armed during this read.
-                        backlog = self._backlog_remaining != 0
-                        if self._backlog_remaining:
-                            self._backlog_remaining -= 1
-                    record = parse_log_event_packet(reply, self.brand)
-                    for callback in tuple(self._activity_callbacks):
-                        if callback not in self._activity_callbacks:
-                            continue
-                        try:
-                            await callback(record, backlog)
-                        except Exception:  # pylint: disable=broad-except
-                            _LOGGER.warning(
-                                "%s: Unexpected error in a log record callback"
-                                " (log_type 0x%02X)",
-                                self.name,
-                                record.log_type,
-                                exc_info=True,
-                            )
-        except BaseException as err:
-            self._activity_drain_pending = True
-            if not isinstance(err, (BleakError, TimeoutError, ResponseError)):
-                raise
-            self._note_activity_drain_failure(err, records)
-            return
-        self._activity_drain_failures = 0
-        self._activity_overruns = 0
-
-    def _note_activity_drain_failure(self, err: Exception, records: int) -> None:
+    def _note_activity_drain_failure(self, err: Exception) -> None:
         """Count a failed drain; after enough in a row, leave the log alone a while."""
-        if isinstance(err, ActivityLogOverrunError):
-            self._activity_overruns += 1
-            if records and self._activity_overruns < ACTIVITY_DRAIN_MAX_OVERRUNS:
-                # A deep backlog, not a failure: carry on shortly.
-                _LOGGER.debug(
-                    "%s: Activity log is deeper than one drain, continuing shortly",
-                    self.name,
-                )
-                self._schedule_future_update_with_debounce(ACTIVITY_PRIME_DELAY)
-                return
-            # Nothing read, or no end after many chunks: a log that never ends.
-            self._activity_overruns = 0
-            strikes = ACTIVITY_DRAIN_FAILURE_THRESHOLD
-        else:
-            strikes = 1
-        self._activity_drain_failures += strikes
+        self._activity_drain_failures += 1
         if self._activity_drain_failures < ACTIVITY_DRAIN_FAILURE_THRESHOLD:
             _LOGGER.debug(
-                "%s: Reading lock activity failed (%s), will retry on next update.",
+                "%s: Reading lock activity failed (%s), will retry.",
                 self.name,
                 err,
             )
             return
-        self._activity_drain_failures = 0
-        self._earliest_activity_drain_time = (
-            time.monotonic() + ACTIVITY_DRAIN_FAILURE_BACKOFF
-        )
+        self._back_off_activity_drain()
         _LOGGER.warning(
             "%s: Reading lock activity keeps failing (%s); "
             "not trying again for %d seconds",
             self.name,
             err,
             ACTIVITY_DRAIN_FAILURE_BACKOFF,
+            exc_info=err,
+        )
+
+    def _back_off_activity_drain(self) -> None:
+        """Leave the activity log alone for ACTIVITY_DRAIN_FAILURE_BACKOFF seconds."""
+        self._activity_drain_failures = 0
+        self._earliest_activity_drain_time = (
+            time.monotonic() + ACTIVITY_DRAIN_FAILURE_BACKOFF
+        )
+
+    def _log_activity_capture(self, record: LogRecord, backlog: bool) -> None:
+        """Pass record to activity_capture.log_record with the lock's status."""
+        since_change = None
+        if self._last_settled_lock_change_time != NEVER_TIME:
+            since_change = time.monotonic() - self._last_settled_lock_change_time
+        activity_capture.log_record(
+            self.address,
+            self.name,
+            record.raw,
+            backlog,
+            since_change,
+            self.lock_status,
+            self.door_status,
         )
 
     async def _set_slow_connection_params(self, lock: Lock) -> None:
@@ -2086,7 +2266,12 @@ class PushLock:
         self._schedule_future_update_with_debounce(next_update)
 
     async def start(self) -> Callable[[], None]:
-        """Start watching for updates."""
+        """Start watching for updates after the address's last teardown has ended."""
+        if (teardown := _PENDING_TEARDOWNS.pending(self.address)) is not None:
+            _LOGGER.debug("%s: Waiting for the last stop's teardown", self.name)
+            # asyncio.wait leaves the teardown running if start() is canceled, and
+            # raises neither its exception nor its cancellation here.
+            await asyncio.wait((teardown,))
         _LOGGER.debug("Waiting for advertisement callbacks for %s", self.name)
         if self._running:
             raise RuntimeError("Already running")
@@ -2102,17 +2287,29 @@ class PushLock:
     def _cancel(self) -> None:
         self._running = False
         self._cancel_future_update()
+        self._cancel_keepalive_timer()
+        if self._activity_drain_task is not None:
+            self._activity_drain_task.cancel()
         if not self._operation_in_flight:
             # Kept while a command is in flight so a jam reported during it
             # still ends its attempts; the stopped exit resets it instead.
             self._reset_jam_state()
-        self.background_task(self._execute_forced_disconnect("stopping"))
+        _PENDING_TEARDOWNS.record(
+            self.address,
+            self.background_task(self._execute_forced_disconnect("stopping")),
+        )
 
-    def background_task(self, fut: Coroutine[Any, Any, Any]) -> None:
-        """Execute a background task."""
-        task: asyncio.Task[Any] = asyncio.create_task(fut)
+    def background_task(self, fut: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        """Run fut as a logged background task and return the task."""
+        task = self._logged_task(fut)
         self._background_tasks.add(task)
+        return task
+
+    def _logged_task(self, coro: Coroutine[Any, Any, _T]) -> asyncio.Task[_T]:
+        """Run coro as a task whose unexpected exception is logged."""
+        task = asyncio.create_task(coro)
         task.add_done_callback(self._on_background_task_done)
+        return task
 
     def _on_background_task_done(self, task: asyncio.Task[Any]) -> None:
         """Remove finished task and log unexpected exceptions."""
@@ -2126,20 +2323,19 @@ class PushLock:
         """Wait for the first update."""
         if not self._running:
             raise RuntimeError("Not running")
-        if not self._first_update_future:
+        if (future := self._first_update_future) is None:
             raise RuntimeError("Already waited for first update")
         try:
             async with asyncio_timeout(timeout):
-                await self._first_update_future
-        except (TimeoutError, asyncio.CancelledError) as ex:
-            self._first_update_future.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._first_update_future
+                await future
+        except TimeoutError as ex:
             raise NoAdvertisementError(
                 "No advertisement received before timeout"
             ) from ex
         finally:
-            self._first_update_future = None
+            # A start() after a stop can replace _first_update_future while this waits.
+            if self._first_update_future is future:
+                self._first_update_future = None
 
     def _hold_update(self) -> None:
         """Hold update cycles off for the stale-state debounce from now."""
@@ -2213,9 +2409,7 @@ class PushLock:
             return
         if self._wait_for_the_floor(now):
             return
-        if self._operation_lock.locked():
-            # The cycle is re-armed rather than created, so no task sits on the
-            # operation lock waiting for the motor to stop.
+        if self._a_command_holds_the_lock():
             _LOGGER.debug(
                 "%s: Rescheduling update until the operation lock is released",
                 self.name,
@@ -2227,13 +2421,14 @@ class PushLock:
         self._update_task = asyncio.create_task(self._execute_deferred_update())
 
     def _set_update_state(self, exception: Exception | None) -> None:
-        """Set the update state."""
-        if not self._first_update_future:
+        """Resolve _first_update_future with the outcome while it is pending."""
+        future = self._first_update_future
+        if future is None or future.done():
             return
         if exception:
-            self._first_update_future.set_exception(exception)
+            future.set_exception(exception)
         else:
-            self._first_update_future.set_result(None)
+            future.set_result(None)
 
     async def _execute_deferred_update(self) -> None:  # noqa: PLR0915
         """Execute deferred update."""
