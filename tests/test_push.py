@@ -1587,6 +1587,7 @@ async def test_keep_alive_door_read_follows_an_unanswered_battery_read_and_holds
         battery=AsyncMock(side_effect=TimeoutError),
         door_status=AsyncMock(side_effect=TimeoutError),
         lock_status=AsyncMock(),
+        session=MagicMock(write_failed=False),
     )
     push_lock._hold_update()
 
@@ -1605,6 +1606,55 @@ async def test_keep_alive_door_read_follows_an_unanswered_battery_read_and_holds
     assert "Door status request timed out" in caplog.text
     # Nothing answered, so the keep-alive does not count from these requests.
     assert push_lock._last_operation_complete_time == last_request
+
+
+@pytest.mark.asyncio
+async def test_a_keep_alive_battery_write_that_does_not_return_holds_nothing_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Real Session: a hung battery write sends no door request and arms no hold."""
+    push_lock = _connected_always_on_lock("aa:bb:cc:dd:ee:9b")
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    session.cipher_encrypt = MagicMock(update=bytes)
+    push_lock._client = lock
+    written: list[int] = []
+
+    async def hang(_char: object, command: bytearray, _response: bool) -> None:
+        written.append(command[0x04])
+        await asyncio.Event().wait()
+
+    client.write_gatt_char = AsyncMock(side_effect=hang)
+    push_lock._hold_update()
+
+    with (
+        patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.05)),
+        caplog.at_level(logging.DEBUG, logger="yalexs_ble.push"),
+    ):
+        push_lock._keep_alive()
+        await asyncio.gather(*push_lock._background_tasks)
+    await asyncio.sleep(0)
+
+    assert written == [StatusType.BATTERY.value]
+    assert "Keep-alive read failed" in caplog.text
+    assert "timed out; not asking again" not in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    # The battery request goes out on the next connection.
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    session.cipher_encrypt = MagicMock(update=bytes)
+    push_lock._client = lock
+    written.clear()
+
+    async def answer(_char: object, command: bytearray, _response: bool) -> None:
+        written.append(command[0x04])
+        session._notify(0, bytearray(_STATUS_ANSWERS[command[0x04]]))
+
+    client.write_gatt_char = AsyncMock(side_effect=answer)
+
+    push_lock._keep_alive()
+    await asyncio.gather(*push_lock._background_tasks)
+
+    assert written == [StatusType.BATTERY.value]
 
 
 @pytest.mark.asyncio
@@ -8619,6 +8669,7 @@ async def test_a_door_request_the_lock_does_not_answer_arms_the_cooldown(
 
     mock_lock = MagicMock()
     mock_lock.door_status = AsyncMock(side_effect=TimeoutError)
+    mock_lock.session = MagicMock(write_failed=False)
 
     before = time.monotonic()
     with caplog.at_level(logging.INFO, logger="yalexs_ble.push"):
@@ -8765,11 +8816,12 @@ async def test_update_polls_lock_and_door_together_on_a_door_sense_lock() -> Non
 
 
 # Built GETSTATUS answers keyed by the subtype at byte[4]: the battery at
-# 0x1479 mV, the lock Locked, and the lock Locked at byte[8] with the door
-# Closed at byte[9].
+# 0x1479 mV, the lock Locked, the door Closed at byte[8], and the lock Locked at
+# byte[8] with the door Closed at byte[9].
 _STATUS_ANSWERS = {
     StatusType.BATTERY.value: _with_checksum("bb0200000f00000079140000000000000000"),
     StatusType.LOCK_ONLY.value: _with_checksum(_STATUS_PUSH_LOCKED),
+    StatusType.DOOR_ONLY.value: _with_checksum("bb0200002e00000001000000000000000000"),
     StatusType.DOOR_AND_LOCK.value: _with_checksum(
         "bb0200002f00000005010000000000000000"
     ),
@@ -9405,6 +9457,109 @@ async def test_a_combined_poll_whose_write_does_not_return_counts_as_a_drop() ->
 
     assert written == [StatusType.DOOR_AND_LOCK.value]
     assert push_lock._unanswered_combined_status_polls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "subtype"),
+    [
+        pytest.param("_poll_door_status", StatusType.DOOR_ONLY, id="door"),
+        pytest.param("_poll_battery", StatusType.BATTERY, id="battery"),
+    ],
+)
+async def test_a_request_whose_write_does_not_return_raises_and_holds_nothing_off(
+    method: str, subtype: StatusType, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Real Session: a request whose write does not return raises and arms no hold."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:99")
+    # The stand-down sends the door request on its own.
+    _stand_down(push_lock)
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    session.cipher_encrypt = MagicMock(update=bytes)
+    written: list[int] = []
+
+    async def hang(_char: object, command: bytearray, _response: bool) -> None:
+        written.append(command[0x04])
+        await asyncio.Event().wait()
+
+    client.write_gatt_char = AsyncMock(side_effect=hang)
+
+    with (
+        patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.05)),
+        caplog.at_level(logging.INFO, logger="yalexs_ble.push"),
+        pytest.raises(TimeoutError),
+    ):
+        await getattr(push_lock, method)(lock)
+    await asyncio.sleep(0)
+
+    assert written == [subtype.value]
+    assert "timed out; not asking again" not in caplog.text
+
+    # The request goes out on the next connection.
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    session.cipher_encrypt = MagicMock(update=bytes)
+    written.clear()
+
+    async def answer(_char: object, command: bytearray, _response: bool) -> None:
+        written.append(command[0x04])
+        session._notify(0, bytearray(_STATUS_ANSWERS[command[0x04]]))
+
+    client.write_gatt_char = AsyncMock(side_effect=answer)
+
+    assert await getattr(push_lock, method)(lock) is True
+    assert written == [subtype.value]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("read", "subtype", "sent"),
+    [
+        pytest.param(
+            "door_status",
+            StatusType.DOOR_ONLY,
+            [StatusType.BATTERY.value, StatusType.DOOR_ONLY.value],
+            id="door",
+        ),
+        pytest.param(
+            "battery", StatusType.BATTERY, [StatusType.BATTERY.value], id="battery"
+        ),
+    ],
+)
+async def test_a_cycle_whose_request_write_does_not_return_sends_it_on_a_new_connection(
+    read: str, subtype: StatusType, sent: list[int]
+) -> None:
+    """Real Session: the cycle runs again on a new connection and sends the request."""
+    push_lock = _operational_push_lock("aa:bb:cc:dd:ee:9a")
+    # The stand-down sends the door request on its own.
+    _stand_down(push_lock)
+    lock, session, client = _lock_on_a_real_session(push_lock)
+    session.cipher_encrypt = MagicMock(update=bytes)
+    push_lock._client = lock
+    written: list[int] = []
+
+    async def write(_char: object, command: bytearray, _response: bool) -> None:
+        written.append(command[0x04])
+        if command[0x04] == subtype.value:
+            await asyncio.Event().wait()
+        session._notify(0, bytearray(_STATUS_ANSWERS[command[0x04]]))
+
+    async def drop_the_link() -> None:
+        client.is_connected = False
+        lock.disconnected()
+
+    client.write_gatt_char = AsyncMock(side_effect=write)
+    client.disconnect = AsyncMock(side_effect=drop_the_link)
+    fresh = AsyncMock(is_connected=True)
+
+    with (
+        patch("yalexs_ble.util.asyncio_timeout", _timeout_of(0.05)),
+        patch.object(push_lock, "_get_lock_instance", return_value=fresh),
+    ):
+        await push_lock._locked_update()
+
+    assert written == sent
+    fresh.connect.assert_awaited_once()
+    getattr(fresh, read).assert_awaited_once()
 
 
 @pytest.mark.asyncio

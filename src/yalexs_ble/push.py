@@ -1589,12 +1589,15 @@ class PushLock:
             self._record_auth_success()
             self._next_battery_refresh_time = now + BATTERY_REFRESH_INTERVAL
         except TimeoutError:
+            # The hold is for a request the lock received and did not answer, and a
+            # write that did not return ends the link, so its timeout is raised.
+            if lock.session is not None and lock.session.write_failed:
+                raise
             _LOGGER.info(
                 "%s: Battery request timed out; not asking again for %d seconds",
                 self.name,
                 BATTERY_TIMEOUT_COOLDOWN,
             )
-            # Set cooldown to prevent repeated timeouts.
             self._earliest_battery_attempt_time = now + BATTERY_TIMEOUT_COOLDOWN
             return False
         except BleakError as err:
@@ -1645,8 +1648,10 @@ class PushLock:
         try:
             await lock.door_status()
         except TimeoutError:
-            # The hold is for a request the lock does not answer, so a transport
-            # error propagates.
+            # The hold is for a request the lock received and did not answer, and a
+            # write that did not return ends the link, so its timeout is raised.
+            if lock.session is not None and lock.session.write_failed:
+                raise
             _LOGGER.info(
                 "%s: Door status request timed out; not asking again for %d seconds",
                 self.name,
