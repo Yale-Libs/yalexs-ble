@@ -4,7 +4,7 @@ import asyncio
 import bisect
 import logging
 import os
-from collections.abc import AsyncGenerator, Callable, Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, TypeVar, cast
 
 from bleak import BleakError
@@ -18,7 +18,6 @@ from bleak_retry_connector import (
 from . import util
 from .const import (
     FIRMWARE_REVISION_CHARACTERISTIC,
-    LOG_TYPE_GET_LOG_ERROR,
     MECHANICAL_OPERATION_ERRORS,
     MODEL_NUMBER_CHARACTERISTIC,
     SERIAL_NUMBER_CHARACTERISTIC,
@@ -45,7 +44,6 @@ from .session import (
     KeycodeError,
     OperationFailedError,
     OperationProgress,
-    ResponseError,
     Session,
     YaleXSBLEError,
 )
@@ -54,9 +52,6 @@ _LOGGER = logging.getLogger(__name__)
 
 LOCK_INFO_TIMEOUT = 3
 LOCK_INFO_ATTEMPTS = 2
-
-# Upper bound on the records read in one drain of the activity log
-MAX_ACTIVITY_RECORDS = 32
 
 # Operation byte that makes an Unlock command an unlatch (retract the latch).
 UNLATCH_OPERATION_BYTE = 0x0A
@@ -192,6 +187,7 @@ NO_STATE_OPCODES = frozenset(
         Commands.KEYCODE_COMMIT.value,
         Commands.KEYCODE_GET.value,
         Commands.GETLOG.value,
+        Commands.CLEARLOG.value,
     }
 )
 KEYCODE_ACCESS_ALWAYS = 0x80
@@ -251,8 +247,13 @@ def _operation_response_matcher(opcode: int) -> Callable[[bytes], bool]:
     return _matches
 
 
-class ActivityLogOverrunError(ResponseError):
-    """The activity log did not end within the read cap."""
+def _first_reply_matcher(opcode: int) -> Callable[[bytes], bool]:
+    """Match an 0xAA or 0xBB frame whose byte 1 is opcode, whatever byte 4 holds."""
+
+    def _matches(data: bytes) -> bool:
+        return len(data) > 0x01 and data[0x00] in (0xAA, 0xBB) and data[0x01] == opcode
+
+    return _matches
 
 
 _GETLOG_MATCHER = _poll_response_matcher(Commands.GETLOG.value)
@@ -919,17 +920,11 @@ class Lock:
 
     @raise_if_not_connected
     async def unread_event_count(self) -> int:
-        """Read the activity log's unread count; the read removes no record.
-
-        A negative count, signed at bytes 8 to 11, is not a depth and raises.
-        """
+        """Return the activity log's unread count as read."""
         response = await self._poll_status(
             StatusType.LOCK_EVENTS_UNREAD, "unread_event_count"
         )
-        count = util._bytes_to_int(response[0x08:0x0C], signed=True)
-        if count < 0:
-            raise ResponseError(f"Unread count {count} is not a depth")
-        return count
+        return util._bytes_to_int(response[0x08:0x0C], signed=True)
 
     @raise_if_not_connected
     async def battery(self) -> BatteryState:
@@ -965,23 +960,14 @@ class Lock:
             _GETLOG_MATCHER,
         )
 
-    async def drain_lock_activity(self) -> AsyncGenerator[bytes]:
-        """Yield each GetLog reply unchanged, ending after the GetLogError record.
-
-        The next GetLog is sent when the caller asks for the next reply. Raises
-        ActivityLogOverrunError past the read cap.
-        """
-        if not self.is_connected:
-            raise DisconnectedError("Lock is not connected")
-        _LOGGER.debug("%s: Executing drain_lock_activity", self.name)
-        for _ in range(MAX_ACTIVITY_RECORDS):
-            response = await self.get_log()
-            yield response
-            if response[0x04] == LOG_TYPE_GET_LOG_ERROR:
-                _LOGGER.debug("%s: Finished drain_lock_activity", self.name)
-                return
-        raise ActivityLogOverrunError(
-            f"{self.name}: Activity log did not end within {MAX_ACTIVITY_RECORDS} reads"
+    @raise_if_not_connected
+    async def clear_log(self) -> None:
+        """Discard every unread record in the lock's activity log."""
+        assert self.session is not None  # nosec
+        await self.session.execute(
+            self.session.build_command(Commands.CLEARLOG),
+            "clear_log",
+            _first_reply_matcher(Commands.CLEARLOG.value),
         )
 
     async def disconnect(self) -> None:

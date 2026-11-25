@@ -1,0 +1,99 @@
+"""Log each GetLog reply a drain reads, with its decodes.
+
+Each lock's lines are debug lines on the child logger of this module's logger
+named for the lock's Bluetooth address, in lower case without colons, for example
+yalexs_ble.activity_capture.aabbccddeeff for AA:BB:CC:DD:EE:FF. Debug enabled for
+that logger turns the lines on, as for any logger.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+import time
+from datetime import UTC, datetime
+from enum import Enum
+from urllib.parse import quote
+
+from .activity_log import LogRecord, parse_log_event_packet
+from .const import Brand, DoorStatus, LockStatus
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def log_record(
+    address: str,
+    name: str,
+    reply: bytes,
+    backlog: bool,
+    since_change: float | None,
+    lock: LockStatus,
+    door: DoorStatus,
+) -> None:
+    """Log reply's timing, lock and door status, flag, and both decodes as one line.
+
+    since_change is the seconds since the last settled lock change, or None.
+    """
+    logger = _LOGGER.getChild(address.replace(":", "").lower())
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    captured = time.time()
+    yale = parse_log_event_packet(reply, Brand.YALE)
+    time_stamp: int | None = getattr(yale, "time_stamp", None)
+    yale_text = _decoded_field(yale)
+    august_text = _decoded_field(parse_log_event_packet(reply, Brand.AUGUST))
+    fields = [
+        ("captured", _time(captured)),
+        ("log_type", f"0x{reply[0x04]:02X}"),
+        ("lock_time", "-" if time_stamp is None else _time(time_stamp)),
+        ("lag", "-" if time_stamp is None else f"{captured - time_stamp:.3f}"),
+        ("since_change", "-" if since_change is None else f"{since_change:.3f}"),
+        ("lock", lock.name),
+        ("door", door.name),
+        ("backlog", str(backlog)),
+        ("raw", reply.hex()),
+        ("yale", yale_text),
+    ]
+    if august_text != yale_text:
+        fields.append(("august", august_text))
+    logger.debug(
+        "%s: activity record %s",
+        name,
+        " ".join(f"{key}={value}" for key, value in fields),
+    )
+
+
+def _decoded_field(decoded: LogRecord) -> str:
+    """Return the record formatted as one token."""
+    values = ",".join(
+        f"{field.name}={_value(field.name, getattr(decoded, field.name))}"
+        for field in dataclasses.fields(decoded)
+        if field.name != "raw"
+    )
+    return f"{type(decoded).__name__}({values})"
+
+
+def _value(name: str, value: object) -> str:
+    """Format the value of the record field name as one token."""
+    if value is None:
+        return "-"
+    if isinstance(value, Enum):
+        return value.name
+    if isinstance(value, int) and (name == "time_stamp" or name.endswith("_time")):
+        return _time(value)
+    if isinstance(value, str):
+        # Percent-encoding leaves no space, comma, equals sign, or parenthesis
+        # in the value.
+        return quote(value, safe="")
+    if isinstance(value, tuple):
+        return ":".join(_value(name, item) for item in value)
+    return str(value)
+
+
+def _time(seconds: float) -> str:
+    """Format seconds since 1970 UTC as local ISO 8601 time with milliseconds."""
+    return (
+        datetime.fromtimestamp(seconds, UTC)
+        .astimezone()
+        .isoformat(timespec="milliseconds")
+    )
